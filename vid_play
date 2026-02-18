@@ -1,0 +1,182 @@
+-- play_nfv_loop.lua
+-- Loops an NFV2 (video-only) file forever as a background animation.
+
+local args = {...}
+if #args < 1 then
+  print("Usage: play_nfv_loop <video.nfv> [monitorSide]")
+  return
+end
+
+local PATH = args[1]
+local MON  = args[2]
+
+local LOOP = true
+local PALETTE_CACHE = true
+
+local function openTerm()
+  if MON then
+    local m = peripheral.wrap(MON)
+    if not m then error("No monitor/peripheral on "..tostring(MON)) end
+    if m.isColor and not m.isColor() then
+      error("Monitor is not advanced (needs color)")
+    end
+    return m
+  end
+  return term
+end
+
+local t = openTerm()
+
+local function readU8(h)
+  local b = h.read()
+  if b == nil then return nil end
+  return b
+end
+
+local function readU16(h)
+  local b1 = readU8(h); local b2 = readU8(h)
+  if not b2 then return nil end
+  return b1 + b2 * 256
+end
+
+local function readU32(h)
+  local b1 = readU8(h); local b2 = readU8(h); local b3 = readU8(h); local b4 = readU8(h)
+  if not b4 then return nil end
+  return b1 + b2*256 + b3*65536 + b4*16777216
+end
+
+local function readExact(h, n)
+  local s = h.read(n)
+  if not s or #s ~= n then return nil end
+  return s
+end
+
+local function rleDecodeBytes(data)
+  local out = {}
+  local n = #data
+  local i = 1
+  while i <= n do
+    local run = data:byte(i)
+    local val = data:byte(i+1)
+    i = i + 2
+    out[#out+1] = string.rep(string.char(val), run)
+  end
+  return table.concat(out)
+end
+
+local HEX = "0123456789abcdef"
+
+local function unpack4bppToBgRows(packed, w, h)
+  local rows = {}
+  local bytePos = 1
+  local useHi = true
+
+  for y=1,h do
+    local row = {}
+    for x=1,w do
+      local b = packed:byte(bytePos)
+      local nib
+      if useHi then
+        nib = (b >> 4) & 0x0F
+        useHi = false
+      else
+        nib = b & 0x0F
+        useHi = true
+        bytePos = bytePos + 1
+      end
+      row[#row+1] = HEX:sub(nib+1, nib+1)
+    end
+
+    if not useHi then
+      useHi = true
+      bytePos = bytePos + 1
+    end
+
+    rows[y] = table.concat(row)
+  end
+
+  return rows
+end
+
+local function setPaletteFromBytes(palBytes)
+  for i=0,15 do
+    local r = palBytes:byte(i*3 + 1) / 255
+    local g = palBytes:byte(i*3 + 2) / 255
+    local b = palBytes:byte(i*3 + 3) / 255
+    local mask = 2^i
+    if t.setPaletteColour then
+      t.setPaletteColour(mask, r, g, b)
+    elseif t.setPaletteColor then
+      t.setPaletteColor(mask, r, g, b)
+    end
+  end
+end
+
+local function waitTimer(id)
+  while true do
+    local e, tid = os.pullEvent()
+    if e == "timer" and tid == id then return end
+  end
+end
+
+local function playOnce()
+  local h = fs.open(PATH, "rb")
+  if not h then error("Can't open "..PATH) end
+
+  local magic = readExact(h, 4)
+  if magic ~= "NFV2" then h.close(); error("Bad magic (expected NFV2)") end
+
+  local version = readU8(h)
+  local flags   = readU8(h)
+  local w       = readU16(h)
+  local hh      = readU16(h)
+  local fps1000 = readU32(h)
+  local frames  = readU32(h)
+
+  local fps = fps1000 / 1000
+  local dt = 1 / fps
+  local useRLE = (flags & 0x01) == 0x01
+
+  local textRow = string.rep(" ", w)
+  local fgRow   = string.rep("0", w)
+
+  if t.setTextScale then pcall(function() t.setTextScale(0.5) end) end
+  t.setCursorBlink(false)
+  t.setBackgroundColor(colors.black)
+  t.clear()
+
+  local lastPal = nil
+  local timerId = os.startTimer(0)
+
+  for fi=1,frames do
+    local palLen = readU16(h)
+    if not palLen then break end
+    local palBytes = readExact(h, palLen)
+    local dataLen  = readU32(h)
+    local data     = readExact(h, dataLen)
+
+    if (not PALETTE_CACHE) or (not lastPal) or (palBytes ~= lastPal) then
+      setPaletteFromBytes(palBytes)
+      lastPal = palBytes
+    end
+
+    local packed = data
+    if useRLE then packed = rleDecodeBytes(data) end
+    local bgRows = unpack4bppToBgRows(packed, w, hh)
+
+    for y=1,hh do
+      t.setCursorPos(1, y)
+      t.blit(textRow, fgRow, bgRows[y])
+    end
+
+    waitTimer(timerId)
+    timerId = os.startTimer(dt)
+  end
+
+  h.close()
+end
+
+while true do
+  playOnce()
+  if not LOOP then break end
+end
