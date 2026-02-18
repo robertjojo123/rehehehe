@@ -1,0 +1,40 @@
+-- show_nfp.lua
+-- Displays a single .nfp file (W H then H lines of 0-9a-f) on a monitor.
+
+local args = {...}
+if #args < 2 then
+  print("Usage: show_nfp <file.nfp> <monitorSide>")
+  return
+end
+
+local FILE = args[1]
+local SIDE = args[2]
+local mon = peripheral.wrap(SIDE)
+if not mon then error("No monitor on "..tostring(SIDE)) end
+
+local TEXT_SCALE = 0.5
+
+local h = fs.open(FILE, "r")
+if not h then error("Can't open "..FILE) end
+
+local header = h.readLine()
+local w, hh = header:match("^(%d+)%s+(%d+)%s*$")
+w, hh = tonumber(w), tonumber(hh)
+if not w then h.close(); error("Bad header in "..FILE.." (expected 'W H')") end
+
+if mon.setTextScale then pcall(function() mon.setTextScale(TEXT_SCALE) end) end
+mon.setCursorBlink(false)
+mon.setBackgroundColor(colors.black)
+mon.clear()
+
+local textRow = (" "):rep(w)
+local fgRow   = ("0"):rep(w)
+
+for y=1,hh do
+  local row = h.readLine()
+  if not row then break end
+  mon.setCursorPos(1, y)
+  mon.blit(textRow, fgRow, row)
+end
+
+h.close()
