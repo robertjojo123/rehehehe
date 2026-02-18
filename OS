@@ -1,0 +1,222 @@
+-- os_home.lua
+-- Photo-backed "OS home screen" with centered outlined message + an Inventory app icon.
+-- Requires: Advanced monitor recommended (for best color).
+-- Usage: lua os_home.lua <monitorSide>
+-- Example: lua os_home.lua right
+
+local args = {...}
+if #args < 1 then
+  print("Usage: os_home <monitorSide>")
+  return
+end
+
+local SIDE = args[1]
+local mon = peripheral.wrap(SIDE)
+if not mon then error("No monitor on "..tostring(SIDE)) end
+
+-- ============ CONFIG ============
+local BG_FILE = "photo.nfp"                 -- your image file (W H then H rows of 0-9a-f)
+local INVENTORY_APP = "inventory_manager.lua" -- app to launch when icon tapped
+local TEXT_SCALE = 0.5
+
+local TOP_SLOGAN = "Beating the xxxx xxx xx xxxx xxxx, one xxxx at a time"
+local CENTER_MESSAGE = "Tap INV to open Inventory"
+-- =================================
+
+-- ---------- small helpers ----------
+local function setPal(mask, r, g, b)
+  if mon.setPaletteColour then
+    mon.setPaletteColour(mask, r, g, b)
+  else
+    mon.setPaletteColor(mask, r, g, b)
+  end
+end
+
+local function fillRect(x, y, w, h, bgColor)
+  mon.setBackgroundColor(bgColor)
+  for yy = y, y + h - 1 do
+    mon.setCursorPos(x, yy)
+    mon.write((" "):rep(w))
+  end
+end
+
+local function writeAt(x, y, text, fg, bg)
+  mon.setTextColor(fg)
+  mon.setBackgroundColor(bg)
+  mon.setCursorPos(x, y)
+  mon.write(text)
+end
+
+local function centerX(text, totalW)
+  return math.max(1, math.floor((totalW - #text) / 2) + 1)
+end
+
+local function outlinedCenter(y, text, fg, outline, bg, totalW)
+  local x = centerX(text, totalW)
+  -- outline pass (8 directions around)
+  writeAt(x-1, y,   text, outline, bg)
+  writeAt(x+1, y,   text, outline, bg)
+  writeAt(x,   y-1, text, outline, bg)
+  writeAt(x,   y+1, text, outline, bg)
+  writeAt(x-1, y-1, text, outline, bg)
+  writeAt(x+1, y-1, text, outline, bg)
+  writeAt(x-1, y+1, text, outline, bg)
+  writeAt(x+1, y+1, text, outline, bg)
+  -- fill pass
+  writeAt(x, y, text, fg, bg)
+end
+
+-- ---------- load NFP image ----------
+local function loadNfp(path)
+  local h = fs.open(path, "r")
+  if not h then error("Can't open "..path) end
+
+  local header = h.readLine()
+  local w, hh = header:match("^(%d+)%s+(%d+)%s*$")
+  w, hh = tonumber(w), tonumber(hh)
+  if not w then h.close(); error("Bad header in "..path.." (expected 'W H')") end
+
+  local rows = {}
+  for y=1,hh do
+    local row = h.readLine()
+    if not row then break end
+    rows[y] = row
+  end
+  h.close()
+
+  return w, hh, rows
+end
+
+-- ---------- apply YOUR palette codes exactly ----------
+local function applyUserPalette()
+  -- your exact lines / values, same indices:
+  setPal(2^9,  0.15, 0.4,  0.7)   -- '9' blue
+  setPal(2^13, 0.25, 0.75, 0.25)  -- 'd' green
+  setPal(2^7,  0.10, 0.40, 0.10)  -- '7' (you had this as green)
+  setPal(2^12, 0.40, 0.28, 0.15)  -- 'c' dark brown
+  setPal(2^8,  0.50, 0.34, 0.18)  -- '8' brown
+  setPal(2^14, 0.70, 0.55, 0.35)  -- 'e' tan
+end
+
+-- ---------- draw background (fast: cached rows) ----------
+local function drawBackground(imgW, imgH, rows, screenW, screenH)
+  local w = math.min(imgW, screenW)
+  local h = math.min(imgH, screenH)
+  local textRow = (" "):rep(w)
+  local fgRow   = ("0"):rep(w)
+
+  for y=1,h do
+    local row = rows[y] or ""
+    if #row > w then row = row:sub(1, w) end
+    if #row < w then row = row .. ("f"):rep(w - #row) end
+    mon.setCursorPos(1, y)
+    mon.blit(textRow, fgRow, row)
+  end
+end
+
+-- ---------- UI layout ----------
+local function drawUI(screenW, screenH)
+  -- top slogan bar
+  local topBarH = 3
+  fillRect(1, 1, screenW, topBarH, colors.black)
+  outlinedCenter(2, TOP_SLOGAN, colors.white, colors.gray, colors.black, screenW)
+
+  -- center message area reserved (outlined text)
+  local boxW = math.min(screenW, math.max(24, #CENTER_MESSAGE + 8))
+  local boxH = 5
+  local boxX = math.floor((screenW - boxW)/2) + 1
+  local boxY = math.floor((screenH - boxH)/2) + 1
+
+  -- dark translucent-ish panel (solid)
+  fillRect(boxX, boxY, boxW, boxH, colors.black)
+  -- thin border
+  mon.setBackgroundColor(colors.gray)
+  mon.setCursorPos(boxX, boxY);           mon.write((" "):rep(boxW))
+  mon.setCursorPos(boxX, boxY + boxH-1);  mon.write((" "):rep(boxW))
+  for yy=boxY, boxY+boxH-1 do
+    mon.setCursorPos(boxX, yy); mon.write(" ")
+    mon.setCursorPos(boxX+boxW-1, yy); mon.write(" ")
+  end
+
+  -- outlined centered message inside the panel
+  local msgY = boxY + math.floor(boxH/2)
+  outlinedCenter(msgY, CENTER_MESSAGE, colors.white, colors.gray, colors.black, screenW)
+
+  -- right-side app icon (INV)
+  local iconW, iconH = 7, 5
+  local iconX = screenW - iconW
+  local iconY = topBarH + 1
+
+  fillRect(iconX, iconY, iconW, iconH, colors.black)
+  -- border
+  mon.setBackgroundColor(colors.gray)
+  mon.setCursorPos(iconX, iconY);               mon.write((" "):rep(iconW))
+  mon.setCursorPos(iconX, iconY + iconH - 1);   mon.write((" "):rep(iconW))
+  for yy=iconY, iconY+iconH-1 do
+    mon.setCursorPos(iconX, yy); mon.write(" ")
+    mon.setCursorPos(iconX+iconW-1, yy); mon.write(" ")
+  end
+
+  -- label
+  outlinedCenter(iconY + 2, "INV", colors.white, colors.gray, colors.black, screenW)
+
+  return {
+    icon = {x1=iconX, y1=iconY, x2=iconX+iconW-1, y2=iconY+iconH-1}
+  }
+end
+
+local function inRect(x, y, r)
+  return x >= r.x1 and x <= r.x2 and y >= r.y1 and y <= r.y2
+end
+
+-- ---------- init ----------
+if mon.setTextScale then pcall(function() mon.setTextScale(TEXT_SCALE) end) end
+mon.setCursorBlink(false)
+
+local imgW, imgH, rows = loadNfp(BG_FILE)
+local screenW, screenH = mon.getSize()
+
+-- If your image is larger than monitor size, it will clip (fine for background).
+-- If your image is smaller, the rest stays whatever was there; we’ll clear once.
+mon.setBackgroundColor(colors.black)
+mon.clear()
+
+applyUserPalette()
+
+-- ---------- main loop ----------
+local hitboxes
+
+local function redrawAll()
+  drawBackground(imgW, imgH, rows, screenW, screenH)
+  hitboxes = drawUI(screenW, screenH)
+end
+
+redrawAll()
+
+while true do
+  local e, p1, p2, p3 = os.pullEvent()
+
+  if e == "monitor_touch" then
+    local side, x, y = p1, p2, p3
+    if side == SIDE and hitboxes and inRect(x, y, hitboxes.icon) then
+      -- launch inventory app
+      if fs.exists(INVENTORY_APP) then
+        -- optional: show feedback
+        CENTER_MESSAGE = "Opening Inventory..."
+        redrawAll()
+
+        shell.run(INVENTORY_APP)
+
+        -- when app exits, redraw home
+        CENTER_MESSAGE = "Tap INV to open Inventory"
+        redrawAll()
+      else
+        CENTER_MESSAGE = "Missing: " .. INVENTORY_APP
+        redrawAll()
+      end
+    end
+  elseif e == "term_resize" or e == "monitor_resize" then
+    screenW, screenH = mon.getSize()
+    redrawAll()
+  end
+end
