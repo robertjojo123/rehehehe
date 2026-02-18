@@ -1,0 +1,119 @@
+-- background.lua
+-- Plays text-based .nfv frames on a monitor using the DEFAULT CC palette (full color).
+-- Usage: lua background.lua right
+
+local args = {...}
+local FILE = "gif_30s.nfv"
+local SIDE = args[1]
+
+local function getMonitor()
+  if SIDE then
+    local m = peripheral.wrap(SIDE)
+    if not m then error("No peripheral on side: "..tostring(SIDE)) end
+    return m
+  end
+  local m = peripheral.find("monitor")
+  if not m then error("No monitor found. Run: lua background.lua <side>") end
+  return m
+end
+
+local mon = getMonitor()
+
+local TEXT_SCALE = 0.5
+local LOOP = true
+
+-- CC:Tweaked default palette (approx, 0..1 RGB)
+-- Index i maps to mask 2^i (blit '0'..'f')
+local CC_DEFAULT = {
+  [0]  = {0.941, 0.941, 0.941}, -- white
+  [1]  = {0.949, 0.698, 0.200}, -- orange
+  [2]  = {0.898, 0.498, 0.847}, -- magenta
+  [3]  = {0.600, 0.698, 0.949}, -- light blue
+  [4]  = {0.871, 0.871, 0.424}, -- yellow
+  [5]  = {0.498, 0.800, 0.098}, -- lime
+  [6]  = {0.949, 0.698, 0.800}, -- pink
+  [7]  = {0.298, 0.298, 0.298}, -- gray
+  [8]  = {0.600, 0.600, 0.600}, -- light gray
+  [9]  = {0.200, 0.600, 0.698}, -- cyan
+  [10] = {0.698, 0.400, 0.898}, -- purple
+  [11] = {0.200, 0.400, 0.800}, -- blue
+  [12] = {0.498, 0.400, 0.298}, -- brown
+  [13] = {0.341, 0.651, 0.305}, -- green
+  [14] = {0.800, 0.298, 0.298}, -- red
+  [15] = {0.067, 0.067, 0.067}, -- black
+}
+
+local function applyDefaultPalette()
+  for i = 0, 15 do
+    local c = CC_DEFAULT[i]
+    local mask = 2^i
+    if mon.setPaletteColour then
+      mon.setPaletteColour(mask, c[1], c[2], c[3])
+    else
+      mon.setPaletteColor(mask, c[1], c[2], c[3])
+    end
+  end
+end
+
+local function readNonBlank(h)
+  while true do
+    local line = h.readLine()
+    if line == nil then return nil end
+    if line ~= "" then return line end
+  end
+end
+
+local function waitTimer(id)
+  while true do
+    local e, tid = os.pullEvent()
+    if e == "timer" and tid == id then return end
+  end
+end
+
+local function playOnce()
+  local h = fs.open(FILE, "r")
+  if not h then error("Can't open "..FILE) end
+
+  local header = h.readLine()
+  local w, hgt, fps = header:match("^(%d+)%s+(%d+)%s+(%d+)%s*$")
+  w, hgt, fps = tonumber(w), tonumber(hgt), tonumber(fps)
+  if not w then h.close(); error("Bad header in "..FILE.." (expected: W H FPS)") end
+
+  if mon.setTextScale then pcall(function() mon.setTextScale(TEXT_SCALE) end) end
+  mon.setCursorBlink(false)
+  mon.setBackgroundColor(colors.black)
+  mon.clear()
+
+  applyDefaultPalette()
+
+  local dt = 1 / fps
+  local textRow = string.rep(" ", w)
+  local fgRow   = string.rep("0", w)
+
+  local timerId = os.startTimer(0)
+
+  while true do
+    local row1 = readNonBlank(h)
+    if row1 == nil then break end
+
+    mon.setCursorPos(1, 1)
+    mon.blit(textRow, fgRow, row1)
+
+    for y = 2, hgt do
+      local row = readNonBlank(h)
+      if row == nil then h.close(); return end
+      mon.setCursorPos(1, y)
+      mon.blit(textRow, fgRow, row)
+    end
+
+    waitTimer(timerId)
+    timerId = os.startTimer(dt)
+  end
+
+  h.close()
+end
+
+while true do
+  playOnce()
+  if not LOOP then break end
+end
