@@ -1,0 +1,77 @@
+-- background.lua
+-- Minimal looping background player for text-based .nfv files
+-- Expects file format:
+--   Line 1: "W H FPS"
+--   Then frames: H lines per frame of W chars (0-9a-f)
+--   Optional blank line between frames
+
+local FILE = "gif_30s.nfv"   -- name of your local file
+local LOOP = true
+
+-- -------- open target --------
+local t = term
+
+-- -------- helpers --------
+local function readNonBlank(h)
+  while true do
+    local line = h.readLine()
+    if line == nil then return nil end
+    if line ~= "" then return line end
+  end
+end
+
+local function waitTimer(id)
+  while true do
+    local e, tid = os.pullEvent()
+    if e == "timer" and tid == id then return end
+  end
+end
+
+-- -------- play once --------
+local function playOnce()
+  local h = fs.open(FILE, "r")
+  if not h then error("Can't open "..FILE) end
+
+  local header = h.readLine()
+  local w, hgt, fps = header:match("^(%d+)%s+(%d+)%s+(%d+)$")
+  w, hgt, fps = tonumber(w), tonumber(hgt), tonumber(fps)
+
+  local dt = 1 / fps
+  local textRow = string.rep(" ", w)
+  local fgRow   = string.rep("0", w)
+
+  term.setCursorBlink(false)
+  term.setBackgroundColor(colors.black)
+  term.clear()
+
+  local timerId = os.startTimer(0)
+
+  while true do
+    local row1 = readNonBlank(h)
+    if row1 == nil then break end
+
+    term.setCursorPos(1, 1)
+    term.blit(textRow, fgRow, row1)
+
+    for y = 2, hgt do
+      local row = readNonBlank(h)
+      if row == nil then
+        h.close()
+        return
+      end
+      term.setCursorPos(1, y)
+      term.blit(textRow, fgRow, row)
+    end
+
+    waitTimer(timerId)
+    timerId = os.startTimer(dt)
+  end
+
+  h.close()
+end
+
+-- -------- loop forever --------
+while true do
+  playOnce()
+  if not LOOP then break end
+end
