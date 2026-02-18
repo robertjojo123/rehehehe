@@ -1,0 +1,104 @@
+-- background.lua
+-- Fixed-palette looping background player for text-based .nfv files
+
+local FILE = "gif_30s.nfv"
+
+-- ========= FIXED PALETTE =========
+-- Map indices 0..f to CC palette colors ONCE.
+-- These are chosen for smooth gradients & contrast.
+local PALETTE = {
+  [0] = {0.00, 0.00, 0.00}, -- black
+  [1] = {0.12, 0.12, 0.12},
+  [2] = {0.22, 0.22, 0.22},
+  [3] = {0.35, 0.35, 0.35},
+  [4] = {0.48, 0.48, 0.48},
+  [5] = {0.65, 0.65, 0.65},
+  [6] = {0.82, 0.82, 0.82},
+  [7] = {1.00, 1.00, 1.00}, -- white
+
+  -- subtle color accents (kept dark so it still reads as “background”)
+  [8] = {0.30, 0.10, 0.10}, -- dark red
+  [9] = {0.10, 0.25, 0.10}, -- dark green
+  [10]= {0.10, 0.15, 0.30}, -- dark blue
+  [11]= {0.30, 0.30, 0.10}, -- olive
+  [12]= {0.25, 0.10, 0.25}, -- purple
+  [13]= {0.10, 0.25, 0.25}, -- teal
+  [14]= {0.45, 0.30, 0.10}, -- brown
+  [15]= {0.60, 0.60, 0.60}, -- highlight gray
+}
+-- =================================
+
+-- ---------- helpers ----------
+local function readNonBlank(h)
+  while true do
+    local line = h.readLine()
+    if line == nil then return nil end
+    if line ~= "" then return line end
+  end
+end
+
+local function waitTimer(id)
+  while true do
+    local e, tid = os.pullEvent()
+    if e == "timer" and tid == id then return end
+  end
+end
+
+-- ---------- apply palette ONCE ----------
+for i = 0, 15 do
+  local c = PALETTE[i]
+  local mask = 2 ^ i
+  if term.setPaletteColour then
+    term.setPaletteColour(mask, c[1], c[2], c[3])
+  else
+    term.setPaletteColor(mask, c[1], c[2], c[3])
+  end
+end
+
+-- ---------- play ----------
+local function playOnce()
+  local h = fs.open(FILE, "r")
+  if not h then error("Can't open "..FILE) end
+
+  local header = h.readLine()
+  local w, hgt, fps = header:match("^(%d+)%s+(%d+)%s+(%d+)$")
+  w, hgt, fps = tonumber(w), tonumber(hgt), tonumber(fps)
+
+  local dt = 1 / fps
+  local textRow = string.rep(" ", w)
+  local fgRow   = string.rep("0", w)
+
+  term.setCursorBlink(false)
+  term.setBackgroundColor(colors.black)
+  term.clear()
+
+  local timerId = os.startTimer(0)
+
+  while true do
+    local row1 = readNonBlank(h)
+    if row1 == nil then break end
+
+    term.setCursorPos(1, 1)
+    term.blit(textRow, fgRow, row1)
+
+    for y = 2, hgt do
+      local row = readNonBlank(h)
+      if row == nil then
+        h.close()
+        return
+      end
+      term.setCursorPos(1, y)
+      term.blit(textRow, fgRow, row)
+    end
+
+    waitTimer(timerId)
+    timerId = os.startTimer(dt)
+  end
+
+  h.close()
+end
+
+-- ---------- loop forever ----------
+while true do
+  playOnce()
+end
