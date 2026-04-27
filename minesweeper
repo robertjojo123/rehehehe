@@ -1,0 +1,592 @@
+-- Pure CC:Tweaked Minesweeper
+-- 3x3 monitor setup recommended
+-- No-guess generator: board is only accepted if deterministic solver can clear it
+
+local monitor = peripheral.find("monitor")
+if monitor then
+    monitor.setTextScale(0.5)
+    term.redirect(monitor)
+end
+
+local W, H = term.getSize()
+
+local difficulties = {
+    { name = "Easy",       size = 7,  mines = 7   },
+    { name = "Medium",     size = 11, mines = 22  },
+    { name = "Hard",       size = 15, mines = 50  },
+    { name = "Impossible", size = 30, mines = 180 },
+}
+
+local colors = colours or colors
+
+local state = "menu"
+local boardSize = 7
+local mineCount = 7
+local board = {}
+local revealed = {}
+local flagged = {}
+local firstClick = true
+local gameOver = false
+local won = false
+local flagMode = false
+local generated = false
+local startTime = nil
+local elapsed = 0
+local status = ""
+
+local tileW = 2
+local tileH = 1
+local boardX = 1
+local boardY = 5
+
+local numberColors = {
+    [1] = colors.blue,
+    [2] = colors.green,
+    [3] = colors.red,
+    [4] = colors.purple,
+    [5] = colors.brown,
+    [6] = colors.cyan,
+    [7] = colors.black,
+    [8] = colors.gray,
+}
+
+local function clear(bg)
+    term.setBackgroundColor(bg or colors.black)
+    term.setTextColor(colors.white)
+    term.clear()
+    term.setCursorPos(1, 1)
+end
+
+local function writeAt(x, y, text, fg, bg)
+    term.setCursorPos(x, y)
+    if fg then term.setTextColor(fg) end
+    if bg then term.setBackgroundColor(bg) end
+    term.write(text)
+end
+
+local function centerText(y, text, fg, bg)
+    local x = math.floor((W - #text) / 2) + 1
+    writeAt(x, y, text, fg, bg)
+end
+
+local function inBounds(x, y)
+    return x >= 1 and x <= boardSize and y >= 1 and y <= boardSize
+end
+
+local function key(x, y)
+    return x .. "," .. y
+end
+
+local function neighbors(x, y)
+    local list = {}
+    for dx = -1, 1 do
+        for dy = -1, 1 do
+            if not (dx == 0 and dy == 0) then
+                local nx, ny = x + dx, y + dy
+                if inBounds(nx, ny) then
+                    table.insert(list, { nx, ny })
+                end
+            end
+        end
+    end
+    return list
+end
+
+local function countAdjacentMines(grid, x, y)
+    local count = 0
+    for _, n in ipairs(neighbors(x, y)) do
+        if grid[n[1]][n[2]] == -1 then
+            count = count + 1
+        end
+    end
+    return count
+end
+
+local function buildNumbers(grid)
+    for x = 1, boardSize do
+        for y = 1, boardSize do
+            if grid[x][y] ~= -1 then
+                grid[x][y] = countAdjacentMines(grid, x, y)
+            end
+        end
+    end
+end
+
+local function emptyGrid()
+    local grid = {}
+    for x = 1, boardSize do
+        grid[x] = {}
+        for y = 1, boardSize do
+            grid[x][y] = 0
+        end
+    end
+    return grid
+end
+
+local function copyGrid(grid)
+    local c = {}
+    for x = 1, boardSize do
+        c[x] = {}
+        for y = 1, boardSize do
+            c[x][y] = grid[x][y]
+        end
+    end
+    return c
+end
+
+local function safeZone(firstX, firstY)
+    local safe = {}
+    safe[key(firstX, firstY)] = true
+
+    for _, n in ipairs(neighbors(firstX, firstY)) do
+        safe[key(n[1], n[2])] = true
+    end
+
+    return safe
+end
+
+local function placeMines(firstX, firstY)
+    local grid = emptyGrid()
+    local safe = safeZone(firstX, firstY)
+
+    local placed = 0
+    while placed < mineCount do
+        local x = math.random(1, boardSize)
+        local y = math.random(1, boardSize)
+
+        if not safe[key(x, y)] and grid[x][y] ~= -1 then
+            grid[x][y] = -1
+            placed = placed + 1
+        end
+    end
+
+    buildNumbers(grid)
+    return grid
+end
+
+local function floodReveal(modelRevealed, grid, sx, sy)
+    local q = { { sx, sy } }
+    local qi = 1
+
+    while q[qi] do
+        local x, y = q[qi][1], q[qi][2]
+        qi = qi + 1
+
+        if inBounds(x, y) and not modelRevealed[x][y] then
+            modelRevealed[x][y] = true
+
+            if grid[x][y] == 0 then
+                for _, n in ipairs(neighbors(x, y)) do
+                    local nx, ny = n[1], n[2]
+                    if not modelRevealed[nx][ny] and grid[nx][ny] ~= -1 then
+                        table.insert(q, { nx, ny })
+                    end
+                end
+            end
+        end
+    end
+end
+
+local function makeBoolGrid(value)
+    local g = {}
+    for x = 1, boardSize do
+        g[x] = {}
+        for y = 1, boardSize do
+            g[x][y] = value or false
+        end
+    end
+    return g
+end
+
+local function solverCanClear(grid, firstX, firstY)
+    local r = makeBoolGrid(false)
+    local f = makeBoolGrid(false)
+
+    floodReveal(r, grid, firstX, firstY)
+
+    local changed = true
+
+    while changed do
+        changed = false
+
+        for x = 1, boardSize do
+            for y = 1, boardSize do
+                if r[x][y] and grid[x][y] > 0 then
+                    local hidden = {}
+                    local flagCount = 0
+
+                    for _, n in ipairs(neighbors(x, y)) do
+                        local nx, ny = n[1], n[2]
+                        if f[nx][ny] then
+                            flagCount = flagCount + 1
+                        elseif not r[nx][ny] then
+                            table.insert(hidden, { nx, ny })
+                        end
+                    end
+
+                    local remaining = grid[x][y] - flagCount
+
+                    if remaining == 0 and #hidden > 0 then
+                        for _, h in ipairs(hidden) do
+                            local hx, hy = h[1], h[2]
+                            if not r[hx][hy] and not f[hx][hy] then
+                                floodReveal(r, grid, hx, hy)
+                                changed = true
+                            end
+                        end
+                    elseif remaining == #hidden and #hidden > 0 then
+                        for _, h in ipairs(hidden) do
+                            local hx, hy = h[1], h[2]
+                            if not f[hx][hy] then
+                                f[hx][hy] = true
+                                changed = true
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    for x = 1, boardSize do
+        for y = 1, boardSize do
+            if grid[x][y] ~= -1 and not r[x][y] then
+                return false
+            end
+        end
+    end
+
+    return true
+end
+
+local function generateNoGuessBoard(firstX, firstY)
+    status = "Generating no-guess board..."
+    draw()
+
+    local attempts = 0
+
+    while true do
+        attempts = attempts + 1
+        local candidate = placeMines(firstX, firstY)
+
+        if solverCanClear(candidate, firstX, firstY) then
+            status = "No-guess board ready. Attempts: " .. attempts
+            return candidate
+        end
+
+        if attempts % 25 == 0 then
+            status = "Generating no-guess board... " .. attempts
+            drawHeader()
+        end
+    end
+end
+
+function drawHeader()
+    term.setBackgroundColor(colors.black)
+    term.setTextColor(colors.white)
+
+    for y = 1, 4 do
+        term.setCursorPos(1, y)
+        term.clearLine()
+    end
+
+    local modeText = flagMode and "FLAG" or "DIG"
+    local minesLeft = mineCount
+
+    for x = 1, boardSize do
+        for y = 1, boardSize do
+            if flagged[x] and flagged[x][y] then
+                minesLeft = minesLeft - 1
+            end
+        end
+    end
+
+    if startTime and not gameOver and not won then
+        elapsed = math.floor((os.epoch("utc") - startTime) / 1000)
+    end
+
+    writeAt(2, 1, "MINESWEEPER", colors.yellow, colors.black)
+    writeAt(2, 2, "Mines: " .. minesLeft .. "   Time: " .. elapsed .. "s   Mode: " .. modeText, colors.white, colors.black)
+
+    writeAt(2, 3, "[New]", colors.black, colors.lime)
+    writeAt(10, 3, "[Menu]", colors.black, colors.orange)
+    writeAt(19, 3, "[Flag/Dig]", flagMode and colors.white or colors.black, flagMode and colors.red or colors.lightGray)
+
+    if status ~= "" then
+        writeAt(32, 3, status:sub(1, W - 32), colors.lightGray, colors.black)
+    end
+end
+
+local function tileScreenPos(x, y)
+    return boardX + (x - 1) * tileW, boardY + (y - 1) * tileH
+end
+
+local function drawTile(x, y)
+    local sx, sy = tileScreenPos(x, y)
+
+    if gameOver and board[x][y] == -1 then
+        writeAt(sx, sy, " *", colors.white, colors.red)
+        return
+    end
+
+    if flagged[x][y] then
+        writeAt(sx, sy, " F", colors.white, colors.red)
+        return
+    end
+
+    if not revealed[x][y] then
+        writeAt(sx, sy, "  ", colors.white, colors.lightGray)
+        return
+    end
+
+    local v = board[x][y]
+
+    if v == 0 then
+        writeAt(sx, sy, "  ", colors.white, colors.gray)
+    elseif v > 0 then
+        writeAt(sx, sy, " " .. tostring(v), numberColors[v] or colors.white, colors.gray)
+    else
+        writeAt(sx, sy, " *", colors.white, colors.red)
+    end
+end
+
+local function drawBoard()
+    boardX = math.floor((W - boardSize * tileW) / 2) + 1
+    boardY = 5
+
+    for x = 1, boardSize do
+        for y = 1, boardSize do
+            drawTile(x, y)
+        end
+    end
+end
+
+function draw()
+    clear(colors.black)
+
+    if state == "menu" then
+        centerText(2, "CC:Tweaked Minesweeper", colors.yellow, colors.black)
+        centerText(4, "No-guess boards only", colors.lightBlue, colors.black)
+
+        for i, d in ipairs(difficulties) do
+            local text = "[" .. i .. "] " .. d.name .. " - " .. d.size .. "x" .. d.size .. " - " .. d.mines .. " mines"
+            centerText(6 + i * 2, text, colors.white, colors.gray)
+        end
+
+        centerText(H - 2, "Touch/click a difficulty, or press 1-4", colors.lightGray, colors.black)
+        return
+    end
+
+    drawHeader()
+    drawBoard()
+
+    if won then
+        centerText(4, "YOU WIN - board solved with no forced guessing", colors.lime, colors.black)
+    elseif gameOver then
+        centerText(4, "BOOM - press New or Menu", colors.red, colors.black)
+    end
+end
+
+local function resetGame()
+    board = emptyGrid()
+    revealed = makeBoolGrid(false)
+    flagged = makeBoolGrid(false)
+    firstClick = true
+    gameOver = false
+    won = false
+    generated = false
+    startTime = nil
+    elapsed = 0
+    status = "Click any tile to start"
+end
+
+local function startDifficulty(index)
+    local d = difficulties[index]
+    if not d then return end
+
+    boardSize = d.size
+    mineCount = d.mines
+    state = "game"
+    resetGame()
+    draw()
+end
+
+local function revealReal(x, y)
+    if not inBounds(x, y) then return end
+    if revealed[x][y] or flagged[x][y] then return end
+
+    if board[x][y] == -1 then
+        gameOver = true
+        status = "Mine hit"
+        return
+    end
+
+    local q = { { x, y } }
+    local qi = 1
+
+    while q[qi] do
+        local cx, cy = q[qi][1], q[qi][2]
+        qi = qi + 1
+
+        if inBounds(cx, cy) and not revealed[cx][cy] and not flagged[cx][cy] then
+            revealed[cx][cy] = true
+
+            if board[cx][cy] == 0 then
+                for _, n in ipairs(neighbors(cx, cy)) do
+                    local nx, ny = n[1], n[2]
+                    if not revealed[nx][ny] and not flagged[nx][ny] then
+                        table.insert(q, { nx, ny })
+                    end
+                end
+            end
+        end
+    end
+end
+
+local function checkWin()
+    for x = 1, boardSize do
+        for y = 1, boardSize do
+            if board[x][y] ~= -1 and not revealed[x][y] then
+                return false
+            end
+        end
+    end
+
+    return true
+end
+
+local function screenToTile(sx, sy)
+    local tx = math.floor((sx - boardX) / tileW) + 1
+    local ty = sy - boardY + 1
+
+    if inBounds(tx, ty) then
+        return tx, ty
+    end
+
+    return nil, nil
+end
+
+local function handleGameClick(x, y, button)
+    if y == 3 then
+        if x >= 2 and x <= 6 then
+            resetGame()
+            draw()
+            return
+        elseif x >= 10 and x <= 15 then
+            state = "menu"
+            draw()
+            return
+        elseif x >= 19 and x <= 29 then
+            flagMode = not flagMode
+            draw()
+            return
+        end
+    end
+
+    if gameOver or won then return end
+
+    local tx, ty = screenToTile(x, y)
+    if not tx then return end
+
+    local wantsFlag = flagMode or button == 2
+
+    if wantsFlag then
+        if not revealed[tx][ty] then
+            flagged[tx][ty] = not flagged[tx][ty]
+        end
+        draw()
+        return
+    end
+
+    if flagged[tx][ty] then return end
+
+    if firstClick then
+        board = generateNoGuessBoard(tx, ty)
+        firstClick = false
+        generated = true
+        startTime = os.epoch("utc")
+    end
+
+    revealReal(tx, ty)
+
+    if checkWin() then
+        won = true
+        status = "Solved"
+    end
+
+    draw()
+end
+
+local function handleMenuClick(x, y)
+    for i = 1, #difficulties do
+        local row = 6 + i * 2
+        if y == row then
+            startDifficulty(i)
+            return
+        end
+    end
+end
+
+math.randomseed(os.epoch("utc"))
+
+resetGame()
+state = "menu"
+draw()
+
+local function timerLoop()
+    while true do
+        if state == "game" then
+            drawHeader()
+        end
+        sleep(1)
+    end
+end
+
+local function inputLoop()
+    while true do
+        local e = { os.pullEventRaw() }
+        local ev = e[1]
+
+        if ev == "terminate" then
+            term.redirect(term.native and term.native() or term.current())
+            clear(colors.black)
+            return
+        elseif ev == "monitor_touch" then
+            local x, y = e[3], e[4]
+            if state == "menu" then
+                handleMenuClick(x, y)
+            else
+                handleGameClick(x, y, 1)
+            end
+        elseif ev == "mouse_click" then
+            local button, x, y = e[2], e[3], e[4]
+            if state == "menu" then
+                handleMenuClick(x, y)
+            else
+                handleGameClick(x, y, button)
+            end
+        elseif ev == "key" then
+            local k = e[2]
+
+            if state == "menu" then
+                if k == keys.one then startDifficulty(1) end
+                if k == keys.two then startDifficulty(2) end
+                if k == keys.three then startDifficulty(3) end
+                if k == keys.four then startDifficulty(4) end
+            else
+                if k == keys.f then
+                    flagMode = not flagMode
+                    draw()
+                elseif k == keys.r then
+                    resetGame()
+                    draw()
+                elseif k == keys.m then
+                    state = "menu"
+                    draw()
+                end
+            end
+        end
+    end
+end
+
+parallel.waitForAny(inputLoop, timerLoop)
