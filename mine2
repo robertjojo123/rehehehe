@@ -1,0 +1,447 @@
+-- CC:Tweaked Minesweeper (No Guess Version)
+-- FULL VERSION WITH UI IMPROVEMENTS
+
+local monitor = peripheral.find("monitor")
+if monitor then
+    monitor.setTextScale(0.5)
+    term.redirect(monitor)
+end
+
+local W, H = term.getSize()
+
+local difficulties = {
+    { name = "Easy",       size = 7,  mines = 7   },
+    { name = "Medium",     size = 11, mines = 22  },
+    { name = "Hard",       size = 15, mines = 50  },
+    { name = "Impossible", size = 30, mines = 180 },
+}
+
+local colors = colours
+
+local state = "menu"
+local boardSize, mineCount = 7, 7
+
+local board = {}
+local revealed = {}
+local flagged = {}
+
+local firstClick = true
+local gameOver = false
+local won = false
+local flagMode = false
+
+local startTime = nil
+local elapsed = 0
+local status = ""
+
+local tileW = 2
+local boardX = 1
+local boardY = 6
+
+local numberColors = {
+    [1]=colors.blue,[2]=colors.green,[3]=colors.red,[4]=colors.purple,
+    [5]=colors.brown,[6]=colors.cyan,[7]=colors.black,[8]=colors.gray
+}
+
+-- ================= UTIL =================
+
+local function clear(bg)
+    term.setBackgroundColor(bg or colors.black)
+    term.setTextColor(colors.white)
+    term.clear()
+    term.setCursorPos(1,1)
+end
+
+local function writeAt(x,y,t,fg,bg)
+    term.setCursorPos(x,y)
+    if fg then term.setTextColor(fg) end
+    if bg then term.setBackgroundColor(bg) end
+    term.write(t)
+end
+
+local function center(y,t,fg,bg)
+    writeAt(math.floor((W-#t)/2)+1,y,t,fg,bg)
+end
+
+local function inBounds(x,y)
+    return x>=1 and x<=boardSize and y>=1 and y<=boardSize
+end
+
+local function neighbors(x,y)
+    local n={}
+    for dx=-1,1 do
+        for dy=-1,1 do
+            if not(dx==0 and dy==0) then
+                local nx,ny=x+dx,y+dy
+                if inBounds(nx,ny) then table.insert(n,{nx,ny}) end
+            end
+        end
+    end
+    return n
+end
+
+-- ================= GRID =================
+
+local function emptyGrid(val)
+    local g={}
+    for x=1,boardSize do
+        g[x]={}
+        for y=1,boardSize do g[x][y]=val or 0 end
+    end
+    return g
+end
+
+local function countMines(g,x,y)
+    local c=0
+    for _,n in ipairs(neighbors(x,y)) do
+        if g[n[1]][n[2]]==-1 then c=c+1 end
+    end
+    return c
+end
+
+local function buildNumbers(g)
+    for x=1,boardSize do
+        for y=1,boardSize do
+            if g[x][y]~=-1 then g[x][y]=countMines(g,x,y) end
+        end
+    end
+end
+
+local function placeMines(fx,fy)
+    local g=emptyGrid(0)
+
+    local safe={}
+    safe[fx..","..fy]=true
+    for _,n in ipairs(neighbors(fx,fy)) do
+        safe[n[1]..","..n[2]]=true
+    end
+
+    local placed=0
+    while placed<mineCount do
+        local x=math.random(1,boardSize)
+        local y=math.random(1,boardSize)
+        if not safe[x..","..y] and g[x][y]~=-1 then
+            g[x][y]=-1
+            placed=placed+1
+        end
+    end
+
+    buildNumbers(g)
+    return g
+end
+
+-- ================= SOLVER =================
+
+local function flood(r,g,x,y)
+    local q={{x,y}} local i=1
+    while q[i] do
+        local cx,cy=q[i][1],q[i][2] i=i+1
+        if inBounds(cx,cy) and not r[cx][cy] then
+            r[cx][cy]=true
+            if g[cx][cy]==0 then
+                for _,n in ipairs(neighbors(cx,cy)) do
+                    table.insert(q,n)
+                end
+            end
+        end
+    end
+end
+
+local function solverCanClear(g,fx,fy)
+    local r=emptyGrid(false)
+    local f=emptyGrid(false)
+
+    flood(r,g,fx,fy)
+
+    local changed=true
+    while changed do
+        changed=false
+        for x=1,boardSize do
+            for y=1,boardSize do
+                if r[x][y] and g[x][y]>0 then
+                    local hidden={} local flags=0
+                    for _,n in ipairs(neighbors(x,y)) do
+                        if f[n[1]][n[2]] then flags=flags+1
+                        elseif not r[n[1]][n[2]] then table.insert(hidden,n)
+                        end
+                    end
+
+                    local remain=g[x][y]-flags
+
+                    if remain==0 then
+                        for _,h in ipairs(hidden) do
+                            flood(r,g,h[1],h[2]) changed=true
+                        end
+                    elseif remain==#hidden then
+                        for _,h in ipairs(hidden) do
+                            f[h[1]][h[2]]=true changed=true
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    for x=1,boardSize do
+        for y=1,boardSize do
+            if g[x][y]~=-1 and not r[x][y] then return false end
+        end
+    end
+
+    return true
+end
+
+local function generateBoard(fx,fy)
+    status="Generating..."
+    draw()
+
+    local tries=0
+    while true do
+        tries=tries+1
+        local g=placeMines(fx,fy)
+        if solverCanClear(g,fx,fy) then
+            status="Ready ("..tries.." tries)"
+            return g
+        end
+    end
+end
+
+-- ================= DRAW =================
+
+local function tilePos(x,y)
+    return boardX+(x-1)*tileW, boardY+(y-1)
+end
+
+local function drawBorder()
+    local l=boardX-1
+    local r=boardX+boardSize*tileW
+    local t=boardY-1
+    local b=boardY+boardSize
+
+    writeAt(l,t,"+",colors.white)
+    writeAt(r,t,"+",colors.white)
+    writeAt(l,b,"+",colors.white)
+    writeAt(r,b,"+",colors.white)
+
+    for x=l+1,r-1 do
+        writeAt(x,t,"-",colors.white)
+        writeAt(x,b,"-",colors.white)
+    end
+
+    for y=t+1,b-1 do
+        writeAt(l,y,"|",colors.white)
+        writeAt(r,y,"|",colors.white)
+    end
+end
+
+local function drawTile(x,y)
+    local sx,sy=tilePos(x,y)
+
+    if gameOver and board[x][y]==-1 then
+        writeAt(sx,sy," *",colors.white,colors.red) return
+    end
+
+    if flagged[x][y] then
+        writeAt(sx,sy," F",colors.white,colors.red) return
+    end
+
+    if not revealed[x][y] then
+        if firstClick then
+            local cx=math.ceil(boardSize/2)
+            local cy=math.ceil(boardSize/2)
+            local d=math.abs(x-cx)+math.abs(y-cy)
+
+            if d==0 then
+                writeAt(sx,sy,"[]",colors.black,colors.lime)
+            elseif d<=2 then
+                writeAt(sx,sy,"  ",colors.white,colors.green)
+            else
+                writeAt(sx,sy,"  ",colors.white,colors.lightGray)
+            end
+        else
+            writeAt(sx,sy,"  ",colors.white,colors.lightGray)
+        end
+        return
+    end
+
+    local v=board[x][y]
+    if v==0 then
+        writeAt(sx,sy,"  ",nil,colors.gray)
+    else
+        writeAt(sx,sy," "..v,numberColors[v],colors.gray)
+    end
+end
+
+local function drawBoard()
+    boardX = math.floor((W - boardSize*tileW)/2)+1
+    boardY = 6
+
+    drawBorder()
+
+    for x=1,boardSize do
+        for y=1,boardSize do
+            drawTile(x,y)
+        end
+    end
+end
+
+local function drawHeader()
+    for y=1,5 do
+        term.setCursorPos(1,y) term.clearLine()
+    end
+
+    writeAt(2,1,"MINESWEEPER",colors.yellow)
+    writeAt(2,2,"Mines: "..mineCount.."  Time: "..elapsed.."s",colors.white)
+    writeAt(2,3,"[New]",colors.black,colors.lime)
+    writeAt(10,3,"[Menu]",colors.black,colors.orange)
+    writeAt(20,3,"[Flag/Dig]",colors.black,colors.gray)
+
+    if firstClick then
+        writeAt(2,4,"Start in green zone",colors.lime)
+    end
+
+    writeAt(2,5,status,colors.lightGray)
+end
+
+function draw()
+    clear(colors.black)
+
+    if state=="menu" then
+        center(3,"MINESWEEPER",colors.yellow)
+        for i,d in ipairs(difficulties) do
+            center(5+i*2,"["..i.."] "..d.name.." "..d.size.."x"..d.size,colors.white)
+        end
+        return
+    end
+
+    drawHeader()
+    drawBoard()
+
+    if won then center(4,"YOU WIN",colors.lime) end
+    if gameOver then center(4,"BOOM",colors.red) end
+end
+
+-- ================= GAME =================
+
+local function reset()
+    board=emptyGrid(0)
+    revealed=emptyGrid(false)
+    flagged=emptyGrid(false)
+    firstClick=true
+    gameOver=false
+    won=false
+    status="Click to start"
+end
+
+local function reveal(x,y)
+    if not inBounds(x,y) or revealed[x][y] or flagged[x][y] then return end
+
+    if board[x][y]==-1 then
+        gameOver=true return
+    end
+
+    local q={{x,y}} local i=1
+    while q[i] do
+        local cx,cy=q[i][1],q[i][2] i=i+1
+        if inBounds(cx,cy) and not revealed[cx][cy] then
+            revealed[cx][cy]=true
+            if board[cx][cy]==0 then
+                for _,n in ipairs(neighbors(cx,cy)) do table.insert(q,n) end
+            end
+        end
+    end
+end
+
+local function checkWin()
+    for x=1,boardSize do
+        for y=1,boardSize do
+            if board[x][y]~=-1 and not revealed[x][y] then return false end
+        end
+    end
+    return true
+end
+
+-- ================= INPUT =================
+
+local function click(x,y,btn)
+    if y==3 then
+        if x<8 then reset() draw() return end
+        if x<18 then state="menu" draw() return end
+        flagMode=not flagMode draw() return
+    end
+
+    local tx=math.floor((x-boardX)/tileW)+1
+    local ty=y-boardY+1
+    if not inBounds(tx,ty) then return end
+
+    if flagMode or btn==2 then
+        flagged[tx][ty]=not flagged[tx][ty]
+        draw() return
+    end
+
+    if firstClick then
+        board=generateBoard(tx,ty)
+        firstClick=false
+        startTime=os.epoch("utc")
+    end
+
+    reveal(tx,ty)
+
+    if checkWin() then won=true end
+    draw()
+end
+
+-- ================= LOOP =================
+
+math.randomseed(os.epoch("utc"))
+reset()
+state="menu"
+draw()
+
+parallel.waitForAny(
+function()
+    while true do
+        if startTime and not gameOver and not won then
+            elapsed=math.floor((os.epoch("utc")-startTime)/1000)
+            drawHeader()
+        end
+        sleep(1)
+    end
+end,
+function()
+    while true do
+        local e={os.pullEventRaw()}
+        if e[1]=="mouse_click" then
+            if state=="menu" then
+                local y=e[4]
+                for i=1,#difficulties do
+                    if y==5+i*2 then
+                        boardSize=difficulties[i].size
+                        mineCount=difficulties[i].mines
+                        state="game"
+                        reset()
+                        draw()
+                    end
+                end
+            else
+                click(e[3],e[4],e[2])
+            end
+        elseif e[1]=="monitor_touch" then
+            if state=="menu" then
+                local y=e[4]
+                for i=1,#difficulties do
+                    if y==5+i*2 then
+                        boardSize=difficulties[i].size
+                        mineCount=difficulties[i].mines
+                        state="game"
+                        reset()
+                        draw()
+                    end
+                end
+            else
+                click(e[3],e[4],1)
+            end
+        end
+    end
+end
+)
