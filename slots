@@ -1,0 +1,410 @@
+-- Slot Game Computer - Rednet + Redstone Integrator Reel Version
+-- Reels are controlled by redstone integrators instead of analog redstone outputs.
+--
+-- Reel peripherals:
+--   redstone_integrator_4061 = left reel
+--   redstone_integrator_4060 = middle reel
+--   redstone_integrator_4059 = far right reel
+--
+-- Symbol outputs:
+--   up    = sapphire = 5x jackpot symbol
+--   down  = nickel   = 2x symbol
+--   north = ruby     = 2x symbol
+--
+-- Timing:
+--   pulse ON  = 0.3s
+--   pulse OFF = 0.3s
+
+-- =========================================================
+-- === Config
+-- =========================================================
+
+local MODEM_SIDE = "bottom"
+local PROTOCOL = "slots"
+
+-- Set this to the bank computer ID if you want direct rednet.send().
+-- Leave nil to rednet.broadcast() to anything listening on protocol "slots".
+local BANK_COMPUTER_ID = nil
+
+local STATS_FILE = "stats.txt"
+
+local REEL_LEFT_NAME = "redstone_integrator_4061"
+local REEL_MIDDLE_NAME = "redstone_integrator_4060"
+local REEL_RIGHT_NAME = "redstone_integrator_4059"
+
+local PULSE_ON_TIME = 0.3
+local PULSE_OFF_TIME = 0.3
+
+local PLAY_TIME = 15
+
+-- 5x jackpot tuning.
+-- 235 was old-ish generous setting.
+-- 170 targets around 3.3% total 5x hit rate.
+local JACKPOT_THIRD_REEL_CHANCE_PER_1000 = 170
+
+-- 2x completion tuning from your old setup.
+local TWO_X_THIRD_REEL_CHANCE_PER_1000 = 549
+
+-- Symbol IDs used internally.
+local RUBY = "ruby"
+local NICKEL = "nickel"
+local SAPPHIRE = "sapphire"
+
+local SYMBOL_TO_SIDE = {
+    [SAPPHIRE] = "up",
+    [NICKEL] = "down",
+    [RUBY] = "north"
+}
+
+local SYMBOL_LABEL = {
+    [SAPPHIRE] = "SAPPHIRE",
+    [NICKEL] = "NICKEL",
+    [RUBY] = "RUBY"
+}
+
+-- =========================================================
+-- === Peripherals
+-- =========================================================
+
+local modem = peripheral.wrap(MODEM_SIDE)
+if not modem then error("No modem on " .. MODEM_SIDE) end
+
+rednet.open(MODEM_SIDE)
+
+local speaker = peripheral.find("speaker")
+
+local reelLeft = peripheral.wrap(REEL_LEFT_NAME)
+local reelMiddle = peripheral.wrap(REEL_MIDDLE_NAME)
+local reelRight = peripheral.wrap(REEL_RIGHT_NAME)
+
+if not reelLeft then error("Could not wrap " .. REEL_LEFT_NAME) end
+if not reelMiddle then error("Could not wrap " .. REEL_MIDDLE_NAME) end
+if not reelRight then error("Could not wrap " .. REEL_RIGHT_NAME) end
+
+local REELS = {
+    left = reelLeft,
+    middle = reelMiddle,
+    right = reelRight
+}
+
+-- =========================================================
+-- === Persistent Stats
+-- =========================================================
+
+local function loadStats()
+    if fs.exists(STATS_FILE) then
+        local f = fs.open(STATS_FILE, "r")
+        local data = textutils.unserialize(f.readAll())
+        f.close()
+        return data or {}
+    end
+    return {}
+end
+
+local function saveStats(stats)
+    local f = fs.open(STATS_FILE, "w")
+    f.write(textutils.serialize(stats))
+    f.close()
+end
+
+local stats = loadStats()
+stats.totalPlays = stats.totalPlays or 0
+stats.wins2x = stats.wins2x or 0
+stats.wins5x = stats.wins5x or 0
+stats.payoutBalance = stats.payoutBalance or 0
+
+-- =========================================================
+-- === Rednet Messaging
+-- =========================================================
+
+local function sendMessage(msg)
+    if BANK_COMPUTER_ID then
+        rednet.send(BANK_COMPUTER_ID, msg, PROTOCOL)
+    else
+        rednet.broadcast(msg, PROTOCOL)
+    end
+end
+
+local function receiveMessage(timeout)
+    local sender, msg = rednet.receive(PROTOCOL, timeout or 2)
+    return msg, sender
+end
+
+-- =========================================================
+-- === Sounds
+-- =========================================================
+
+local function playAcceptSound()
+    if speaker then speaker.playNote("pling", 1, 7) end
+end
+
+local function playDenialSound()
+    if speaker then speaker.playNote("bass", 1, 3) end
+end
+
+local function playDenialSequence()
+    for i = 1, 3 do
+        playDenialSound()
+        sleep(0.2)
+    end
+end
+
+local function playWinSequence(count)
+    for i = 1, count do
+        playAcceptSound()
+        sleep(0.2)
+    end
+end
+
+-- =========================================================
+-- === Bank / Token Request
+-- =========================================================
+
+local function waitForBankItem()
+    while redstone.getInput("top") do
+        sendMessage({
+            type = "request_item"
+        })
+
+        local reply = receiveMessage(2)
+
+        if reply == "item_transferred" or (type(reply) == "table" and reply.type == "item_transferred") then
+            playAcceptSound()
+            return true
+
+        elseif reply == "no_item" or (type(reply) == "table" and reply.type == "no_item") then
+            playDenialSequence()
+        end
+
+        sleep(0.1)
+    end
+
+    return false
+end
+
+local function sendPayout(amount)
+    sendMessage({
+        type = "payout",
+        amount = amount
+    })
+end
+
+-- =========================================================
+-- === Redstone Integrator Reel Control
+-- =========================================================
+
+local function clearIntegrator(integrator)
+    for _, side in pairs(SYMBOL_TO_SIDE) do
+        integrator.setOutput(side, false)
+    end
+end
+
+local function clearAllReels()
+    clearIntegrator(reelLeft)
+    clearIntegrator(reelMiddle)
+    clearIntegrator(reelRight)
+end
+
+local function pulseSymbol(integrator, symbol)
+    local side = SYMBOL_TO_SIDE[symbol]
+    if not side then error("No side mapped for symbol: " .. tostring(symbol)) end
+
+    clearIntegrator(integrator)
+    integrator.setOutput(side, true)
+    sleep(PULSE_ON_TIME)
+    integrator.setOutput(side, false)
+    sleep(PULSE_OFF_TIME)
+end
+
+local function cycleReel(integrator, duration, finalSymbol)
+    local sequence = {RUBY, NICKEL, SAPPHIRE}
+    local index = 1
+    local startTime = os.clock()
+
+    while os.clock() - startTime < duration do
+        local symbol = sequence[index]
+
+        -- During animation, avoid over-pulsing the final symbol constantly.
+        -- Final symbol gets a clean final pulse at the end.
+        if symbol ~= finalSymbol then
+            pulseSymbol(integrator, symbol)
+        else
+            sleep(PULSE_ON_TIME + PULSE_OFF_TIME)
+        end
+
+        index = (index % #sequence) + 1
+    end
+
+    -- Final result pulse
+    pulseSymbol(integrator, finalSymbol)
+end
+
+-- =========================================================
+-- === Slot Logic
+-- =========================================================
+
+local function randomSymbol()
+    local roll = math.random(1, 3)
+    if roll == 1 then return RUBY end
+    if roll == 2 then return NICKEL end
+    return SAPPHIRE
+end
+
+local function biasedLeftSymbol()
+    -- Old behavior favored the 2x symbols.
+    -- 75% ruby/nickel, 25% sapphire.
+    if math.random(100) <= 75 then
+        return (math.random(2) == 1) and RUBY or NICKEL
+    else
+        return SAPPHIRE
+    end
+end
+
+local function decideMiddle(left)
+    -- Old behavior: middle matches left about 77.5% of the time.
+    if math.random(1000) <= 775 then
+        return left
+    end
+
+    local alt
+    repeat
+        alt = randomSymbol()
+    until alt ~= left
+
+    return alt
+end
+
+local function decideRight(left, middle)
+    if left == middle then
+        if left == SAPPHIRE then
+            -- 5x jackpot chance tuning.
+            if math.random(1000) <= JACKPOT_THIRD_REEL_CHANCE_PER_1000 then
+                return SAPPHIRE
+            end
+
+            -- If jackpot fails, force a non-sapphire so it does not accidentally jackpot.
+            local alt
+            repeat
+                alt = randomSymbol()
+            until alt ~= SAPPHIRE
+            return alt
+
+        else
+            -- 2x symbol completion chance.
+            if math.random(1000) <= TWO_X_THIRD_REEL_CHANCE_PER_1000 then
+                return left
+            end
+
+            -- If 2x completion fails, force a different symbol so it does not accidentally win.
+            local alt
+            repeat
+                alt = randomSymbol()
+            until alt ~= left
+            return alt
+        end
+    end
+
+    -- If first two reels don't match, third reel can be anything.
+    -- No triple is possible when left ~= middle.
+    return randomSymbol()
+end
+
+local function getPayout(left, middle, right)
+    if left == middle and middle == right then
+        if right == SAPPHIRE then
+            return 5
+        elseif right == NICKEL or right == RUBY then
+            return 2
+        end
+    end
+
+    return 0
+end
+
+-- =========================================================
+-- === Main
+-- =========================================================
+
+math.randomseed(os.epoch("utc") + os.getComputerID())
+for i = 1, 10 do math.random() end
+
+clearAllReels()
+
+print("Slot machine ready.")
+print("Mode: Rednet + redstone integrators")
+print("Left reel:   " .. REEL_LEFT_NAME)
+print("Middle reel: " .. REEL_MIDDLE_NAME)
+print("Right reel:  " .. REEL_RIGHT_NAME)
+print("Protocol: " .. PROTOCOL)
+print("Bank computer ID: " .. tostring(BANK_COMPUTER_ID or "broadcast"))
+print("5x tuning: " .. JACKPOT_THIRD_REEL_CHANCE_PER_1000 .. "/1000 third-reel completion")
+print("")
+
+while true do
+    if redstone.getInput("top") then
+        if waitForBankItem() then
+            local left = biasedLeftSymbol()
+            local middle = decideMiddle(left)
+            local right = decideRight(left, middle)
+
+            local leftDur = PLAY_TIME / 3
+            local middleDur = (2 * PLAY_TIME) / 3
+            local rightDur = PLAY_TIME
+
+            parallel.waitForAll(
+                function() cycleReel(reelLeft, leftDur, left) end,
+                function() cycleReel(reelMiddle, middleDur, middle) end,
+                function() cycleReel(reelRight, rightDur, right) end
+            )
+
+            stats.totalPlays = stats.totalPlays + 1
+            stats.payoutBalance = stats.payoutBalance - 1
+
+            local payout = getPayout(left, middle, right)
+
+            print(
+                "L:" .. SYMBOL_LABEL[left]
+                .. " M:" .. SYMBOL_LABEL[middle]
+                .. " R:" .. SYMBOL_LABEL[right]
+            )
+
+            if payout == 5 then
+                stats.wins5x = stats.wins5x + 1
+                stats.payoutBalance = stats.payoutBalance + 5
+
+                os.sleep(7)
+                sendPayout(5)
+                playWinSequence(5)
+                print(">>> SAPPHIRE 5x WIN!")
+
+            elseif payout == 2 then
+                stats.wins2x = stats.wins2x + 1
+                stats.payoutBalance = stats.payoutBalance + 2
+
+                os.sleep(7)
+                sendPayout(2)
+                playWinSequence(2)
+                print(">>> 2x WIN!")
+
+            else
+                os.sleep(7)
+                playDenialSequence()
+                print("No win.")
+            end
+
+            saveStats(stats)
+
+            print(string.format(
+                "Plays: %d | 2x Wins: %d | 5x Wins: %d | Payout: %+d",
+                stats.totalPlays,
+                stats.wins2x,
+                stats.wins5x,
+                stats.payoutBalance
+            ))
+
+            sleep(PLAY_TIME)
+        end
+    end
+
+    sleep(0.1)
+end
