@@ -1,0 +1,473 @@
+-- Game Computer Script
+-- Bank/messaging/sounds/stats preserved from channel 1 version
+-- Reel outputs use redstone integrator pulses instead of analog redstone
+--
+-- Integrators:
+--   redstone_integrator_4061 = LEFT reel
+--   redstone_integrator_4060 = MIDDLE reel
+--   redstone_integrator_4059 = RIGHT reel
+--
+-- Symbol directions:
+--   up    = Sapphire = 5x
+--   down  = Nickel   = 2x
+--   north = Ruby     = 2x
+--
+-- Spin timing:
+--   0.5s on
+--   0.6s off
+--
+-- Final result stays extended briefly, payout happens quickly,
+-- then machine resets for next play.
+
+math.randomseed(os.time())
+
+-- === Peripherals ===
+local modem = peripheral.wrap("bottom")
+local speaker = peripheral.find("speaker")
+
+if not modem then error("No modem on bottom") end
+modem.open(1)
+
+local leftIntegrator = peripheral.wrap("redstone_integrator_4061")
+local middleIntegrator = peripheral.wrap("redstone_integrator_4060")
+local rightIntegrator = peripheral.wrap("redstone_integrator_4059")
+
+if not leftIntegrator then error("Missing redstone_integrator_4061 for LEFT reel") end
+if not middleIntegrator then error("Missing redstone_integrator_4060 for MIDDLE reel") end
+if not rightIntegrator then error("Missing redstone_integrator_4059 for RIGHT reel") end
+
+local STATS_FILE = "stats.txt"
+
+-- === Config ===
+local PLAY_TIME = 15
+local PULSE_ON_TIME = 0.5
+local PULSE_OFF_TIME = 0.6
+
+-- Result visible before payout/no-win sound.
+local FINAL_HOLD_TIME = 2.5
+
+-- After payout/no-win sequence, wait before accepting another play.
+local POST_ROUND_DELAY = 4.5
+
+-- 5x tuning: about 3.3% total 5x hit rate using your earlier odds structure.
+local JACKPOT_CHANCE_PER_1000 = 170
+
+-- 2x tuning from your previous code
+local TWO_X_CHANCE_PER_1000 = 549
+
+-- Symbols
+local RUBY = "ruby"
+local NICKEL = "nickel"
+local SAPPHIRE = "sapphire"
+
+local SYMBOL_TO_SIDE = {
+    [SAPPHIRE] = "up",
+    [NICKEL] = "down",
+    [RUBY] = "north"
+}
+
+local SYMBOL_LABEL = {
+    [SAPPHIRE] = "SAPPHIRE",
+    [NICKEL] = "NICKEL",
+    [RUBY] = "RUBY"
+}
+
+local SYMBOL_SHORT = {
+    [SAPPHIRE] = "S",
+    [NICKEL] = "N",
+    [RUBY] = "R"
+}
+
+local SYMBOL_SEQUENCE = {RUBY, NICKEL, SAPPHIRE}
+
+-- === Persistent stats ===
+local function loadStats()
+    if fs.exists(STATS_FILE) then
+        local f = fs.open(STATS_FILE, "r")
+        local data = textutils.unserialize(f.readAll())
+        f.close()
+        return data or {}
+    end
+    return {}
+end
+
+local function saveStats(stats)
+    local f = fs.open(STATS_FILE, "w")
+    f.write(textutils.serialize(stats))
+    f.close()
+end
+
+local stats = loadStats()
+stats.totalPlays = stats.totalPlays or 0
+stats.wins2x = stats.wins2x or 0
+stats.wins5x = stats.wins5x or 0
+stats.payoutBalance = stats.payoutBalance or 0
+
+-- === Messaging: kept like old channel 1 code ===
+local function sendMessage(msg)
+    modem.transmit(1, 1, msg)
+end
+
+local function receiveMessage(timeout)
+    local timer = os.startTimer(timeout or 2)
+
+    while true do
+        local event, side, ch, _, msg = os.pullEvent()
+
+        if event == "modem_message" and ch == 1 then
+            return msg
+        elseif event == "timer" and side == timer then
+            return nil
+        end
+    end
+end
+
+-- === Sounds ===
+local function playAcceptSound()
+    if speaker then speaker.playNote("pling", 1, 7) end
+end
+
+local function playSpinTick()
+    if speaker then speaker.playNote("hat", 0.8, 12) end
+end
+
+local function playReelStopSound()
+    if speaker then
+        speaker.playNote("pling", 1, 10)
+        sleep(0.08)
+        speaker.playNote("pling", 1, 14)
+    end
+end
+
+local function playDenialSound()
+    if speaker then speaker.playNote("bass", 1, 3) end
+end
+
+local function playDenialSequence()
+    for i = 1, 3 do
+        playDenialSound()
+        sleep(0.2)
+    end
+end
+
+local function playWinSequence(count)
+    for i = 1, count do
+        playAcceptSound()
+        sleep(0.18)
+    end
+end
+
+local function playStartSpinSound()
+    if speaker then
+        speaker.playNote("pling", 1, 5)
+        sleep(0.08)
+        speaker.playNote("pling", 1, 8)
+        sleep(0.08)
+        speaker.playNote("pling", 1, 12)
+    end
+end
+
+-- === Bank item request ===
+local function waitForBankItem()
+    while redstone.getInput("top") do
+        sendMessage("request_item")
+
+        local reply = receiveMessage(2)
+
+        if reply == "item_transferred" then
+            playAcceptSound()
+            return true
+        elseif reply == "no_item" then
+            playDenialSequence()
+        end
+
+        sleep(0.1)
+    end
+
+    return false
+end
+
+-- === Redstone integrator output ===
+local function clearIntegrator(integrator)
+    integrator.setOutput("up", false)
+    integrator.setOutput("down", false)
+    integrator.setOutput("north", false)
+end
+
+local function clearAllIntegrators()
+    clearIntegrator(leftIntegrator)
+    clearIntegrator(middleIntegrator)
+    clearIntegrator(rightIntegrator)
+end
+
+local function setSymbolHeld(integrator, symbol)
+    local side = SYMBOL_TO_SIDE[symbol]
+    if not side then error("Invalid symbol: " .. tostring(symbol)) end
+
+    clearIntegrator(integrator)
+    integrator.setOutput(side, true)
+end
+
+local function pulseSymbol(integrator, symbol, makeSound)
+    local side = SYMBOL_TO_SIDE[symbol]
+    if not side then error("Invalid symbol: " .. tostring(symbol)) end
+
+    clearIntegrator(integrator)
+    sleep(0.02)
+
+    integrator.setOutput(side, true)
+
+    if makeSound then
+        playSpinTick()
+    end
+
+    sleep(PULSE_ON_TIME)
+
+    integrator.setOutput(side, false)
+    sleep(PULSE_OFF_TIME)
+end
+
+local function nextSymbolAfter(current)
+    if current == RUBY then return NICKEL end
+    if current == NICKEL then return SAPPHIRE end
+    return RUBY
+end
+
+local function pulseOtherSymbolsBeforeFinal(integrator, finalSymbol, lastSymbol)
+    -- Makes the reel visibly cycle through other options before landing.
+    local current = lastSymbol
+
+    for _, symbol in ipairs(SYMBOL_SEQUENCE) do
+        if symbol ~= finalSymbol and symbol ~= current then
+            pulseSymbol(integrator, symbol, true)
+            current = symbol
+        end
+    end
+
+    -- Force one more non-final symbol if needed, so it doesn't look like a direct pick.
+    if current == finalSymbol or current == lastSymbol then
+        local forced = nextSymbolAfter(finalSymbol)
+        if forced == current then
+            forced = nextSymbolAfter(forced)
+        end
+        pulseSymbol(integrator, forced, true)
+        current = forced
+    end
+
+    return current
+end
+
+-- === Slot logic ===
+local function randomSymbol()
+    local roll = math.random(1, 3)
+    if roll == 1 then return RUBY end
+    if roll == 2 then return NICKEL end
+    return SAPPHIRE
+end
+
+local function biasedLeftSymbol()
+    -- 75% chance for 2x symbols, 25% chance for sapphire.
+    if math.random(100) <= 75 then
+        if math.random(2) == 1 then
+            return RUBY
+        else
+            return NICKEL
+        end
+    else
+        return SAPPHIRE
+    end
+end
+
+local function decideMiddle(left)
+    -- Middle matches left 77.5% of the time.
+    if math.random(1000) <= 775 then
+        return left
+    end
+
+    local alt
+    repeat
+        alt = randomSymbol()
+    until alt ~= left
+
+    return alt
+end
+
+local function decideRight(left, middle)
+    if left == middle then
+        if left == SAPPHIRE then
+            -- 5x sapphire jackpot completion
+            if math.random(1000) <= JACKPOT_CHANCE_PER_1000 then
+                return SAPPHIRE
+            end
+
+            -- If jackpot fails, force non-sapphire
+            local alt
+            repeat
+                alt = randomSymbol()
+            until alt ~= SAPPHIRE
+
+            return alt
+        else
+            -- 2x ruby/nickel completion
+            if math.random(1000) <= TWO_X_CHANCE_PER_1000 then
+                return left
+            end
+
+            -- If 2x fails, force a different symbol
+            local alt
+            repeat
+                alt = randomSymbol()
+            until alt ~= left
+
+            return alt
+        end
+    end
+
+    -- If first two reels don't match, third can be anything.
+    return randomSymbol()
+end
+
+local function getPayout(left, middle, right)
+    if left == middle and middle == right then
+        if right == SAPPHIRE then
+            return 5
+        elseif right == NICKEL or right == RUBY then
+            return 2
+        end
+    end
+
+    return 0
+end
+
+local function cycleReel(integrator, reelName, duration, finalSymbol)
+    local index = 1
+    local startTime = os.clock()
+    local lastSymbol = nil
+
+    print(reelName .. " reel spinning...")
+
+    while os.clock() - startTime < duration do
+        local symbol = SYMBOL_SEQUENCE[index]
+
+        -- Do not pulse exact same symbol twice in a row.
+        if symbol ~= lastSymbol then
+            pulseSymbol(integrator, symbol, true)
+            lastSymbol = symbol
+        end
+
+        index = (index % #SYMBOL_SEQUENCE) + 1
+    end
+
+    -- Before stopping, force it to pass through other symbols first.
+    lastSymbol = pulseOtherSymbolsBeforeFinal(integrator, finalSymbol, lastSymbol)
+
+    -- Final result stays extended/held.
+    setSymbolHeld(integrator, finalSymbol)
+    playReelStopSound()
+
+    print(reelName .. " reel stopped on " .. SYMBOL_LABEL[finalSymbol])
+end
+
+-- === Main loop ===
+clearAllIntegrators()
+
+print("Slot machine ready.")
+print("Using redstone integrators:")
+print("LEFT   = redstone_integrator_4061")
+print("MIDDLE = redstone_integrator_4060")
+print("RIGHT  = redstone_integrator_4059")
+print("Sapphire = up = 5x")
+print("Nickel   = down = 2x")
+print("Ruby     = north = 2x")
+print("Channel: 1")
+print("Pulse ON:", PULSE_ON_TIME)
+print("Pulse OFF:", PULSE_OFF_TIME)
+print("Final hold:", FINAL_HOLD_TIME)
+print("Post round delay:", POST_ROUND_DELAY)
+print("Speaker:", speaker and "found" or "NOT FOUND")
+print("Jackpot tuning:", JACKPOT_CHANCE_PER_1000 .. "/1000 third reel completion")
+print("")
+
+while true do
+    if redstone.getInput("top") then
+        if waitForBankItem() then
+            clearAllIntegrators()
+            playStartSpinSound()
+
+            local left = biasedLeftSymbol()
+            local middle = decideMiddle(left)
+            local right = decideRight(left, middle)
+
+            -- Left finishes first, then middle, then right.
+            local leftDur = PLAY_TIME / 3
+            local middleDur = (2 * PLAY_TIME) / 3
+            local rightDur = PLAY_TIME
+
+            print("Target result:")
+            print("L:" .. SYMBOL_LABEL[left] .. " M:" .. SYMBOL_LABEL[middle] .. " R:" .. SYMBOL_LABEL[right])
+
+            parallel.waitForAll(
+                function()
+                    cycleReel(leftIntegrator, "LEFT", leftDur, left)
+                end,
+                function()
+                    cycleReel(middleIntegrator, "MIDDLE", middleDur, middle)
+                end,
+                function()
+                    cycleReel(rightIntegrator, "RIGHT", rightDur, right)
+                end
+            )
+
+            stats.totalPlays = stats.totalPlays + 1
+            stats.payoutBalance = stats.payoutBalance - 1
+
+            local payout = getPayout(left, middle, right)
+
+            print(
+                "Final: L:" .. SYMBOL_SHORT[left]
+                .. " M:" .. SYMBOL_SHORT[middle]
+                .. " R:" .. SYMBOL_SHORT[right]
+            )
+
+            -- Show final result briefly, then decide/payout quickly.
+            sleep(FINAL_HOLD_TIME)
+
+            if payout == 5 then
+                stats.wins5x = stats.wins5x + 1
+                stats.payoutBalance = stats.payoutBalance + 5
+
+                sendMessage({type = "payout", amount = 5})
+                playWinSequence(5)
+                print(">>> SAPPHIRE JACKPOT 5x WIN!")
+
+            elseif payout == 2 then
+                stats.wins2x = stats.wins2x + 1
+                stats.payoutBalance = stats.payoutBalance + 2
+
+                sendMessage({type = "payout", amount = 2})
+                playWinSequence(2)
+                print(">>> 2x WIN!")
+
+            else
+                playDenialSequence()
+                print("No win.")
+            end
+
+            saveStats(stats)
+
+            print(string.format(
+                "Plays: %d | 2x Wins: %d | 5x Wins: %d | Payout: %+d",
+                stats.totalPlays,
+                stats.wins2x,
+                stats.wins5x,
+                stats.payoutBalance
+            ))
+
+            print("Resetting soon...")
+            sleep(POST_ROUND_DELAY)
+            clearAllIntegrators()
+        end
+    end
+
+    sleep(0.1)
+end
