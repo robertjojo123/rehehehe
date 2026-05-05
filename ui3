@@ -1,0 +1,1034 @@
+-- roulette_ui_local_lamps.lua
+-- Run on roulette UI computer:
+-- Computer ID: 8165
+-- Peripheral name: computer_1253
+--
+-- This version:
+-- - Keeps account computer Rednet communication with protocol "casino"
+-- - Keeps monitor board drawing and roulette_hitboxes.lua
+-- - Keeps radar player detection
+-- - Removes spinner computer / integrator communication
+-- - Directly controls colorful_lamp_7097 through colorful_lamp_7136
+-- - Runs slow idle lamp animation in the background
+-- - On SPIN: speeds up, slows down, stops on result, then pays out if won
+--
+-- Important:
+-- Bets are subtracted when placed.
+-- On loss: no payout/refund.
+-- On win: adds payout only.
+
+-- =========================================================
+-- === Winning Logic
+-- =========================================================
+
+local redNumbers = {
+    ["1"]=true, ["3"]=true, ["5"]=true, ["7"]=true, ["9"]=true,
+    ["12"]=true, ["14"]=true, ["16"]=true, ["18"]=true,
+    ["21"]=true, ["23"]=true, ["25"]=true, ["27"]=true,
+    ["28"]=true, ["30"]=true, ["32"]=true, ["34"]=true, ["36"]=true
+}
+
+local function isDozen(betZone, result)
+    local n = tonumber(result)
+    if not n then return false end
+    if betZone == "1st12" then return n >= 1 and n <= 12 end
+    if betZone == "2nd12" then return n >= 13 and n <= 24 end
+    if betZone == "3rd12" then return n >= 25 and n <= 36 end
+    return false
+end
+
+local function isColumn(betZone, result)
+    local n = tonumber(result)
+    if not n then return false end
+    if betZone == "2to1_top" then return n % 3 == 0 end
+    if betZone == "2to1_mid" then return n % 3 == 2 end
+    if betZone == "2to1_bot" then return n % 3 == 1 end
+    return false
+end
+
+local function isExtra(betZone, result)
+    local n = tonumber(result)
+    if not n then return false end
+    if betZone == "1to18" then return n >= 1 and n <= 18 end
+    if betZone == "19to36" then return n >= 19 and n <= 36 end
+    if betZone == "even" then return n % 2 == 0 end
+    if betZone == "odd" then return n % 2 == 1 end
+    return false
+end
+
+local function isColor(betZone, result)
+    if betZone == "red" and redNumbers[result] then
+        return true
+    end
+
+    if betZone == "black" and not redNumbers[result] and result ~= "0" and result ~= "00" then
+        return true
+    end
+
+    return false
+end
+
+-- =========================================================
+-- === Peripherals
+-- =========================================================
+
+local monitor = peripheral.wrap("top")
+local radar = peripheral.wrap("radar_13")
+local modem = peripheral.wrap("bottom")
+
+if not monitor then error("No monitor on top") end
+if not radar then error("No radar peripheral radar_13") end
+if not modem then error("No modem on bottom") end
+
+rednet.open("bottom")
+
+-- =========================================================
+-- === Config
+-- =========================================================
+
+local ACCOUNT_COMPUTER_ID = 8166
+
+local BET_AMOUNTS = {500, 1000, 5000, 10000, 15000}
+local MIN_DISTANCE, MAX_DISTANCE = 1, 1.55
+local MAX_TOTAL_BETS = 75000
+
+-- Lamp wheel config
+local START_ID = 7097
+local END_ID = 7136
+local RESULT_BLINK_SECONDS = 5
+local RESULT_BLINK_DELAY = 0.25
+
+local CORNER_LAMPS = {
+    ["colorful_lamp_7102"] = true,
+    ["colorful_lamp_7122"] = true
+}
+
+-- Number mapping in ascending lamp ID order, skipping corners:
+-- 7097 = 0
+-- 7098 = 26
+-- 7099 = 3
+-- 7100 = 35
+-- 7101 = 12
+-- 7102 = corner
+-- 7103 = 19
+-- etc.
+local WHEEL_ORDER_BY_LAMP_ASC = {
+    "0","26","3","35","12","19","7","29","18","22","9","31",
+    "14","20","1","33","16","24","5","00","23","8","30","11",
+    "36","13","27","6","34","17","25","2","21","4","28","15","32","10"
+}
+
+-- =========================================================
+-- === Hitbox Data
+-- =========================================================
+
+local monitorHitboxes = dofile("roulette_hitboxes.lua")
+
+-- =========================================================
+-- === Globals
+-- =========================================================
+
+local activePlayer = nil
+local playerBalance = 0
+local placingMode = false
+local betAmount = nil
+local message = ""
+local placedBets = {}
+local selectedChip = nil
+local spinningPlayer = nil
+
+-- Lamp spin shared state
+local spinRequest = false
+local spinFinished = false
+local spinResult = nil
+local spinError = nil
+local lampMode = "idle"
+local lampBusy = false
+
+-- =========================================================
+-- === Lamp Color Helpers
+-- =========================================================
+
+-- Tuned for your Computronics colorful lamps.
+-- This makes visual red appear red, corners blue, 0/00 lime green.
+local function visualRgb(r, g, b)
+    r = math.max(0, math.min(31, r))
+    g = math.max(0, math.min(31, g))
+    b = math.max(0, math.min(31, b))
+
+    -- Red/blue swapped for your lamps.
+    return b + (g * 32) + (r * 1024)
+end
+
+local RGB = {
+    OFF = 0,
+
+    RED = visualRgb(31, 0, 0),       -- bright red roulette pockets
+    BLACK = visualRgb(7, 7, 7),      -- gray/black pockets
+    ZERO = visualRgb(10, 31, 0),     -- bright lime green 0 and 00
+    CORNER = visualRgb(0, 0, 31),    -- bright blue corner lamps
+
+    BALL = visualRgb(31, 31, 31),    -- white ball
+    TRAIL_1 = visualRgb(31, 20, 0),  -- warm orange/gold trail
+    TRAIL_2 = visualRgb(24, 10, 0),
+    TRAIL_3 = visualRgb(12, 5, 0),
+
+    RESULT = visualRgb(31, 31, 31)
+}
+
+local ALL_LAMPS = {}
+local RESULT_LAMPS = {}
+local LAMP_TO_NUMBER = {}
+local LAMPS = {}
+
+local numberIndex = 1
+
+for id = START_ID, END_ID do
+    local name = "colorful_lamp_" .. id
+    table.insert(ALL_LAMPS, name)
+
+    local lamp = peripheral.wrap(name)
+    if lamp then
+        LAMPS[name] = lamp
+    else
+        print("WARNING: could not wrap " .. name)
+    end
+
+    if not CORNER_LAMPS[name] then
+        local num = WHEEL_ORDER_BY_LAMP_ASC[numberIndex]
+        LAMP_TO_NUMBER[name] = num
+        table.insert(RESULT_LAMPS, name)
+        numberIndex = numberIndex + 1
+    end
+end
+
+if #RESULT_LAMPS ~= #WHEEL_ORDER_BY_LAMP_ASC then
+    error(
+        "Result lamp count mismatch. Lamps="
+        .. #RESULT_LAMPS
+        .. " Numbers="
+        .. #WHEEL_ORDER_BY_LAMP_ASC
+    )
+end
+
+local function setLampByName(name, color)
+    local lamp = LAMPS[name]
+    if not lamp then return end
+
+    if lamp.setLampColor then
+        lamp.setLampColor(color)
+    elseif lamp.setColor then
+        lamp.setColor(color)
+    elseif lamp.setColour then
+        lamp.setColour(color)
+    end
+end
+
+local function getBaseColor(lampName)
+    if CORNER_LAMPS[lampName] then
+        return RGB.CORNER
+    end
+
+    local num = LAMP_TO_NUMBER[lampName]
+
+    if num == "0" or num == "00" then
+        return RGB.ZERO
+    elseif redNumbers[num] then
+        return RGB.RED
+    else
+        return RGB.BLACK
+    end
+end
+
+local function drawBaseWheel()
+    for _, lampName in ipairs(ALL_LAMPS) do
+        setLampByName(lampName, getBaseColor(lampName))
+    end
+end
+
+local function prevIndex(i, max)
+    i = i - 1
+    if i < 1 then i = max end
+    return i
+end
+
+local function findIndex(list, value)
+    for i, v in ipairs(list) do
+        if v == value then return i end
+    end
+    return nil
+end
+
+-- =========================================================
+-- === Lamp Trail / Spin Animation
+-- =========================================================
+
+local trailHistory = {}
+local currentAnimIndex = math.random(1, #ALL_LAMPS)
+
+local function resetTrail()
+    trailHistory = {}
+end
+
+local function pushTrail(index)
+    table.insert(trailHistory, 1, index)
+
+    while #trailHistory > 3 do
+        table.remove(trailHistory)
+    end
+end
+
+local function drawBall(currentIndex)
+    drawBaseWheel()
+
+    if trailHistory[3] then
+        setLampByName(ALL_LAMPS[trailHistory[3]], RGB.TRAIL_3)
+    end
+
+    if trailHistory[2] then
+        setLampByName(ALL_LAMPS[trailHistory[2]], RGB.TRAIL_2)
+    end
+
+    if trailHistory[1] then
+        setLampByName(ALL_LAMPS[trailHistory[1]], RGB.TRAIL_1)
+    end
+
+    setLampByName(ALL_LAMPS[currentIndex], RGB.BALL)
+end
+
+local function blinkResult(resultLamp)
+    local start = os.clock()
+
+    while os.clock() - start < RESULT_BLINK_SECONDS do
+        drawBaseWheel()
+        setLampByName(resultLamp, RGB.RESULT)
+        sleep(RESULT_BLINK_DELAY)
+
+        drawBaseWheel()
+        sleep(RESULT_BLINK_DELAY)
+    end
+
+    drawBaseWheel()
+    setLampByName(resultLamp, RGB.RESULT)
+end
+
+local function performSpin()
+    resetTrail()
+
+    -- Fair random result from valid roulette slots only.
+    local resultNumberIndex = math.random(1, #RESULT_LAMPS)
+    local resultLamp = RESULT_LAMPS[resultNumberIndex]
+    local resultAnimIndex = findIndex(ALL_LAMPS, resultLamp)
+    local resultNumber = WHEEL_ORDER_BY_LAMP_ASC[resultNumberIndex]
+
+    if not resultAnimIndex then
+        error("Could not find result lamp in ALL_LAMPS: " .. tostring(resultLamp))
+    end
+
+    -- Full laps + exact stopping distance while moving backwards/decreasing.
+    local laps = math.random(4, 7) * #ALL_LAMPS
+    local distance = (currentAnimIndex - resultAnimIndex) % #ALL_LAMPS
+    local totalSteps = laps + distance
+
+    for step = 1, totalSteps do
+        pushTrail(currentAnimIndex)
+
+        currentAnimIndex = prevIndex(currentAnimIndex, #ALL_LAMPS)
+
+        drawBall(currentAnimIndex)
+
+        local progress = step / totalSteps
+
+        -- Fast at first, then increasingly slow.
+        local delay = 0.012 + (progress * progress * progress * 0.24)
+
+        -- Dramatic final ticks.
+        if totalSteps - step < 8 then
+            delay = delay + 0.08
+        end
+
+        sleep(delay)
+    end
+
+    drawBaseWheel()
+    setLampByName(resultLamp, RGB.RESULT)
+    blinkResult(resultLamp)
+
+    return resultNumber
+end
+
+local function runLocalSpin()
+    if lampBusy then
+        return nil, "Wheel is already spinning."
+    end
+
+    spinRequest = true
+    spinFinished = false
+    spinResult = nil
+    spinError = nil
+
+    while not spinFinished do
+        sleep(0.05)
+    end
+
+    if spinError then
+        return nil, spinError
+    end
+
+    return spinResult, nil
+end
+
+local function lampAnimationLoop()
+    math.randomseed(os.epoch("utc") + os.getComputerID())
+    for i = 1, 10 do math.random() end
+
+    drawBaseWheel()
+
+    while true do
+        if spinRequest and not lampBusy then
+            lampBusy = true
+            lampMode = "spin"
+            spinRequest = false
+
+            local ok, resultOrErr = pcall(performSpin)
+
+            if ok then
+                spinResult = resultOrErr
+                spinError = nil
+            else
+                spinResult = nil
+                spinError = tostring(resultOrErr)
+            end
+
+            spinFinished = true
+            lampBusy = false
+            lampMode = "idle"
+            resetTrail()
+
+        else
+            -- Slow idle animation.
+            -- This keeps the wheel alive in the background.
+            if not lampBusy then
+                pushTrail(currentAnimIndex)
+                currentAnimIndex = prevIndex(currentAnimIndex, #ALL_LAMPS)
+                drawBall(currentAnimIndex)
+                sleep(0.18)
+            else
+                sleep(0.05)
+            end
+        end
+    end
+end
+
+-- =========================================================
+-- === Load NFV Frame
+-- =========================================================
+
+local function loadNFV(path)
+    local file = fs.open(path, "r")
+    if not file then error("Could not open " .. path) end
+
+    local first = file.readLine()
+    local width, height = first:match("(%d+)%s+(%d+)")
+    local lines = {}
+
+    for i = 1, tonumber(height) do
+        table.insert(lines, file.readLine() or "")
+    end
+
+    file.close()
+    return lines
+end
+
+-- =========================================================
+-- === Monitor Color Palette
+-- =========================================================
+
+local COLOR_MAP = {
+    f = colors.black,
+    e = colors.green,
+    d = colors.red,
+    c = colors.red,
+    b = colors.black,
+    a = colors.black,
+    [9] = colors.red,
+    [8] = colors.black,
+    [7] = colors.black,
+    [3] = colors.white
+}
+
+local function drawPixel(x, y, color)
+    monitor.setCursorPos(x, y)
+    monitor.setBackgroundColor(color)
+    monitor.write(" ")
+end
+
+local function drawBackground(lines)
+    monitor.clear()
+
+    for y, row in ipairs(lines) do
+        for x = 1, math.min(#row, 57) do
+            local ch = row:sub(x, x):lower()
+            local color = COLOR_MAP[ch] or colors.white
+            drawPixel(x, y, color)
+        end
+    end
+end
+
+-- =========================================================
+-- === Overlay UI
+-- =========================================================
+
+local function drawOverlay(balance, messageText)
+    monitor.setCursorPos(2, 37)
+    monitor.setBackgroundColor(colors.green)
+    monitor.setTextColor(colors.yellow)
+    monitor.write("Balance: $" .. balance)
+
+    if messageText and messageText ~= "" then
+        monitor.setCursorPos(2, 36)
+        monitor.setBackgroundColor(colors.black)
+        monitor.setTextColor(colors.orange)
+        monitor.write(messageText)
+    end
+
+    -- zeros
+    monitor.setCursorPos(4, 9)
+    monitor.blit("0", "0", "d")
+    monitor.setCursorPos(4, 21)
+    monitor.blit("00", "00", "dd")
+
+    -- first row
+    monitor.setCursorPos(7, 7)
+    monitor.blit("3", "0", "e")
+    monitor.setCursorPos(7, 15)
+    monitor.blit("2", "0", "f")
+    monitor.setCursorPos(7, 22)
+    monitor.blit("1", "0", "e")
+
+    -- second
+    monitor.setCursorPos(11, 7)
+    monitor.blit("6", "0", "f")
+    monitor.setCursorPos(11, 15)
+    monitor.blit("5", "0", "e")
+    monitor.setCursorPos(11, 22)
+    monitor.blit("4", "0", "f")
+
+    -- third
+    monitor.setCursorPos(15, 7)
+    monitor.blit("9", "0", "e")
+    monitor.setCursorPos(15, 15)
+    monitor.blit("8", "0", "f")
+    monitor.setCursorPos(15, 22)
+    monitor.blit("7", "0", "e")
+
+    -- fourth
+    monitor.setCursorPos(19, 7)
+    monitor.blit("12", "00", "ee")
+    monitor.setCursorPos(19, 15)
+    monitor.blit("11", "00", "ff")
+    monitor.setCursorPos(19, 22)
+    monitor.blit("10", "00", "ff")
+
+    -- fifth
+    monitor.setCursorPos(22, 7)
+    monitor.blit("15", "00", "ff")
+    monitor.setCursorPos(22, 15)
+    monitor.blit("14", "00", "ee")
+    monitor.setCursorPos(22, 22)
+    monitor.blit("13", "00", "ff")
+
+    -- sixth
+    monitor.setCursorPos(26, 7)
+    monitor.blit("18", "00", "ee")
+    monitor.setCursorPos(26, 15)
+    monitor.blit("17", "00", "ff")
+    monitor.setCursorPos(26, 22)
+    monitor.blit("16", "00", "ee")
+
+    -- seventh
+    monitor.setCursorPos(30, 7)
+    monitor.blit("21", "00", "ee")
+    monitor.setCursorPos(30, 15)
+    monitor.blit("20", "00", "ff")
+    monitor.setCursorPos(30, 22)
+    monitor.blit("19", "00", "ff")
+
+    -- eighth
+    monitor.setCursorPos(34, 7)
+    monitor.blit("24", "00", "ff")
+    monitor.setCursorPos(34, 15)
+    monitor.blit("23", "00", "ee")
+    monitor.setCursorPos(34, 22)
+    monitor.blit("22", "00", "ff")
+
+    -- ninth
+    monitor.setCursorPos(38, 7)
+    monitor.blit("27", "00", "ee")
+    monitor.setCursorPos(38, 15)
+    monitor.blit("26", "00", "ff")
+    monitor.setCursorPos(38, 22)
+    monitor.blit("25", "00", "ee")
+
+    -- tenth
+    monitor.setCursorPos(42, 7)
+    monitor.blit("30", "00", "ee")
+    monitor.setCursorPos(42, 15)
+    monitor.blit("29", "00", "ff")
+    monitor.setCursorPos(42, 22)
+    monitor.blit("28", "00", "ee")
+
+    -- eleventh
+    monitor.setCursorPos(46, 7)
+    monitor.blit("33", "00", "ff")
+    monitor.setCursorPos(46, 15)
+    monitor.blit("32", "00", "ee")
+    monitor.setCursorPos(46, 22)
+    monitor.blit("31", "00", "ff")
+
+    -- twelfth
+    monitor.setCursorPos(50, 7)
+    monitor.blit("36", "00", "ee")
+    monitor.setCursorPos(50, 15)
+    monitor.blit("35", "00", "ff")
+    monitor.setCursorPos(50, 22)
+    monitor.blit("34", "00", "ee")
+
+    -- 2 to 1 row
+    monitor.setCursorPos(54, 7)
+    monitor.blit("1st", "000", "ddd")
+    monitor.setCursorPos(54, 8)
+    monitor.blit("Row", "000", "ddd")
+
+    monitor.setCursorPos(54, 14)
+    monitor.blit("2nd", "000", "ddd")
+    monitor.setCursorPos(54, 15)
+    monitor.blit("Row", "000", "ddd")
+
+    monitor.setCursorPos(54, 22)
+    monitor.blit("3rd", "000", "ddd")
+    monitor.setCursorPos(54, 23)
+    monitor.blit("Row", "000", "ddd")
+
+    -- twelves
+    monitor.setCursorPos(11, 28)
+    monitor.blit("1st 12", "000000", "dddddd")
+    monitor.setCursorPos(26, 28)
+    monitor.blit("2nd 12", "000000", "dddddd")
+    monitor.setCursorPos(43, 28)
+    monitor.blit("3rd 12", "000000", "dddddd")
+
+    -- bottom row
+    monitor.setCursorPos(6, 33)
+    monitor.blit("1-18", "0000", "dddd")
+    monitor.setCursorPos(15, 33)
+    monitor.blit("Even", "0000", "dddd")
+    monitor.setCursorPos(23, 33)
+    monitor.blit("Red", "000", "eee")
+    monitor.setCursorPos(31, 33)
+    monitor.blit("Black", "00000", "fffff")
+    monitor.setCursorPos(40, 33)
+    monitor.blit("Odd", "000", "ddd")
+    monitor.setCursorPos(48, 33)
+    monitor.blit("19-36", "00000", "ddddd")
+
+    -- chips
+    monitor.setCursorPos(30, 36)
+    monitor.blit("100", "aaa", "111")
+    monitor.setCursorPos(37, 36)
+    monitor.blit("500", "aaa", "111")
+    monitor.setCursorPos(43, 36)
+    monitor.blit("1000", "aaaa", "1111")
+    monitor.setCursorPos(50, 36)
+    monitor.blit("2500", "aaaa", "1111")
+
+    -- buttons
+    monitor.setCursorPos(30, 38)
+    monitor.blit("Clear Bets", "ffffffffff", "dddddddddd")
+    monitor.setCursorPos(43, 38)
+    monitor.blit("SPIN", "432e", "dddd")
+
+    -- Draw placed bets
+    for zone, amount in pairs(placedBets) do
+        local center = monitorHitboxes[zone] and monitorHitboxes[zone][1]
+        if center then
+            monitor.setCursorPos(center[1], center[2])
+            monitor.setBackgroundColor(colors.black)
+            monitor.setTextColor(colors.yellow)
+            monitor.write(tostring(amount / 100))
+        end
+    end
+end
+
+-- =========================================================
+-- === Account Rednet Communication
+-- =========================================================
+
+local function requestBalance(name)
+    rednet.send(ACCOUNT_COMPUTER_ID, {
+        action = "get_balance",
+        player = name
+    }, "casino")
+
+    local id, msg = rednet.receive("casino", 2)
+
+    if id == ACCOUNT_COMPUTER_ID and type(msg) == "table" and msg.player == name then
+        return tonumber(msg.balance) or 0
+    end
+
+    return 0
+end
+
+local function sendBalanceChange(name, delta, note)
+    rednet.send(ACCOUNT_COMPUTER_ID, {
+        action = "transfer",
+        player = name,
+        delta = delta,
+        note = note or "Roulette transfer"
+    }, "casino")
+
+    local id, msg = rednet.receive("casino", 2)
+
+    if id == ACCOUNT_COMPUTER_ID and type(msg) == "table" and msg.player == name then
+        return tonumber(msg.balance) or playerBalance
+    end
+
+    return playerBalance
+end
+
+-- =========================================================
+-- === Helpers
+-- =========================================================
+
+local function getTotalTableBet()
+    local total = 0
+
+    for _, amt in pairs(placedBets) do
+        total = total + amt
+    end
+
+    return total
+end
+
+local function getZoneAt(x, y)
+    for name, positions in pairs(monitorHitboxes) do
+        for _, pos in ipairs(positions) do
+            if x == pos[1] and y == pos[2] then
+                return name
+            end
+        end
+    end
+
+    return nil
+end
+
+local function detectPlayer()
+    local players = radar.getPlayers()
+    local closest = nil
+
+    for _, p in ipairs(players) do
+        if p.distance >= MIN_DISTANCE and p.distance <= MAX_DISTANCE then
+            if not closest or p.distance < closest.distance then
+                closest = p
+            end
+        end
+    end
+
+    return closest
+end
+
+local function getZoneMultiplier(zone)
+    if zone == "0" or zone == "00" or tonumber(zone) then
+        return 36
+    elseif zone == "1st12" or zone == "2nd12" or zone == "3rd12" then
+        return 3
+    elseif zone == "2to1_top" or zone == "2to1_mid" or zone == "2to1_bot" then
+        return 3
+    elseif zone == "1to18" or zone == "19to36"
+        or zone == "even" or zone == "odd"
+        or zone == "red" or zone == "black" then
+        return 2
+    end
+
+    return 1
+end
+
+local function getZoneMax(zone)
+    local mult = getZoneMultiplier(zone)
+
+    if mult == 36 then
+        return 1400
+    elseif mult == 3 then
+        return 17000
+    elseif mult == 2 then
+        return 25000
+    else
+        return 25000
+    end
+end
+
+local function betWon(betZone, spin)
+    if betZone == spin then
+        return true, 36
+    elseif betZone == "1st12" or betZone == "2nd12" or betZone == "3rd12" then
+        return isDozen(betZone, spin), 3
+    elseif betZone == "2to1_top" or betZone == "2to1_mid" or betZone == "2to1_bot" then
+        return isColumn(betZone, spin), 3
+    elseif betZone == "1to18" or betZone == "19to36"
+        or betZone == "even" or betZone == "odd"
+        or betZone == "red" or betZone == "black" then
+
+        return (isExtra(betZone, spin) or isColor(betZone, spin)), 2
+    end
+
+    return false, 0
+end
+
+-- =========================================================
+-- === Threads
+-- =========================================================
+
+local function radarLoop()
+    while true do
+        if not spinningPlayer then
+            local found = detectPlayer()
+
+            if found then
+                if activePlayer ~= found.name then
+                    activePlayer = found.name
+                    playerBalance = requestBalance(activePlayer)
+                    message = "Welcome, " .. activePlayer
+                else
+                    -- Refresh balance every ~1 sec.
+                    playerBalance = requestBalance(activePlayer)
+                end
+            else
+                activePlayer = nil
+                playerBalance = 0
+                placingMode = false
+                betAmount = nil
+                message = ""
+                placedBets = {}
+                selectedChip = nil
+            end
+
+            sleep(0.75)
+        end
+
+        sleep(0.25)
+    end
+end
+
+local function displayLoop()
+    local lines = loadNFV("frame.nfv")
+    monitor.setTextScale(0.5)
+
+    while true do
+        drawBackground(lines)
+
+        if activePlayer then
+            drawOverlay(playerBalance, message)
+        else
+            monitor.setCursorPos(15, 18)
+            monitor.setBackgroundColor(colors.black)
+            monitor.setTextColor(colors.yellow)
+            monitor.write("Stand at roulette table")
+            monitor.setCursorPos(12, 20)
+            monitor.write("Only one player in range")
+        end
+
+        sleep(0.1)
+    end
+end
+
+local function touchLoop()
+    while true do
+        local _, _, x, y = os.pullEvent("monitor_touch")
+
+        if activePlayer then
+            local zone = getZoneAt(x, y)
+
+            if zone then
+                if zone:match("chip_") then
+                    local val = tonumber(zone:match("chip_(%d+)"))
+
+                    if val and val <= playerBalance then
+                        selectedChip = val
+                        message = "Selected chip: $" .. val
+                    else
+                        message = "Not enough balance for $" .. (val or "?")
+                    end
+
+                elseif zone == "clear" then
+                    local refund = 0
+
+                    for _, amt in pairs(placedBets) do
+                        refund = refund + amt
+                    end
+
+                    if refund > 0 then
+                        playerBalance = sendBalanceChange(
+                            activePlayer,
+                            refund,
+                            "ROULETTE REFUND: cleared bets"
+                        )
+                        message = "Refunded $" .. refund .. " back to balance."
+                    else
+                        message = "No bets to refund."
+                    end
+
+                    placedBets = {}
+                    selectedChip = nil
+
+                elseif zone == "spin" and activePlayer then
+                    if next(placedBets) == nil then
+                        message = "Place a bet first."
+                    else
+                        spinningPlayer = activePlayer
+                        message = "Spinning!"
+
+                        local spin, spinErr = runLocalSpin()
+
+                        if not spin then
+                            message = spinErr or "Spin failed. Refunding bets..."
+
+                            -- If spin fails before a result, refund active bets.
+                            local refund = 0
+                            for _, amt in pairs(placedBets) do
+                                refund = refund + amt
+                            end
+
+                            if refund > 0 then
+                                playerBalance = sendBalanceChange(
+                                    activePlayer,
+                                    refund,
+                                    "ROULETTE REFUND: spin failed"
+                                )
+                            end
+
+                            placedBets = {}
+                            selectedChip = nil
+                            spinningPlayer = nil
+                            sleep(2)
+                        else
+                            message = "Spin Result: " .. spin
+
+                            local totalPayout = 0
+                            local totalLost = 0
+                            local winMessageParts = {}
+
+                            for betZone, amt in pairs(placedBets) do
+                                local won, mult = betWon(betZone, spin)
+
+                                if won then
+                                    local payout = amt * mult
+                                    totalPayout = totalPayout + payout
+                                    table.insert(winMessageParts, "$" .. payout .. " on " .. betZone)
+                                else
+                                    totalLost = totalLost + amt
+                                end
+                            end
+
+                            -- Bets are subtracted when placed.
+                            -- On loss: do nothing.
+                            -- On win: add payout only.
+                            if totalPayout > 0 then
+                                playerBalance = sendBalanceChange(
+                                    activePlayer,
+                                    totalPayout,
+                                    "ROULETTE WIN: $" .. totalPayout .. ", result " .. spin
+                                )
+
+                                message = "Won: " .. table.concat(winMessageParts, ", ") .. " (" .. spin .. ")"
+                            else
+                                message = "Lost $" .. totalLost .. " (" .. spin .. ")"
+                            end
+
+                            sleep(8)
+
+                            placedBets = {}
+                            selectedChip = nil
+                            spinningPlayer = nil
+
+                            if activePlayer then
+                                playerBalance = requestBalance(activePlayer)
+                            end
+                        end
+                    end
+
+                else
+                    if not selectedChip then
+                        message = "Select a chip first."
+                    elseif playerBalance < selectedChip then
+                        message = "Not enough balance."
+                    else
+                        placedBets[zone] = placedBets[zone] or 0
+
+                        local max = getZoneMax(zone)
+                        local current = placedBets[zone]
+
+                        local zoneAvailable = math.max(0, max - current)
+                        local totalAvailable = math.max(0, MAX_TOTAL_BETS - getTotalTableBet())
+                        local allowable = math.min(selectedChip, zoneAvailable, totalAvailable)
+
+                        if allowable > 0 then
+                            placedBets[zone] = current + allowable
+                            playerBalance = sendBalanceChange(
+                                activePlayer,
+                                -allowable,
+                                "ROULETTE BET: $" .. allowable .. " on " .. zone
+                            )
+
+                            if allowable < selectedChip then
+                                if totalAvailable < selectedChip then
+                                    message = "Only $" .. allowable .. " allowed (table limit reached)"
+                                else
+                                    message = "Only $" .. allowable .. " allowed (zone max reached)"
+                                end
+                            else
+                                message = "Placed $" .. allowable .. " on " .. zone
+                            end
+                        else
+                            if zoneAvailable <= 0 then
+                                message = "Max $" .. max .. " already on " .. zone
+                            elseif totalAvailable <= 0 then
+                                message = "Table max $" .. MAX_TOTAL_BETS .. " reached!"
+                            else
+                                message = "No more allowed here."
+                            end
+                        end
+                    end
+                end
+            end
+        end
+
+        sleep(0.05)
+    end
+end
+
+-- =========================================================
+-- === Startup
+-- =========================================================
+
+math.randomseed(os.epoch("utc") + os.getComputerID())
+for i = 1, 10 do math.random() end
+
+print("Roulette UI + local lamp wheel starting...")
+print("Computer ID: " .. os.getComputerID())
+print("Result lamps: " .. #RESULT_LAMPS)
+print("Animation lamps: " .. #ALL_LAMPS)
+print("Account computer: " .. ACCOUNT_COMPUTER_ID)
+print("")
+
+drawBaseWheel()
+
+-- =========================================================
+-- === Run
+-- =========================================================
+
+parallel.waitForAny(
+    radarLoop,
+    displayLoop,
+    touchLoop,
+    lampAnimationLoop
+)
