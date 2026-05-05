@@ -1,0 +1,421 @@
+-- roulette_spinner.lua
+-- Run on spinner/lamp computer:
+-- Computer ID: 8164
+-- Peripheral name: computer_1876
+--
+-- Works with roulette UI computer:
+-- Computer ID: 8165
+-- Peripheral name: computer_1253
+--
+-- Receives raw modem spin requests on channel 48164.
+-- Spins colorful_lamp_7097 through colorful_lamp_7136.
+-- 7102 and 7122 are corner lamps: they light during animation but never land.
+-- Sends final result back to UI on reply channel 48165.
+
+-- === CONFIG ===
+
+local MODEM_SIDE = "bottom" -- change if your modem is not on bottom
+
+local SPINNER_LISTEN_CHANNEL = 48164
+local UI_REPLY_CHANNEL = 48165
+
+local START_ID = 7097
+local END_ID = 7136
+
+local RESULT_BLINK_SECONDS = 5
+local RESULT_BLINK_DELAY = 0.25
+
+local DEBUG_MESSAGES = true
+
+local CORNER_LAMPS = {
+    ["colorful_lamp_7102"] = true,
+    ["colorful_lamp_7122"] = true
+}
+
+-- Number mapping in ascending lamp ID order, skipping corners:
+-- 7097 = 0
+-- 7098 = 26
+-- 7099 = 3
+-- 7100 = 35
+-- 7101 = 12
+-- 7102 = corner
+-- 7103 = 19
+-- etc.
+local WHEEL_ORDER_BY_LAMP_ASC = {
+    "0","26","3","35","12","19","7","29","18","22","9","31",
+    "14","20","1","33","16","24","5","00","23","8","30","11",
+    "36","13","27","6","34","17","25","2","21","4","28","15","32","10"
+}
+
+-- Correct American roulette red numbers.
+-- 19 is black, 28 is red.
+local RED_NUMBERS = {
+    ["1"]=true, ["3"]=true, ["5"]=true, ["7"]=true, ["9"]=true,
+    ["12"]=true, ["14"]=true, ["16"]=true, ["18"]=true,
+    ["21"]=true, ["23"]=true, ["25"]=true, ["27"]=true,
+    ["28"]=true, ["30"]=true, ["32"]=true, ["34"]=true, ["36"]=true
+}
+
+-- === VISUAL RGB HELPER ===
+-- Tuned to your Computronics colorful lamps.
+-- This makes visual red appear red, corners blue, 0/00 lime green.
+--
+-- If colors ever look red/blue swapped again, change visualRgb to:
+-- return r + (g * 32) + (b * 1024)
+
+local function visualRgb(r, g, b)
+    r = math.max(0, math.min(31, r))
+    g = math.max(0, math.min(31, g))
+    b = math.max(0, math.min(31, b))
+
+    -- Red/blue swapped for your lamps.
+    return b + (g * 32) + (r * 1024)
+end
+
+local RGB = {
+    OFF = 0,
+
+    RED = visualRgb(31, 0, 0),       -- bright red roulette pockets
+    BLACK = visualRgb(7, 7, 7),      -- gray/black pockets
+    ZERO = visualRgb(10, 31, 0),     -- bright lime green 0 and 00
+    CORNER = visualRgb(0, 0, 31),    -- bright blue corner lamps
+
+    BALL = visualRgb(31, 31, 31),    -- white ball
+    TRAIL_1 = visualRgb(31, 20, 0),  -- warm orange/gold trail
+    TRAIL_2 = visualRgb(24, 10, 0),
+    TRAIL_3 = visualRgb(12, 5, 0),
+
+    RESULT = visualRgb(31, 31, 31)   -- white result blink
+}
+
+-- === MODEM SETUP ===
+
+local modem = peripheral.wrap(MODEM_SIDE)
+if not modem then
+    error("No modem found on " .. MODEM_SIDE)
+end
+
+modem.open(SPINNER_LISTEN_CHANNEL)
+
+-- === BUILD LAMP LISTS ===
+
+local ALL_LAMPS = {}
+local RESULT_LAMPS = {}
+local LAMP_TO_NUMBER = {}
+local LAMPS = {}
+
+local numberIndex = 1
+
+for id = START_ID, END_ID do
+    local name = "colorful_lamp_" .. id
+    table.insert(ALL_LAMPS, name)
+
+    local lamp = peripheral.wrap(name)
+    if lamp then
+        LAMPS[name] = lamp
+    else
+        print("WARNING: could not wrap " .. name)
+    end
+
+    if not CORNER_LAMPS[name] then
+        local num = WHEEL_ORDER_BY_LAMP_ASC[numberIndex]
+        LAMP_TO_NUMBER[name] = num
+        table.insert(RESULT_LAMPS, name)
+        numberIndex = numberIndex + 1
+    end
+end
+
+if #RESULT_LAMPS ~= #WHEEL_ORDER_BY_LAMP_ASC then
+    error(
+        "Result lamp count mismatch. Lamps="
+        .. #RESULT_LAMPS
+        .. " Numbers="
+        .. #WHEEL_ORDER_BY_LAMP_ASC
+    )
+end
+
+-- === LAMP HELPERS ===
+
+local function setLampByName(name, color)
+    local lamp = LAMPS[name]
+    if not lamp then return end
+
+    if lamp.setLampColor then
+        lamp.setLampColor(color)
+    elseif lamp.setColor then
+        lamp.setColor(color)
+    elseif lamp.setColour then
+        lamp.setColour(color)
+    else
+        print("WARNING: no known color method for " .. name)
+    end
+end
+
+local function clearAll()
+    for _, lampName in ipairs(ALL_LAMPS) do
+        setLampByName(lampName, RGB.OFF)
+    end
+end
+
+local function getBaseColor(lampName)
+    if CORNER_LAMPS[lampName] then
+        return RGB.CORNER
+    end
+
+    local num = LAMP_TO_NUMBER[lampName]
+
+    if num == "0" or num == "00" then
+        return RGB.ZERO
+    elseif RED_NUMBERS[num] then
+        return RGB.RED
+    else
+        return RGB.BLACK
+    end
+end
+
+local function drawBaseWheel()
+    for _, lampName in ipairs(ALL_LAMPS) do
+        setLampByName(lampName, getBaseColor(lampName))
+    end
+end
+
+local function prevIndex(i, max)
+    i = i - 1
+    if i < 1 then i = max end
+    return i
+end
+
+local function findIndex(list, value)
+    for i, v in ipairs(list) do
+        if v == value then return i end
+    end
+    return nil
+end
+
+-- === TRAIL SYSTEM ===
+-- Stores previous ball positions only.
+-- This prevents front-of-ball weirdness.
+
+local trailHistory = {}
+
+local function resetTrail()
+    trailHistory = {}
+end
+
+local function pushTrail(index)
+    table.insert(trailHistory, 1, index)
+
+    while #trailHistory > 3 do
+        table.remove(trailHistory)
+    end
+end
+
+local function drawBall(currentIndex)
+    drawBaseWheel()
+
+    if trailHistory[3] then
+        setLampByName(ALL_LAMPS[trailHistory[3]], RGB.TRAIL_3)
+    end
+
+    if trailHistory[2] then
+        setLampByName(ALL_LAMPS[trailHistory[2]], RGB.TRAIL_2)
+    end
+
+    if trailHistory[1] then
+        setLampByName(ALL_LAMPS[trailHistory[1]], RGB.TRAIL_1)
+    end
+
+    setLampByName(ALL_LAMPS[currentIndex], RGB.BALL)
+end
+
+-- === RANDOM SETUP ===
+
+math.randomseed(os.epoch("utc") + os.getComputerID())
+for i = 1, 10 do math.random() end
+
+-- This persists between spins.
+-- Each new spin starts from wherever the last one ended.
+local currentAnimIndex = math.random(1, #ALL_LAMPS)
+
+-- === SPIN ANIMATION ===
+
+local function blinkResult(resultLamp)
+    local start = os.clock()
+
+    while os.clock() - start < RESULT_BLINK_SECONDS do
+        drawBaseWheel()
+        setLampByName(resultLamp, RGB.RESULT)
+        sleep(RESULT_BLINK_DELAY)
+
+        drawBaseWheel()
+        sleep(RESULT_BLINK_DELAY)
+    end
+
+    drawBaseWheel()
+    setLampByName(resultLamp, RGB.RESULT)
+end
+
+local function spinWheel()
+    resetTrail()
+
+    -- Fair random result from valid roulette slots only.
+    -- Corner lamps are not in RESULT_LAMPS, so they cannot be chosen.
+    local resultNumberIndex = math.random(1, #RESULT_LAMPS)
+    local resultLamp = RESULT_LAMPS[resultNumberIndex]
+    local resultAnimIndex = findIndex(ALL_LAMPS, resultLamp)
+    local resultNumber = WHEEL_ORDER_BY_LAMP_ASC[resultNumberIndex]
+
+    if not resultAnimIndex then
+        error("Could not find result lamp in ALL_LAMPS: " .. tostring(resultLamp))
+    end
+
+    -- Full laps + exact stopping distance while moving backwards/decreasing.
+    local laps = math.random(4, 7) * #ALL_LAMPS
+    local distance = (currentAnimIndex - resultAnimIndex) % #ALL_LAMPS
+    local totalSteps = laps + distance
+
+    print("Spinning...")
+    print("Target result: " .. resultNumber)
+    print("Target lamp: " .. resultLamp)
+    print("Steps: " .. totalSteps)
+
+    for step = 1, totalSteps do
+        pushTrail(currentAnimIndex)
+
+        -- Move ball in decreasing lamp ID direction.
+        currentAnimIndex = prevIndex(currentAnimIndex, #ALL_LAMPS)
+
+        drawBall(currentAnimIndex)
+
+        local progress = step / totalSteps
+
+        -- Fast at first, then increasingly slow.
+        local delay = 0.012 + (progress * progress * progress * 0.24)
+
+        -- Dramatic final ticks.
+        if totalSteps - step < 8 then
+            delay = delay + 0.08
+        end
+
+        sleep(delay)
+    end
+
+    -- Ensure final exact result display.
+    drawBaseWheel()
+    setLampByName(resultLamp, RGB.RESULT)
+
+    print("RESULT: " .. resultNumber)
+    blinkResult(resultLamp)
+
+    return resultNumber, resultLamp
+end
+
+local function printMapping()
+    print("Lamp -> Number mapping:")
+
+    local resultIndex = 1
+
+    for id = START_ID, END_ID do
+        local name = "colorful_lamp_" .. id
+
+        if CORNER_LAMPS[name] then
+            print(name .. " = CORNER")
+        else
+            print(name .. " = " .. tostring(WHEEL_ORDER_BY_LAMP_ASC[resultIndex]))
+            resultIndex = resultIndex + 1
+        end
+    end
+
+    print("")
+end
+
+-- === MAIN RAW MODEM SERVER ===
+
+print("Roulette spinner ready.")
+print("Computer ID: " .. os.getComputerID())
+print("Listening channel: " .. SPINNER_LISTEN_CHANNEL)
+print("Default UI reply channel: " .. UI_REPLY_CHANNEL)
+print("Animation lamps: " .. #ALL_LAMPS)
+print("Result lamps: " .. #RESULT_LAMPS)
+print("Modem side: " .. MODEM_SIDE)
+print("")
+print("Waiting for spin requests...")
+print("")
+
+drawBaseWheel()
+
+local busy = false
+
+while true do
+    local event, side, channel, replyChannel, msg, distance = os.pullEvent("modem_message")
+
+    if DEBUG_MESSAGES then
+        print("Modem message:")
+        print("  side: " .. tostring(side))
+        print("  channel: " .. tostring(channel))
+        print("  replyChannel: " .. tostring(replyChannel))
+        print("  msg: " .. textutils.serialize(msg))
+    end
+
+    if channel == SPINNER_LISTEN_CHANNEL and type(msg) == "table" then
+
+        if msg.action == "spin" then
+            local spinId = msg.spinId or tostring(os.epoch("utc"))
+            local replyTo = msg.replyChannel or replyChannel or UI_REPLY_CHANNEL
+
+            print("Spin request accepted.")
+            print("Replying to channel: " .. tostring(replyTo))
+
+            if busy then
+                modem.transmit(replyTo, SPINNER_LISTEN_CHANNEL, {
+                    action = "error",
+                    spinId = spinId,
+                    error = "spinner_busy"
+                })
+            else
+                busy = true
+
+                local ok, resultNumber, resultLamp = pcall(spinWheel)
+
+                if ok then
+                    print("Spin complete. Result: " .. tostring(resultNumber))
+
+                    modem.transmit(replyTo, SPINNER_LISTEN_CHANNEL, {
+                        action = "result",
+                        spinId = spinId,
+                        result = resultNumber,
+                        lamp = resultLamp
+                    })
+                else
+                    print("Spin failed: " .. tostring(resultNumber))
+
+                    modem.transmit(replyTo, SPINNER_LISTEN_CHANNEL, {
+                        action = "error",
+                        spinId = spinId,
+                        error = tostring(resultNumber)
+                    })
+                end
+
+                busy = false
+            end
+
+        elseif msg.action == "base" then
+            print("Base redraw requested.")
+            drawBaseWheel()
+
+        elseif msg.action == "clear" then
+            print("Clear requested.")
+            clearAll()
+
+        elseif msg.action == "map" then
+            printMapping()
+
+        else
+            print("Unknown action: " .. tostring(msg.action))
+        end
+    else
+        if DEBUG_MESSAGES then
+            print("Ignored modem message. Wrong channel or bad format.")
+        end
+    end
+end
