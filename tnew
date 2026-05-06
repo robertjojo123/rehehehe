@@ -1,0 +1,43 @@
+-- inspect_peripheral.lua
+
+local name = "manipulator_40"
+
+if not peripheral.isPresent(name) then
+    error("No peripheral named " .. name)
+end
+
+print("Peripheral name:")
+print(name)
+
+print("")
+print("Type:")
+print(textutils.serialize(peripheral.getType(name)))
+
+print("")
+print("Methods:")
+
+local methods = peripheral.getMethods(name)
+
+if type(methods) ~= "table" then
+    print("No method table returned.")
+    print("Raw value:")
+    print(textutils.serialize(methods))
+else
+    for i, method in ipairs(methods) do
+        print(i .. ". " .. tostring(method))
+    end
+end
+
+print("")
+print("Wrapped object keys:")
+
+local wrapped = peripheral.wrap(name)
+
+if type(wrapped) ~= "table" then
+    print("Could not wrap peripheral.")
+    print(textutils.serialize(wrapped))
+else
+    for k, v in pairs(wrapped) do
+        print(tostring(k) .. " = " .. type(v))
+    end
+end
