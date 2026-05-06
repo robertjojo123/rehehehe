@@ -1,0 +1,17 @@
+local target = nil
+
+for _, n in ipairs(peripheral.getNames()) do
+    local lower = n:lower()
+    if lower:find("extractor") or lower:find("force") or lower:find("mffs") or lower:find("modular") then
+        target = n
+        print("FOUND:", n)
+        print("TYPE:", tostring(peripheral.getType(n)))
+        print("METHODS:")
+        print(textutils.serialize(peripheral.getMethods(n)))
+        print("----------------")
+    end
+end
+
+if not target then
+    print("No extractor-like peripheral found.")
+end
