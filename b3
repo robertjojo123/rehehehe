@@ -1,0 +1,636 @@
+-- Bank Computer: Input & Output match by name + hash prefix
+-- Added:
+--   - Player tracking with radar_41
+--   - Player confirm monitor monitor_963
+--   - Auto-confirms if exactly one player is nearby when a token is requested
+--   - Sends slot gamble win stats to account computer using rednet protocol "casino"
+--   - Uses the actual token value from VALID_PREFIXES for wager/payout/profit stats
+--   - Monitor text wraps at 15 characters per line for 1x1 monitor readability
+--
+-- Original behavior preserved:
+--   - Valid token comes from left chest
+--   - Storage is right chest
+--   - Dropper is back
+--   - Payout dispenses matching token name + hash prefix
+--   - Slot game talks on raw modem channel 2
+--
+-- Updated:
+--   - Uses bottom modem for BOTH raw slot messages and rednet account/stat messages
+
+-- =========================================================
+-- === Config
+-- =========================================================
+
+local MODEM_SIDE = "bottom"
+
+local SLOT_CHANNEL = 2
+
+-- This must be the account computer ID that is running the account code.
+local ACCOUNT_COMPUTER_ID = 8166
+local ACCOUNT_PROTOCOL = "casino"
+
+local PLAYER_RADAR_NAME = "radar_41"
+local PLAYER_MONITOR_NAME = "monitor_963"
+local PLAYER_RADAR_RANGE = 8
+
+-- 1x1 monitor readable line width.
+local PLAYER_MONITOR_LINE_WIDTH = 15
+
+-- This name is only for leaderboard/stat logs.
+local GAME_NAME = "slots"
+
+-- Valid hash prefixes, first 6 chars.
+-- These values are now used for the gambling stat wager/payout math.
+local VALID_PREFIXES = {
+    ["01cf97"] = 500,
+    ["dd703d"] = 15000,
+    ["e61758"] = 1000,
+    ["1fafe1"] = 5000,
+    ["6d281b"] = 10000,
+}
+
+-- =========================================================
+-- === Peripherals
+-- =========================================================
+
+local modem = peripheral.wrap(MODEM_SIDE)
+if not modem then error("No modem on " .. MODEM_SIDE) end
+
+-- Raw slot-machine communication.
+modem.open(SLOT_CHANNEL)
+
+-- Rednet account/stat communication using same bottom modem.
+if not rednet.isOpen(MODEM_SIDE) then
+    rednet.open(MODEM_SIDE)
+end
+
+local radar = peripheral.wrap(PLAYER_RADAR_NAME)
+local monitor = peripheral.wrap(PLAYER_MONITOR_NAME)
+
+if not radar then error("Missing radar: " .. PLAYER_RADAR_NAME) end
+if not monitor then error("Missing monitor: " .. PLAYER_MONITOR_NAME) end
+
+monitor.setTextScale(0.5)
+monitor.setBackgroundColor(colors.black)
+monitor.setTextColor(colors.white)
+monitor.clear()
+
+-- =========================================================
+-- === Token / Play State
+-- =========================================================
+
+-- Store exact item type for matching payout tokens.
+local lastToken = {
+    name = nil,
+    hashPrefix = nil,
+    value = nil
+}
+
+-- Stores the player/token for the most recently accepted play.
+-- If that play loses, no payout message comes, and this gets overwritten
+-- on the next accepted token.
+local lastAcceptedPlay = {
+    player = nil,
+    tokenName = nil,
+    hashPrefix = nil,
+    wager = 0,
+    tokenValue = 0
+}
+
+-- =========================================================
+-- === Player Selection State
+-- =========================================================
+
+local lockedPlayer = nil
+local selectedPlayer = nil
+local nearbyPlayers = {}
+local playerStatusMessage = "Select player"
+
+-- =========================================================
+-- === Slot Messaging
+-- =========================================================
+
+local function sendMessage(msg)
+    modem.transmit(SLOT_CHANNEL, 1, msg)
+end
+
+local function receiveMessage()
+    while true do
+        local event, _, ch, _, msg = os.pullEvent("modem_message")
+
+        if ch == SLOT_CHANNEL then
+            return msg
+        end
+    end
+end
+
+-- =========================================================
+-- === Player Tracking
+-- =========================================================
+
+local function getNearbyPlayers()
+    local players = {}
+
+    local ok, raw = pcall(function()
+        return radar.getPlayers()
+    end)
+
+    if not ok or type(raw) ~= "table" then
+        return players
+    end
+
+    for _, p in ipairs(raw) do
+        local name = p.name or p.username
+        local distance = tonumber(p.distance) or 999999
+
+        if name and distance <= PLAYER_RADAR_RANGE then
+            table.insert(players, {
+                name = name,
+                distance = distance
+            })
+        end
+    end
+
+    table.sort(players, function(a, b)
+        return a.distance < b.distance
+    end)
+
+    return players
+end
+
+local function isPlayerNearby(playerName)
+    if not playerName then return false end
+
+    local players = getNearbyPlayers()
+
+    for _, p in ipairs(players) do
+        if p.name == playerName then
+            return true
+        end
+    end
+
+    return false
+end
+
+local function autoConfirmSingleNearbyPlayer()
+    if lockedPlayer and isPlayerNearby(lockedPlayer) then
+        return lockedPlayer
+    end
+
+    local players = getNearbyPlayers()
+
+    if #players == 1 then
+        lockedPlayer = players[1].name
+        selectedPlayer = lockedPlayer
+        playerStatusMessage = "Auto-confirmed"
+        print("Auto-confirmed slot player:", lockedPlayer)
+        return lockedPlayer
+    end
+
+    return nil
+end
+
+local function getConfirmedPlayer()
+    if lockedPlayer and isPlayerNearby(lockedPlayer) then
+        return lockedPlayer
+    end
+
+    return nil
+end
+
+-- =========================================================
+-- === Small Monitor Text Helpers
+-- =========================================================
+
+local function clearPlayerMonitor()
+    monitor.setBackgroundColor(colors.black)
+    monitor.setTextColor(colors.white)
+    monitor.clear()
+end
+
+local function safeText(text)
+    text = tostring(text or "")
+    text = text:gsub("\n", " ")
+    return text
+end
+
+local function splitText(text, maxLen)
+    text = safeText(text)
+    maxLen = maxLen or PLAYER_MONITOR_LINE_WIDTH
+
+    local lines = {}
+
+    while #text > maxLen do
+        table.insert(lines, text:sub(1, maxLen))
+        text = text:sub(maxLen + 1)
+    end
+
+    table.insert(lines, text)
+
+    return lines
+end
+
+local function writeRawLine(y, text, color)
+    local w, h = monitor.getSize()
+    if y > h then return y end
+
+    text = safeText(text)
+    local maxLen = math.min(PLAYER_MONITOR_LINE_WIDTH, w)
+
+    if #text > maxLen then
+        text = text:sub(1, maxLen)
+    end
+
+    monitor.setCursorPos(1, y)
+    monitor.setBackgroundColor(colors.black)
+    monitor.setTextColor(color or colors.white)
+    monitor.write(text)
+
+    return y + 1
+end
+
+local function writeWrapped(startY, text, color)
+    local w, h = monitor.getSize()
+    local y = startY
+    local maxLen = math.min(PLAYER_MONITOR_LINE_WIDTH, w)
+
+    for _, line in ipairs(splitText(text, maxLen)) do
+        if y > h then break end
+        y = writeRawLine(y, line, color)
+    end
+
+    return y
+end
+
+local function writePlayerName(startY, name, color)
+    -- Player names intentionally get their own rows.
+    return writeWrapped(startY, name or "unknown", color or colors.yellow)
+end
+
+-- =========================================================
+-- === Player Monitor Drawing
+-- =========================================================
+
+local function drawPlayerMonitor()
+    local w, h = monitor.getSize()
+    clearPlayerMonitor()
+
+    local y = 1
+
+    if lockedPlayer then
+        y = writeWrapped(y, "LOCKED", colors.lime)
+        y = writeWrapped(y, "PLAYER", colors.lime)
+        y = writePlayerName(y, lockedPlayer, colors.yellow)
+
+        if y <= h then
+            y = writeWrapped(y, "Leave range", colors.lightGray)
+        end
+
+        if y <= h then
+            y = writeWrapped(y, "to reset", colors.lightGray)
+        end
+
+        if playerStatusMessage and playerStatusMessage ~= "" and y <= h then
+            y = writeWrapped(y, playerStatusMessage, colors.cyan)
+        end
+
+        return
+    end
+
+    nearbyPlayers = getNearbyPlayers()
+
+    y = writeWrapped(y, "SLOT PLAYER", colors.cyan)
+
+    if #nearbyPlayers == 0 then
+        selectedPlayer = nil
+        y = writeWrapped(y, "No players", colors.red)
+        y = writeWrapped(y, "nearby", colors.red)
+        y = writeWrapped(y, "Range: " .. PLAYER_RADAR_RANGE, colors.gray)
+
+        if playerStatusMessage and playerStatusMessage ~= "" and y <= h then
+            y = writeWrapped(y, playerStatusMessage, colors.lightGray)
+        end
+
+        return
+    end
+
+    if #nearbyPlayers == 1 then
+        selectedPlayer = nearbyPlayers[1].name
+
+        y = writeWrapped(y, "Found:", colors.lightGray)
+        y = writePlayerName(y, selectedPlayer, colors.yellow)
+
+        if y <= h then
+            writeWrapped(h, "CONFIRM", colors.lime)
+        end
+
+        return
+    end
+
+    y = writeWrapped(y, "Tap name:", colors.yellow)
+
+    for i, p in ipairs(nearbyPlayers) do
+        if y >= h then break end
+
+        local color = colors.white
+        if selectedPlayer == p.name then
+            color = colors.lime
+        end
+
+        y = writeWrapped(y, tostring(i) .. ".", color)
+        y = writePlayerName(y, p.name, color)
+    end
+
+    writeWrapped(h, "CONFIRM", colors.lime)
+end
+
+local function playerTrackerLoop()
+    while true do
+        if lockedPlayer and not isPlayerNearby(lockedPlayer) then
+            print("Player left radar range, unlocking:", lockedPlayer)
+            lockedPlayer = nil
+            selectedPlayer = nil
+            playerStatusMessage = "Player left"
+        end
+
+        drawPlayerMonitor()
+        sleep(0.5)
+    end
+end
+
+local function playerTouchLoop()
+    local monitorName = peripheral.getName(monitor)
+
+    while true do
+        local _, touchedMonitor, x, y = os.pullEvent("monitor_touch")
+
+        if touchedMonitor == monitorName then
+            local w, h = monitor.getSize()
+
+            if not lockedPlayer then
+                nearbyPlayers = getNearbyPlayers()
+
+                if y == h then
+                    if selectedPlayer and isPlayerNearby(selectedPlayer) then
+                        lockedPlayer = selectedPlayer
+                        playerStatusMessage = "Confirmed"
+                        print("Confirmed slot player:", lockedPlayer)
+                    else
+                        playerStatusMessage = "Pick player"
+                    end
+
+                elseif #nearbyPlayers > 1 then
+                    -- Because names can wrap, touch selection by row is approximate.
+                    -- This keeps it simple: each player uses a 2-line display block.
+                    local index = math.floor((y - 3) / 2) + 1
+                    local picked = nearbyPlayers[index]
+
+                    if picked then
+                        selectedPlayer = picked.name
+                        playerStatusMessage = "Selected"
+                        print("Selected slot player:", selectedPlayer)
+                    end
+                end
+            else
+                playerStatusMessage = "Already locked"
+            end
+        end
+
+        sleep(0.05)
+    end
+end
+
+-- =========================================================
+-- === Account / Leaderboard Stat Messaging
+-- =========================================================
+
+local function sendGambleWinStat(player, tokenName, hashPrefix, payoutTokenCount)
+    if not player then
+        print("No player for gamble stat.")
+        return
+    end
+
+    local wager = tonumber(lastAcceptedPlay.wager) or 0
+    local tokenValue = tonumber(lastAcceptedPlay.tokenValue) or wager
+
+    if wager <= 0 then
+        print("No wager value recorded for gamble stat.")
+        return
+    end
+
+    local tokensPaid = tonumber(payoutTokenCount) or 0
+    local payout = tokensPaid * tokenValue
+    local profit = payout - wager
+
+    if profit <= 0 then
+        print("No positive slot profit to track.")
+        print("Wager:", wager, "Payout:", payout, "Profit:", profit)
+        return
+    end
+
+    local packet = {
+        action = "gamble_win_stat",
+        player = player,
+        game = GAME_NAME,
+
+        book = tokenName or "unknown",
+        hashPrefix = hashPrefix or "unknown",
+
+        wager = wager,
+        payout = payout,
+        profit = profit,
+
+        tokenValue = tokenValue,
+        payoutTokenCount = tokensPaid
+    }
+
+    rednet.send(ACCOUNT_COMPUTER_ID, packet, ACCOUNT_PROTOCOL)
+
+    print("Sent slot gamble stat to account computer:")
+    print(" Account ID:", ACCOUNT_COMPUTER_ID)
+    print(" Protocol:", ACCOUNT_PROTOCOL)
+    print(" Player:", player)
+    print(" Token:", tokenName or "unknown")
+    print(" Prefix:", hashPrefix or "unknown")
+    print(" Token value:", tokenValue)
+    print(" Wager:", wager)
+    print(" Tokens paid:", tokensPaid)
+    print(" Payout:", payout)
+    print(" Profit:", profit)
+end
+
+-- =========================================================
+-- === Token Handling
+-- =========================================================
+
+-- Accept 1 valid token from left chest.
+local function transferSingleToken()
+    -- If already confirmed, use that.
+    -- If nobody is confirmed but exactly one player is nearby,
+    -- auto-confirm them right when the slot asks for a token.
+    local confirmedPlayer = getConfirmedPlayer() or autoConfirmSingleNearbyPlayer()
+
+    if not confirmedPlayer then
+        print("No confirmed player. Refusing token request.")
+
+        local nearby = getNearbyPlayers()
+
+        if #nearby > 1 then
+            playerStatusMessage = "Pick player"
+        else
+            playerStatusMessage = "No player"
+        end
+
+        return false
+    end
+
+    local input = peripheral.wrap("left")
+    local storage = peripheral.wrap("right")
+
+    if not input or not storage then
+        print("Input or storage chest missing.")
+        return false
+    end
+
+    for slot, item in pairs(input.list()) do
+        if item and item.nbtHash then
+            local prefix = string.sub(item.nbtHash, 1, 6)
+            local value = VALID_PREFIXES[prefix]
+
+            if value then
+                input.pushItems(peripheral.getName(storage), slot, 1)
+
+                lastToken.name = item.name
+                lastToken.hashPrefix = prefix
+                lastToken.value = value
+
+                lastAcceptedPlay.player = confirmedPlayer
+                lastAcceptedPlay.tokenName = item.name
+                lastAcceptedPlay.hashPrefix = prefix
+                lastAcceptedPlay.wager = value
+                lastAcceptedPlay.tokenValue = value
+
+                print("Accepted token:", item.name, "| Prefix:", prefix, "| Value:", value, "| Player:", confirmedPlayer)
+                playerStatusMessage = "Playing $" .. tostring(value)
+
+                return true
+            else
+                print("Invalid token prefix:", prefix)
+            end
+        end
+    end
+
+    print("No valid token found.")
+    playerStatusMessage = "No token"
+    return false
+end
+
+-- Dispense N tokens matching name + hash prefix.
+local function dispenseMatchingTokens(count)
+    if not lastToken.name or not lastToken.hashPrefix then
+        print("No token info recorded.")
+        return 0
+    end
+
+    local storage = peripheral.wrap("right")
+    local dropper = peripheral.wrap("back")
+
+    if not storage or not dropper then
+        print("Storage or dropper not found.")
+        return 0
+    end
+
+    local dispensed = 0
+    local items = storage.list()
+
+    for slot, item in pairs(items) do
+        if dispensed >= count then break end
+
+        if item.name == lastToken.name and item.nbtHash then
+            local prefix = string.sub(item.nbtHash, 1, 6)
+
+            if prefix == lastToken.hashPrefix then
+                local toMove = math.min(item.count, count - dispensed)
+                storage.pushItems(peripheral.getName(dropper), slot, toMove)
+
+                for i = 1, toMove do
+                    redstone.setOutput("back", true)
+                    sleep(0.4)
+                    redstone.setOutput("back", false)
+                    sleep(0.2)
+                    redstone.setOutput("back", true)
+                    sleep(0.4)
+                    redstone.setOutput("back", false)
+                    sleep(0.2)
+                end
+
+                dispensed = dispensed + toMove
+                print("Dispensed", toMove, "of", item.name, "| Prefix:", prefix)
+            end
+        end
+    end
+
+    print("Total Dispensed:", dispensed)
+    return dispensed
+end
+
+-- =========================================================
+-- === Main Bank Loop
+-- =========================================================
+
+local function bankLoop()
+    print("Slot bank/token computer ready.")
+    print("Modem side:", MODEM_SIDE)
+    print("Slot channel:", SLOT_CHANNEL)
+    print("Account computer:", ACCOUNT_COMPUTER_ID)
+    print("Account protocol:", ACCOUNT_PROTOCOL)
+    print("Radar:", PLAYER_RADAR_NAME)
+    print("Monitor:", PLAYER_MONITOR_NAME)
+    print("Radar range:", PLAYER_RADAR_RANGE)
+    print("Auto-confirm enabled when exactly one player is nearby.")
+    print("Using bottom modem for slot messages + rednet stat messages.")
+    print("Player monitor line width:", PLAYER_MONITOR_LINE_WIDTH)
+    print("Token values come from VALID_PREFIXES.")
+    print("")
+
+    while true do
+        local msg = receiveMessage()
+
+        if msg == "request_item" then
+            if transferSingleToken() then
+                sendMessage("item_transferred")
+            else
+                sendMessage("no_item")
+            end
+
+        elseif type(msg) == "table" and msg.type == "payout" and type(msg.amount) == "number" then
+            local requestedPayout = msg.amount
+            local dispensed = dispenseMatchingTokens(requestedPayout)
+
+            if dispensed > 0 then
+                local statPlayer = lastAcceptedPlay.player or getConfirmedPlayer()
+
+                sendGambleWinStat(
+                    statPlayer,
+                    lastAcceptedPlay.tokenName or lastToken.name,
+                    lastAcceptedPlay.hashPrefix or lastToken.hashPrefix,
+                    dispensed
+                )
+
+                playerStatusMessage = "Won x" .. tostring(dispensed)
+            else
+                playerStatusMessage = "Payout failed"
+            end
+        end
+    end
+end
+
+-- =========================================================
+-- === Start
+-- =========================================================
+
+parallel.waitForAny(
+    bankLoop,
+    playerTrackerLoop,
+    playerTouchLoop
+)
