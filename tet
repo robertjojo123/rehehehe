@@ -1,0 +1,33 @@
+local name = "chat_box_name_here"
+local p = peripheral.wrap(name)
+
+if not p then
+    error("Could not wrap " .. name)
+end
+
+if not p.getDocs then
+    error(name .. " has no getDocs method")
+end
+
+local methods = peripheral.getMethods(name) or {}
+
+table.sort(methods)
+
+for _, method in ipairs(methods) do
+    print("====== " .. method .. " ======")
+
+    local ok, docs = pcall(function()
+        return p.getDocs(method)
+    end)
+
+    if ok then
+        print(textutils.serialize(docs))
+    else
+        print("getDocs failed:")
+        print(docs)
+    end
+
+    print("")
+    print("-- press any key --")
+    os.pullEvent("key")
+end
