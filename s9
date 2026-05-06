@@ -1,0 +1,701 @@
+-- monitor_slots.lua
+-- Slot Game Computer Script
+--
+-- Uses:
+--   - Left reel monitor:   monitor_957
+--   - Middle reel monitor: monitor_958
+--   - Right reel monitor:  monitor_959
+--
+-- Features:
+--   - 3 vertical monitor reels
+--   - filled pixel-art symbols
+--   - symbols slide downward like slot reels
+--   - missed symbols stay visible above and below when stopped
+--   - custom hex gold payline border: #806f3e
+--   - custom hex nickel symbol: #ffd45a
+--   - vibrant sapphire/ruby palette
+--   - text scale 0.5 for sharper/bigger pixel shapes
+--   - only top/bottom gold payline bars, no side border
+--
+-- Preserved:
+--   - Bank/message system on modem channel 2
+--   - top redstone input starts game
+--   - stats.txt tracking
+--   - 5x sapphire / 2x ruby or nickel logic
+--   - payout messages to bank computer
+
+math.randomseed(os.epoch and os.epoch("utc") or os.time())
+
+-- =========================================================
+-- === Peripherals
+-- =========================================================
+
+local modem = peripheral.wrap("bottom")
+local speaker = peripheral.find("speaker")
+
+if not modem then error("No modem on bottom") end
+modem.open(2)
+
+local leftMonitor = peripheral.wrap("monitor_957")
+local middleMonitor = peripheral.wrap("monitor_958")
+local rightMonitor = peripheral.wrap("monitor_959")
+
+if not leftMonitor then error("Missing left reel monitor_957") end
+if not middleMonitor then error("Missing middle reel monitor_958") end
+if not rightMonitor then error("Missing right reel monitor_959") end
+
+local REEL_MONITORS = {
+    left = leftMonitor,
+    middle = middleMonitor,
+    right = rightMonitor
+}
+
+-- =========================================================
+-- === Config
+-- =========================================================
+
+local STATS_FILE = "stats.txt"
+
+local PLAY_TIME = 12
+
+local LEFT_REEL_TIME = PLAY_TIME / 3
+local MIDDLE_REEL_TIME = (PLAY_TIME * 2) / 3
+local RIGHT_REEL_TIME = PLAY_TIME
+
+local FINAL_RESULT_HOLD_TIME = 2.5
+local NEXT_PLAY_DELAY = 5
+
+local FRAME_DELAY = 0.055
+local FINAL_APPROACH_DELAY = 0.075
+
+-- Custom palette slots.
+-- These use CC color slots but overwrite their palette values on the monitors.
+local GOLD_BORDER_COLOR = colors.orange  -- #806f3e
+local NICKEL_COLOR = colors.yellow       -- #ffd45a
+
+-- =========================================================
+-- === Odds Tuning
+-- =========================================================
+-- Lower = fewer wins.
+--
+-- Old values:
+--   JACKPOT_CHANCE_PER_1000 = 170
+--   TWO_X_CHANCE_PER_1000   = 549
+--
+-- New reduced values:
+--   Sapphire 5x completion: 9.0% when first two sapphires align
+--   Ruby/Nickel 2x completion: 25.0% when first two ruby/nickel align
+
+local JACKPOT_CHANCE_PER_1000 = 90
+local TWO_X_CHANCE_PER_1000 = 250
+
+local RUBY = "ruby"
+local NICKEL = "nickel"
+local SAPPHIRE = "sapphire"
+
+local SYMBOL_SEQUENCE = {RUBY, NICKEL, SAPPHIRE}
+
+local SYMBOL_LABEL = {
+    [SAPPHIRE] = "SAPPHIRE",
+    [NICKEL] = "NICKEL",
+    [RUBY] = "RUBY"
+}
+
+local SYMBOL_SHORT = {
+    [SAPPHIRE] = "S",
+    [NICKEL] = "N",
+    [RUBY] = "R"
+}
+
+-- =========================================================
+-- === Monitor Setup
+-- =========================================================
+
+for _, mon in pairs(REEL_MONITORS) do
+    mon.setTextScale(0.5)
+
+    -- Custom hex palette colors.
+    -- Requires advanced monitors.
+    if mon.setPaletteColor then
+        -- Dark gold border: #806f3e
+        mon.setPaletteColor(GOLD_BORDER_COLOR, 0x806F3E)
+
+        -- Vibrant soft coin/nickel gold: #ffd45a
+        mon.setPaletteColor(NICKEL_COLOR, 0xFFD45A)
+
+        -- Vibrant sapphire colors
+        mon.setPaletteColor(colors.cyan, 0x00E5FF)
+        mon.setPaletteColor(colors.lightBlue, 0x66F2FF)
+        mon.setPaletteColor(colors.blue, 0x006BFF)
+
+        -- Vibrant ruby colors
+        mon.setPaletteColor(colors.red, 0xFF1E2D)
+        mon.setPaletteColor(colors.pink, 0xFF6B7A)
+
+        -- Stronger shadow/gold tone
+        mon.setPaletteColor(colors.brown, 0x7A3B18)
+    end
+
+    mon.setBackgroundColor(colors.black)
+    mon.setTextColor(colors.white)
+    mon.clear()
+end
+
+-- =========================================================
+-- === Filled Pixel Symbol Art
+-- =========================================================
+
+local PIXEL_ART = {
+    [SAPPHIRE] = {
+        "0000110000",
+        "0001111000",
+        "0011111100",
+        "0111111110",
+        "1111111111",
+        "0111111110",
+        "0011111100",
+        "0001111000",
+        "0000110000"
+    },
+
+    [NICKEL] = {
+        "0011111100",
+        "0111111110",
+        "1111111111",
+        "1111001111",
+        "1111001111",
+        "1111001111",
+        "1111111111",
+        "0111111110",
+        "0011111100"
+    },
+
+    [RUBY] = {
+        "0001111000",
+        "0011111100",
+        "0111111110",
+        "1111111111",
+        "1111111111",
+        "0111111110",
+        "0011111100",
+        "0011111100",
+        "0001111000"
+    }
+}
+
+local SYMBOL_BG_COLOR = {
+    [SAPPHIRE] = colors.cyan,
+    [NICKEL] = NICKEL_COLOR,
+    [RUBY] = colors.red
+}
+
+local SYMBOL_HIGHLIGHT_COLOR = {
+    [SAPPHIRE] = colors.white,
+    [NICKEL] = colors.white,
+    [RUBY] = colors.pink
+}
+
+local SYMBOL_SHADOW_COLOR = {
+    [SAPPHIRE] = colors.blue,
+    [NICKEL] = colors.orange,
+    [RUBY] = colors.brown
+}
+
+-- =========================================================
+-- === Persistent Stats
+-- =========================================================
+
+local function loadStats()
+    if fs.exists(STATS_FILE) then
+        local f = fs.open(STATS_FILE, "r")
+        local data = textutils.unserialize(f.readAll())
+        f.close()
+        return data or {}
+    end
+    return {}
+end
+
+local function saveStats(stats)
+    local f = fs.open(STATS_FILE, "w")
+    f.write(textutils.serialize(stats))
+    f.close()
+end
+
+local stats = loadStats()
+stats.totalPlays = stats.totalPlays or 0
+stats.wins2x = stats.wins2x or 0
+stats.wins5x = stats.wins5x or 0
+stats.payoutBalance = stats.payoutBalance or 0
+
+-- =========================================================
+-- === Bank Messaging
+-- =========================================================
+
+local function sendMessage(msg)
+    modem.transmit(2, 1, msg)
+end
+
+local function receiveMessage(timeout)
+    local timer = os.startTimer(timeout or 2)
+
+    while true do
+        local event, side, ch, _, msg = os.pullEvent()
+
+        if event == "modem_message" and ch == 2 then
+            return msg
+        elseif event == "timer" and side == timer then
+            return nil
+        end
+    end
+end
+
+-- =========================================================
+-- === Sounds
+-- =========================================================
+
+local function playNote(instrument, volume, pitch)
+    if speaker then
+        pcall(function()
+            speaker.playNote(instrument, volume or 1, pitch or 12)
+        end)
+    end
+end
+
+local function playAcceptSound()
+    playNote("pling", 1, 7)
+end
+
+local function playSpinTick()
+    playNote("hat", 0.45, 12)
+end
+
+local function playReelStopSound()
+    playNote("pling", 1, 10)
+    sleep(0.08)
+    playNote("pling", 1, 14)
+end
+
+local function playDenialSound()
+    playNote("bass", 1, 3)
+end
+
+local function playDenialSequence()
+    for i = 1, 3 do
+        playDenialSound()
+        sleep(0.2)
+    end
+end
+
+local function playWinSequence(count)
+    for i = 1, count do
+        playAcceptSound()
+        sleep(0.18)
+    end
+end
+
+local function playStartSpinSound()
+    playNote("pling", 1, 5)
+    sleep(0.08)
+    playNote("pling", 1, 8)
+    sleep(0.08)
+    playNote("pling", 1, 12)
+end
+
+-- =========================================================
+-- === Bank Item Request
+-- =========================================================
+
+local function waitForBankItem()
+    while redstone.getInput("top") do
+        sendMessage("request_item")
+
+        local reply = receiveMessage(2)
+
+        if reply == "item_transferred" then
+            playAcceptSound()
+            return true
+        elseif reply == "no_item" then
+            playDenialSequence()
+        end
+
+        sleep(0.1)
+    end
+
+    return false
+end
+
+-- =========================================================
+-- === Slot Logic
+-- =========================================================
+
+local function randomSymbol()
+    local roll = math.random(1, 3)
+    if roll == 1 then return RUBY end
+    if roll == 2 then return NICKEL end
+    return SAPPHIRE
+end
+
+local function biasedLeftSymbol()
+    -- Old structure:
+    -- 75% chance for 2x symbols, 25% chance for sapphire.
+    if math.random(100) <= 75 then
+        if math.random(2) == 1 then
+            return RUBY
+        else
+            return NICKEL
+        end
+    else
+        return SAPPHIRE
+    end
+end
+
+local function decideMiddle(left)
+    -- Middle matches left 77.5% of the time.
+    -- This creates suspense with first two reels,
+    -- while the third reel completion chance controls actual win frequency.
+    if math.random(1000) <= 775 then
+        return left
+    end
+
+    local alt
+    repeat
+        alt = randomSymbol()
+    until alt ~= left
+
+    return alt
+end
+
+local function decideRight(left, middle)
+    if left == middle then
+        if left == SAPPHIRE then
+            if math.random(1000) <= JACKPOT_CHANCE_PER_1000 then
+                return SAPPHIRE
+            end
+
+            local alt
+            repeat
+                alt = randomSymbol()
+            until alt ~= SAPPHIRE
+
+            return alt
+        else
+            if math.random(1000) <= TWO_X_CHANCE_PER_1000 then
+                return left
+            end
+
+            local alt
+            repeat
+                alt = randomSymbol()
+            until alt ~= left
+
+            return alt
+        end
+    end
+
+    return randomSymbol()
+end
+
+local function getPayout(left, middle, right)
+    if left == middle and middle == right then
+        if right == SAPPHIRE then
+            return 5
+        elseif right == NICKEL or right == RUBY then
+            return 2
+        end
+    end
+
+    return 0
+end
+
+-- =========================================================
+-- === Monitor Reel Drawing
+-- =========================================================
+
+local function prevIndex(i, max)
+    i = i - 1
+    if i < 1 then i = max end
+    return i
+end
+
+local function nextIndex(i, max)
+    i = i + 1
+    if i > max then i = 1 end
+    return i
+end
+
+local function getSymbolIndex(symbol)
+    for i, s in ipairs(SYMBOL_SEQUENCE) do
+        if s == symbol then return i end
+    end
+    return 1
+end
+
+local function clearMonitor(mon)
+    mon.setBackgroundColor(colors.black)
+    mon.setTextColor(colors.white)
+    mon.clear()
+end
+
+local function drawPixel(mon, x, y, color)
+    local w, h = mon.getSize()
+
+    if x < 1 or x > w or y < 1 or y > h then
+        return
+    end
+
+    mon.setCursorPos(x, y)
+    mon.setBackgroundColor(color)
+    mon.write(" ")
+end
+
+local function drawPayline(mon)
+    local w, h = mon.getSize()
+    local mid = math.floor(h / 2) + 1
+
+    local top = mid - 5
+    local bottom = mid + 5
+
+    if top < 1 then top = 1 end
+    if bottom > h then bottom = h end
+
+    mon.setBackgroundColor(GOLD_BORDER_COLOR)
+    mon.setTextColor(GOLD_BORDER_COLOR)
+
+    -- Top gold payline bar only
+    mon.setCursorPos(1, top)
+    mon.write(string.rep(" ", w))
+
+    -- Bottom gold payline bar only
+    mon.setCursorPos(1, bottom)
+    mon.write(string.rep(" ", w))
+end
+
+local function drawSymbol(mon, symbol, topY)
+    local art = PIXEL_ART[symbol]
+    if not art then return end
+
+    local w, h = mon.getSize()
+    local symbolColor = SYMBOL_BG_COLOR[symbol] or colors.white
+    local highlightColor = SYMBOL_HIGHLIGHT_COLOR[symbol] or symbolColor
+    local shadowColor = SYMBOL_SHADOW_COLOR[symbol] or symbolColor
+
+    local artW = #art[1]
+    local startX = math.max(1, math.floor((w - artW) / 2) + 1)
+
+    for rowIndex, row in ipairs(art) do
+        local y = topY + rowIndex - 1
+
+        if y >= 1 and y <= h then
+            for col = 1, #row do
+                local ch = row:sub(col, col)
+
+                if ch == "1" then
+                    local color = symbolColor
+
+                    -- Bright top-left highlight
+                    if rowIndex <= 3 and col <= math.ceil(artW / 2) then
+                        color = highlightColor
+                    end
+
+                    -- Darker bottom-right shadow
+                    if rowIndex >= #art - 2 and col >= math.floor(artW / 2) then
+                        color = shadowColor
+                    end
+
+                    drawPixel(mon, startX + col - 1, y, color)
+                end
+            end
+        end
+    end
+end
+
+local function drawReelFrame(mon, centerIndex, offset)
+    clearMonitor(mon)
+
+    local w, h = mon.getSize()
+    local mid = math.floor(h / 2) + 1
+
+    local symbolH = 9
+    local spacing = 11
+    local centerTop = mid - math.floor(symbolH / 2)
+
+    local aboveIndex = prevIndex(centerIndex, #SYMBOL_SEQUENCE)
+    local belowIndex = nextIndex(centerIndex, #SYMBOL_SEQUENCE)
+
+    drawSymbol(mon, SYMBOL_SEQUENCE[aboveIndex], centerTop - spacing + offset)
+    drawSymbol(mon, SYMBOL_SEQUENCE[centerIndex], centerTop + offset)
+    drawSymbol(mon, SYMBOL_SEQUENCE[belowIndex], centerTop + spacing + offset)
+
+    drawPayline(mon)
+end
+
+local function drawFinalReel(mon, finalSymbol)
+    clearMonitor(mon)
+
+    local w, h = mon.getSize()
+    local mid = math.floor(h / 2) + 1
+
+    local symbolH = 9
+    local spacing = 11
+    local centerTop = mid - math.floor(symbolH / 2)
+
+    local finalIndex = getSymbolIndex(finalSymbol)
+    local aboveIndex = prevIndex(finalIndex, #SYMBOL_SEQUENCE)
+    local belowIndex = nextIndex(finalIndex, #SYMBOL_SEQUENCE)
+
+    drawSymbol(mon, SYMBOL_SEQUENCE[aboveIndex], centerTop - spacing)
+    drawSymbol(mon, finalSymbol, centerTop)
+    drawSymbol(mon, SYMBOL_SEQUENCE[belowIndex], centerTop + spacing)
+
+    drawPayline(mon)
+end
+
+local function animateOneDrop(mon, centerIndex, frameDelay)
+    local spacing = 11
+
+    for offset = 0, spacing - 1 do
+        drawReelFrame(mon, centerIndex, offset)
+        playSpinTick()
+        sleep(frameDelay or FRAME_DELAY)
+    end
+
+    return prevIndex(centerIndex, #SYMBOL_SEQUENCE)
+end
+
+local function approachFinal(mon, currentIndex, finalSymbol)
+    local finalIndex = getSymbolIndex(finalSymbol)
+
+    if currentIndex == finalIndex then
+        currentIndex = animateOneDrop(mon, currentIndex, FINAL_APPROACH_DELAY)
+        currentIndex = animateOneDrop(mon, currentIndex, FINAL_APPROACH_DELAY)
+    end
+
+    while currentIndex ~= finalIndex do
+        currentIndex = animateOneDrop(mon, currentIndex, FINAL_APPROACH_DELAY)
+    end
+
+    drawFinalReel(mon, finalSymbol)
+    playReelStopSound()
+
+    return currentIndex
+end
+
+local function spinReel(mon, reelName, duration, finalSymbol)
+    local currentIndex = math.random(1, #SYMBOL_SEQUENCE)
+    local startTime = os.clock()
+
+    print(reelName .. " reel spinning...")
+
+    while os.clock() - startTime < duration do
+        currentIndex = animateOneDrop(mon, currentIndex, FRAME_DELAY)
+    end
+
+    currentIndex = approachFinal(mon, currentIndex, finalSymbol)
+
+    print(reelName .. " reel stopped on " .. SYMBOL_LABEL[finalSymbol])
+
+    return currentIndex
+end
+
+local function drawIdleReels()
+    drawFinalReel(leftMonitor, RUBY)
+    drawFinalReel(middleMonitor, NICKEL)
+    drawFinalReel(rightMonitor, SAPPHIRE)
+end
+
+-- =========================================================
+-- === Main Loop
+-- =========================================================
+
+drawIdleReels()
+
+print("Monitor slot machine ready.")
+print("Reel monitors:")
+print("LEFT   = monitor_957")
+print("MIDDLE = monitor_958")
+print("RIGHT  = monitor_959")
+print("Sapphire = vibrant cyan diamond = 5x")
+print("Nickel   = vibrant gold coin = 2x")
+print("Ruby     = vibrant red ruby = 2x")
+print("Gold border #806f3e uses color slot:", GOLD_BORDER_COLOR)
+print("Nickel #ffd45a uses color slot:", NICKEL_COLOR)
+print("Speaker:", speaker and "found" or "NOT FOUND")
+print("Jackpot tuning:", JACKPOT_CHANCE_PER_1000 .. "/1000 third reel completion")
+print("2x tuning:", TWO_X_CHANCE_PER_1000 .. "/1000 third reel completion")
+print("")
+
+while true do
+    if redstone.getInput("top") then
+        if waitForBankItem() then
+            playStartSpinSound()
+
+            local left = biasedLeftSymbol()
+            local middle = decideMiddle(left)
+            local right = decideRight(left, middle)
+
+            print("Target result:")
+            print("L:" .. SYMBOL_LABEL[left] .. " M:" .. SYMBOL_LABEL[middle] .. " R:" .. SYMBOL_LABEL[right])
+
+            parallel.waitForAll(
+                function()
+                    spinReel(leftMonitor, "LEFT", LEFT_REEL_TIME, left)
+                end,
+                function()
+                    spinReel(middleMonitor, "MIDDLE", MIDDLE_REEL_TIME, middle)
+                end,
+                function()
+                    spinReel(rightMonitor, "RIGHT", RIGHT_REEL_TIME, right)
+                end
+            )
+
+            stats.totalPlays = stats.totalPlays + 1
+            stats.payoutBalance = stats.payoutBalance - 1
+
+            local payout = getPayout(left, middle, right)
+
+            print(
+                "Final: L:" .. SYMBOL_SHORT[left]
+                .. " M:" .. SYMBOL_SHORT[middle]
+                .. " R:" .. SYMBOL_SHORT[right]
+            )
+
+            sleep(FINAL_RESULT_HOLD_TIME)
+
+            if payout == 5 then
+                stats.wins5x = stats.wins5x + 1
+                stats.payoutBalance = stats.payoutBalance + 5
+
+                sendMessage({type = "payout", amount = 5})
+                playWinSequence(5)
+                print(">>> SAPPHIRE JACKPOT 5x WIN!")
+
+            elseif payout == 2 then
+                stats.wins2x = stats.wins2x + 1
+                stats.payoutBalance = stats.payoutBalance + 2
+
+                sendMessage({type = "payout", amount = 2})
+                playWinSequence(2)
+                print(">>> 2x WIN!")
+
+            else
+                playDenialSequence()
+                print("No win.")
+            end
+
+            saveStats(stats)
+
+            print(string.format(
+                "Plays: %d | 2x Wins: %d | 5x Wins: %d | Payout: %+d",
+                stats.totalPlays,
+                stats.wins2x,
+                stats.wins5x,
+                stats.payoutBalance
+            ))
+
+            print("Waiting before next play...")
+            sleep(NEXT_PLAY_DELAY)
+        end
+    end
+
+    sleep(0.1)
+end
