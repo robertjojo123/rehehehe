@@ -1,0 +1,25 @@
+local ex = peripheral.wrap("modularforcefieldsystem:extractor_0")
+
+if not ex then
+    error("Could not wrap extractor")
+end
+
+print("TYPE:")
+print(peripheral.getType("modularforcefieldsystem:extractor_0"))
+
+print("METHODS:")
+print(textutils.serialize(peripheral.getMethods("modularforcefieldsystem:extractor_0")))
+
+print("SIZE:")
+if ex.size then
+    print(ex.size())
+else
+    print("No size() method")
+end
+
+print("LIST:")
+if ex.list then
+    print(textutils.serialize(ex.list()))
+else
+    print("No list() method")
+end
