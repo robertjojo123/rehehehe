@@ -1,0 +1,32 @@
+local chat = peripheral.wrap("chat_box_6")
+
+if not chat then
+    error("Could not wrap chat box")
+end
+
+print("Test 1: say(message)")
+local ok1, err1 = pcall(function()
+    chat.say("public one-arg test")
+end)
+print("ok1:", ok1)
+if not ok1 then print(err1) end
+
+sleep(1)
+
+print("Test 2: say(player, message)")
+local ok2, err2 = pcall(function()
+    chat.say("Rado", "private two-arg test")
+end)
+print("ok2:", ok2)
+if not ok2 then print(err2) end
+
+sleep(1)
+
+print("Test 3: say(message, player)")
+local ok3, err3 = pcall(function()
+    chat.say("private reverse-arg test", "Rado")
+end)
+print("ok3:", ok3)
+if not ok3 then print(err3) end
+
+print("Done.")
