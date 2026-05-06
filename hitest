@@ -1,0 +1,18 @@
+local chat = peripheral.wrap("left")
+
+if not chat then
+    error("No chat recorder on left")
+end
+
+print("Chat test running.")
+print("Say: hi")
+
+while true do
+    local _, player, message, uuid = os.pullEvent("chat_message")
+
+    print(player .. ": " .. message)
+
+    if message:lower() == "hi" then
+        chat.say("hello")
+    end
+end
