@@ -1,0 +1,76 @@
+-- radar_range_test.lua
+-- Finds any radar + any monitor and shows nearby players/distances.
+-- Set range here:
+local DETECTION_RANGE = 64
+
+local radar = peripheral.find("radar")
+local monitor = peripheral.find("monitor")
+
+if not radar then error("No radar found") end
+if not monitor then error("No monitor found") end
+
+monitor.setTextScale(0.5)
+
+local function clear()
+    monitor.setBackgroundColor(colors.black)
+    monitor.setTextColor(colors.white)
+    monitor.clear()
+    monitor.setCursorPos(1, 1)
+end
+
+local function writeLine(y, text, color)
+    local w, h = monitor.getSize()
+    if y > h then return end
+
+    monitor.setCursorPos(1, y)
+    monitor.setBackgroundColor(colors.black)
+    monitor.setTextColor(color or colors.white)
+
+    text = tostring(text)
+    if #text > w then
+        text = text:sub(1, w)
+    end
+
+    monitor.write(text)
+end
+
+while true do
+    clear()
+
+    local players = radar.getPlayers()
+    local seen = {}
+
+    for _, p in ipairs(players) do
+        local dist = tonumber(p.distance) or 999999
+
+        if dist <= DETECTION_RANGE then
+            table.insert(seen, {
+                name = p.name or p.username or "unknown",
+                distance = dist
+            })
+        end
+    end
+
+    table.sort(seen, function(a, b)
+        return a.distance < b.distance
+    end)
+
+    writeLine(1, "Radar Range Test", colors.lime)
+    writeLine(2, "Range: " .. DETECTION_RANGE .. " blocks", colors.yellow)
+    writeLine(3, "Players seen: " .. #seen, colors.cyan)
+    writeLine(4, string.rep("-", 24), colors.gray)
+
+    local y = 5
+    for i, p in ipairs(seen) do
+        writeLine(y, i .. ". " .. p.name, colors.white)
+        y = y + 1
+        writeLine(y, "   dist: " .. string.format("%.2f", p.distance), colors.lightGray)
+        y = y + 1
+    end
+
+    if #seen == 0 then
+        writeLine(5, "No players in range.", colors.red)
+    end
+
+    sleep(0.5)
+end
