@@ -1,0 +1,1365 @@
+-- blackjack_table_v3.lua
+-- Fresh 4-player blackjack table
+--
+-- Main table monitor: monitor_981
+-- Station monitors:
+--   Station 1 = N = monitor_977 = radar_44 + radar_45
+--   Station 2 = E = monitor_978 = radar_46 + radar_47
+--   Station 3 = S = monitor_979 = radar_48 + radar_49
+--   Station 4 = W = monitor_980 = radar_50 + radar_51
+--
+-- Account computer:
+--   ID 8166
+--   rednet protocol "casino"
+--   modem on bottom
+--
+-- Updates in this version:
+--   - Radar radius is 1.65
+--   - Main display station positions rotated 90 degrees clockwise
+--   - Station 1 appears at old Station 2 position
+--   - Station 2 appears at old Station 3 position
+--   - Station 3 appears at old Station 4 position
+--   - Station 4 appears at old Station 1 position
+--   - Station monitor controls compressed upward
+--   - Qty/chip sliders are one row tall
+--   - HIT/STAND/X2/SPLIT buttons are one row tall
+--   - Card hand nil safety preserved
+
+-- =========================================================
+-- === Config
+-- =========================================================
+
+local ACCOUNT_COMPUTER_ID = 8166
+local ACCOUNT_PROTOCOL = "casino"
+local MODEM_SIDE = "bottom"
+
+local MAIN_MONITOR_NAME = "monitor_981"
+
+local DETECT_RADIUS = 1.65
+
+local CHIP_VALUES = {500, 1000, 5000, 25000}
+local MAX_BET = 25000
+
+local DEALER_HITS_SOFT_17 = true
+local BLACKJACK_PAYOUT_MULT = 2.5
+local ROUND_RESULT_SECONDS = 6
+
+local STATIONS = {
+    {
+        id = 1,
+        label = "N",
+        monitorName = "monitor_977",
+        radarNames = {"radar_44", "radar_45"},
+        side = "north"
+    },
+    {
+        id = 2,
+        label = "E",
+        monitorName = "monitor_978",
+        radarNames = {"radar_46", "radar_47"},
+        side = "east"
+    },
+    {
+        id = 3,
+        label = "S",
+        monitorName = "monitor_979",
+        radarNames = {"radar_48", "radar_49"},
+        side = "south"
+    },
+    {
+        id = 4,
+        label = "W",
+        monitorName = "monitor_980",
+        radarNames = {"radar_50", "radar_51"},
+        side = "west"
+    }
+}
+
+-- =========================================================
+-- === Peripherals
+-- =========================================================
+
+local modem = peripheral.wrap(MODEM_SIDE)
+if not modem then error("No modem on " .. MODEM_SIDE) end
+rednet.open(MODEM_SIDE)
+
+local mainMonitor = peripheral.wrap(MAIN_MONITOR_NAME)
+if not mainMonitor then error("Missing main display: " .. MAIN_MONITOR_NAME) end
+
+mainMonitor.setTextScale(0.5)
+mainMonitor.setBackgroundColor(colors.green)
+mainMonitor.clear()
+
+for _, station in ipairs(STATIONS) do
+    station.monitor = peripheral.wrap(station.monitorName)
+    if not station.monitor then error("Missing station monitor: " .. station.monitorName) end
+
+    station.monitor.setTextScale(0.5)
+    station.monitor.setBackgroundColor(colors.black)
+    station.monitor.clear()
+
+    station.radars = {}
+
+    for _, radarName in ipairs(station.radarNames) do
+        local radar = peripheral.wrap(radarName)
+        if not radar then error("Missing radar: " .. radarName) end
+        table.insert(station.radars, radar)
+    end
+end
+
+-- =========================================================
+-- === State
+-- =========================================================
+
+local state = "betting"
+local deck = {}
+local dealerHand = nil
+local dealerRevealed = false
+local currentTurnStationId = nil
+local currentTurnHandIndex = nil
+local roundMessage = "Place bets"
+
+local accountBusy = false
+
+for _, station in ipairs(STATIONS) do
+    station.player = nil
+    station.lockedPlayer = nil
+    station.balance = 0
+
+    station.chipIndex = 1
+    station.quantity = 1
+    station.joined = false
+
+    station.hands = {}
+    station.currentHand = 1
+    station.message = "Stand on pad"
+    station.buttons = {}
+end
+
+-- =========================================================
+-- === Account Helpers
+-- =========================================================
+
+local function accountLock()
+    while accountBusy do sleep(0.05) end
+    accountBusy = true
+end
+
+local function accountUnlock()
+    accountBusy = false
+end
+
+local function requestBalance(player)
+    if not player then return 0 end
+
+    accountLock()
+
+    rednet.send(ACCOUNT_COMPUTER_ID, {
+        action = "get_balance",
+        player = player
+    }, ACCOUNT_PROTOCOL)
+
+    local id, msg = rednet.receive(ACCOUNT_PROTOCOL, 2)
+
+    accountUnlock()
+
+    if id == ACCOUNT_COMPUTER_ID and type(msg) == "table" and msg.player == player then
+        return tonumber(msg.balance) or 0
+    end
+
+    return 0
+end
+
+local function changeBalance(player, delta, note)
+    if not player then return 0 end
+    if delta == 0 then return requestBalance(player) end
+
+    accountLock()
+
+    rednet.send(ACCOUNT_COMPUTER_ID, {
+        action = "transfer",
+        player = player,
+        delta = delta,
+        note = note or "BLACKJACK TRANSFER"
+    }, ACCOUNT_PROTOCOL)
+
+    local id, msg = rednet.receive(ACCOUNT_PROTOCOL, 2)
+
+    accountUnlock()
+
+    if id == ACCOUNT_COMPUTER_ID and type(msg) == "table" and msg.player == player then
+        return tonumber(msg.balance) or 0
+    end
+
+    return requestBalance(player)
+end
+
+local function sendWinStat(player, wager, payout, detail)
+    wager = tonumber(wager) or 0
+    payout = tonumber(payout) or 0
+
+    if not player or payout - wager <= 0 then return end
+
+    rednet.send(ACCOUNT_COMPUTER_ID, {
+        action = "gamble_win_stat",
+        player = player,
+        game = "blackjack",
+        wager = wager,
+        payout = payout,
+        detail = detail or "blackjack"
+    }, ACCOUNT_PROTOCOL)
+end
+
+-- =========================================================
+-- === Card Logic
+-- =========================================================
+
+local SUITS = {"H", "D", "S", "C"}
+local RANKS = {"A", "2", "3", "4", "5", "6", "7", "8", "9", "T", "J", "Q", "K"}
+
+local function makeHand(bet, fromSplit)
+    return {
+        cards = {},
+        bet = bet or 0,
+        done = false,
+        doubled = false,
+        fromSplit = fromSplit or false,
+        result = "",
+        payout = 0,
+        net = 0
+    }
+end
+
+local function safeCards(hand)
+    if type(hand) ~= "table" then return {} end
+    if type(hand.cards) ~= "table" then
+        hand.cards = {}
+    end
+    return hand.cards
+end
+
+local function cardValue(card)
+    if not card then return 0 end
+    if card.rank == "A" then return 11 end
+    if card.rank == "T" or card.rank == "J" or card.rank == "Q" or card.rank == "K" then return 10 end
+    return tonumber(card.rank) or 0
+end
+
+local function handValue(hand)
+    local cards = safeCards(hand)
+    local total = 0
+    local aces = 0
+
+    for _, card in ipairs(cards) do
+        total = total + cardValue(card)
+        if card.rank == "A" then aces = aces + 1 end
+    end
+
+    while total > 21 and aces > 0 do
+        total = total - 10
+        aces = aces - 1
+    end
+
+    return total
+end
+
+local function isSoft17(hand)
+    local cards = safeCards(hand)
+    local total = 0
+    local aces = 0
+
+    for _, card in ipairs(cards) do
+        if card.rank == "A" then
+            total = total + 11
+            aces = aces + 1
+        else
+            total = total + cardValue(card)
+        end
+    end
+
+    while total > 21 and aces > 0 do
+        total = total - 10
+        aces = aces - 1
+    end
+
+    return total == 17 and aces > 0
+end
+
+local function isBlackjack(hand)
+    local cards = safeCards(hand)
+    return #cards == 2 and handValue(hand) == 21 and not hand.fromSplit
+end
+
+local function canDouble(hand)
+    local cards = safeCards(hand)
+    return not hand.done and #cards == 2 and not hand.doubled
+end
+
+local function canSplit(hand)
+    local cards = safeCards(hand)
+
+    if hand.done then return false end
+    if hand.fromSplit then return false end
+    if #cards ~= 2 then return false end
+
+    return cardValue(cards[1]) == cardValue(cards[2])
+end
+
+local function buildDeck()
+    local d = {}
+
+    for _, suit in ipairs(SUITS) do
+        for _, rank in ipairs(RANKS) do
+            table.insert(d, {
+                rank = rank,
+                suit = suit
+            })
+        end
+    end
+
+    for i = #d, 2, -1 do
+        local j = math.random(i)
+        d[i], d[j] = d[j], d[i]
+    end
+
+    return d
+end
+
+local function drawCardFromDeck()
+    if #deck <= 10 then
+        deck = buildDeck()
+    end
+
+    return table.remove(deck)
+end
+
+local function addCard(hand)
+    table.insert(safeCards(hand), drawCardFromDeck())
+end
+
+local function totalBet(station)
+    local chip = CHIP_VALUES[station.chipIndex] or CHIP_VALUES[1]
+    return chip * station.quantity
+end
+
+-- =========================================================
+-- === Main Table Card Drawing
+-- =========================================================
+
+local SUIT_ART = {
+    H = {
+        "0011001100",
+        "0111111110",
+        "1111111111",
+        "1111111111",
+        "0111111110",
+        "0011111100",
+        "0001111000",
+        "0000110000",
+        "0000000000"
+    },
+
+    D = {
+        "0000110000",
+        "0001111000",
+        "0011111100",
+        "0111111110",
+        "1111111111",
+        "0111111110",
+        "0011111100",
+        "0001111000",
+        "0000110000"
+    },
+
+    S = {
+        "0000110000",
+        "0001111000",
+        "0011111100",
+        "0111111110",
+        "1111111111",
+        "1111111111",
+        "0011111100",
+        "0111111110",
+        "0000000000"
+    },
+
+    C = {
+        "0000110000",
+        "0011111100",
+        "0011111100",
+        "1111111111",
+        "1111111111",
+        "0011111100",
+        "0011111100",
+        "0111111110",
+        "0000000000"
+    }
+}
+
+local function suitColor(suit)
+    if suit == "H" or suit == "D" then
+        return colors.red
+    end
+
+    return colors.black
+end
+
+local function writeText(mon, x, y, text, fg, bg)
+    local w, h = mon.getSize()
+    text = tostring(text or "")
+
+    if y < 1 or y > h then return end
+    if x < 1 then x = 1 end
+    if x > w then return end
+
+    mon.setCursorPos(x, y)
+    mon.setTextColor(fg or colors.white)
+    mon.setBackgroundColor(bg or colors.black)
+    mon.write(text)
+end
+
+local function drawPixel(mon, x, y, color)
+    local w, h = mon.getSize()
+    if x < 1 or x > w or y < 1 or y > h then return end
+
+    mon.setCursorPos(x, y)
+    mon.setBackgroundColor(color)
+    mon.write(" ")
+end
+
+local function rotatePoint(px, py, width, height, dir)
+    if dir == "north" then
+        return px, py, width, height
+    elseif dir == "south" then
+        return width - px + 1, height - py + 1, width, height
+    elseif dir == "east" then
+        return height - py + 1, px, height, width
+    elseif dir == "west" then
+        return py, width - px + 1, height, width
+    end
+
+    return px, py, width, height
+end
+
+local function cardDims(dir)
+    if dir == "east" or dir == "west" then
+        return 11, 12
+    end
+
+    return 12, 11
+end
+
+local function drawCard(mon, x, y, card, hidden, dir)
+    dir = dir or "north"
+
+    local baseW = 12
+    local baseH = 11
+    local outW, outH = cardDims(dir)
+
+    -- white card fill
+    for py = 1, baseH do
+        for px = 1, baseW do
+            local rx, ry = rotatePoint(px, py, baseW, baseH, dir)
+            drawPixel(mon, x + rx - 1, y + ry - 1, colors.white)
+        end
+    end
+
+    -- border
+    for py = 1, baseH do
+        for px = 1, baseW do
+            if px == 1 or px == baseW or py == 1 or py == baseH then
+                local rx, ry = rotatePoint(px, py, baseW, baseH, dir)
+                drawPixel(mon, x + rx - 1, y + ry - 1, colors.gray)
+            end
+        end
+    end
+
+    if hidden then
+        for py = 3, baseH - 2 do
+            for px = 3, baseW - 2 do
+                local rx, ry = rotatePoint(px, py, baseW, baseH, dir)
+                drawPixel(mon, x + rx - 1, y + ry - 1, colors.blue)
+            end
+        end
+
+        writeText(mon, x + math.floor(outW / 2), y + math.floor(outH / 2), "?", colors.white, colors.blue)
+        return
+    end
+
+    if not card then return end
+
+    local art = SUIT_ART[card.suit] or SUIT_ART.S
+    local color = suitColor(card.suit)
+
+    local artW = #art[1]
+    local artH = #art
+    local startX = 2
+    local startY = 2
+
+    for row = 1, artH do
+        local line = art[row]
+        for col = 1, artW do
+            if line:sub(col, col) == "1" then
+                local px = startX + col - 1
+                local py = startY + row - 1
+                local rx, ry = rotatePoint(px, py, baseW, baseH, dir)
+                drawPixel(mon, x + rx - 1, y + ry - 1, color)
+            end
+        end
+    end
+
+    -- Rank stays regular monitor text for readability.
+    writeText(mon, x + math.floor(outW / 2), y + math.floor(outH / 2), card.rank, colors.white, color)
+end
+
+local function handDisplayValue(hand)
+    if not hand then return "" end
+
+    local cards = safeCards(hand)
+    if #cards == 0 then return "" end
+
+    local v = handValue(hand)
+    if v > 21 then return "BUST" end
+
+    return tostring(v)
+end
+
+local function drawHand(mon, hand, x, y, dir, label, hideSecond)
+    if not hand then return end
+
+    local cards = safeCards(hand)
+    label = tostring(label or "")
+
+    writeText(mon, x, y - 1, label, colors.white, colors.green)
+
+    local stepX, stepY = 13, 0
+    if dir == "east" or dir == "west" then
+        stepX, stepY = 0, 13
+    end
+
+    for i, card in ipairs(cards) do
+        drawCard(
+            mon,
+            x + ((i - 1) * stepX),
+            y + ((i - 1) * stepY),
+            card,
+            hideSecond and i == 2,
+            dir
+        )
+    end
+
+    if not hideSecond then
+        local vx = x
+        local vy = y + 12
+
+        if dir == "east" or dir == "west" then
+            vx = x + 13
+            vy = y
+        end
+
+        writeText(mon, vx, vy, "Value " .. handDisplayValue(hand), colors.white, colors.green)
+    end
+end
+
+local function clearMain()
+    mainMonitor.setBackgroundColor(colors.green)
+    mainMonitor.clear()
+end
+
+local function getMainLayout()
+    local w, h = mainMonitor.getSize()
+
+    -- Original physical positions:
+    -- north = top
+    -- east  = right
+    -- south = bottom
+    -- west  = left
+    --
+    -- User requested 90-degree clockwise display rotation:
+    -- Station 1 goes to old Station 2 spot
+    -- Station 2 goes to old Station 3 spot
+    -- Station 3 goes to old Station 4 spot
+    -- Station 4 goes to old Station 1 spot
+    return {
+        dealer = {
+            x = math.floor(w / 2) - 18,
+            y = math.floor(h / 2) - 6,
+            dir = "north"
+        },
+
+        -- Station 1 / N displayed at old east position
+        north = {
+            x = w - 24,
+            y = math.floor(h / 2) - 18,
+            dir = "east"
+        },
+
+        -- Station 2 / E displayed at old south position
+        east = {
+            x = math.floor(w / 2) - 18,
+            y = h - 17,
+            dir = "south"
+        },
+
+        -- Station 3 / S displayed at old west position
+        south = {
+            x = 4,
+            y = math.floor(h / 2) - 18,
+            dir = "west"
+        },
+
+        -- Station 4 / W displayed at old north position
+        west = {
+            x = math.floor(w / 2) - 18,
+            y = 4,
+            dir = "north"
+        }
+    }
+end
+
+local function drawMainTable()
+    clearMain()
+
+    local layout = getMainLayout()
+
+    writeText(mainMonitor, 2, 1, "BLACKJACK | " .. roundMessage, colors.white, colors.green)
+
+    if dealerHand and #safeCards(dealerHand) > 0 then
+        drawHand(mainMonitor, dealerHand, layout.dealer.x, layout.dealer.y, layout.dealer.dir, "DEALER", not dealerRevealed)
+    else
+        writeText(mainMonitor, layout.dealer.x, layout.dealer.y, "DEALER", colors.white, colors.green)
+    end
+
+    for _, station in ipairs(STATIONS) do
+        local p = layout[station.side]
+        local showName = station.lockedPlayer or station.player or ("Station " .. station.id)
+
+        writeText(mainMonitor, p.x, p.y - 2, station.label .. " " .. showName, colors.yellow, colors.green)
+
+        if station.joined and station.hands and #station.hands > 0 then
+            local hand = station.hands[station.currentHand or 1]
+
+            local label = "Bet $" .. tostring(hand and hand.bet or 0)
+
+            if #station.hands > 1 then
+                label = label .. " H" .. tostring(station.currentHand or 1) .. "/" .. tostring(#station.hands)
+            end
+
+            drawHand(mainMonitor, hand, p.x, p.y, p.dir, label, false)
+        else
+            writeText(mainMonitor, p.x, p.y, "Not playing", colors.lightGray, colors.green)
+        end
+    end
+end
+
+-- =========================================================
+-- === Station Monitor Drawing
+-- =========================================================
+
+local function resetButtons(station)
+    station.buttons = {}
+end
+
+local function addButton(station, name, x1, y1, x2, y2, label, bg, fg)
+    table.insert(station.buttons, {
+        name = name,
+        x1 = x1,
+        y1 = y1,
+        x2 = x2,
+        y2 = y2
+    })
+
+    local mon = station.monitor
+    mon.setBackgroundColor(bg or colors.gray)
+    mon.setTextColor(fg or colors.white)
+
+    for y = y1, y2 do
+        mon.setCursorPos(x1, y)
+        mon.write(string.rep(" ", math.max(1, x2 - x1 + 1)))
+    end
+
+    local tx = x1 + math.floor(((x2 - x1 + 1) - #label) / 2)
+    local ty = y1 + math.floor((y2 - y1) / 2)
+
+    if tx < x1 then tx = x1 end
+
+    mon.setCursorPos(tx, ty)
+    mon.write(label)
+end
+
+local function drawStationMonitor(station)
+    local mon = station.monitor
+    local w, h = mon.getSize()
+
+    mon.setTextScale(0.5)
+    mon.setBackgroundColor(colors.black)
+    mon.clear()
+    resetButtons(station)
+
+    local playerName = station.player or "No Player"
+    local chip = CHIP_VALUES[station.chipIndex] or CHIP_VALUES[1]
+    local total = totalBet(station)
+
+    -- Row 1: name left, balance right
+    writeText(mon, 1, 1, playerName, colors.white, colors.black)
+
+    local balText = "$" .. tostring(station.balance or 0)
+    writeText(mon, math.max(1, w - #balText), 1, balText, colors.lime, colors.black)
+
+    -- Row 2: compressed qty/chip controls using the gap under name/balance
+    writeText(mon, 1, 2, "Qty", colors.yellow, colors.black)
+    addButton(station, "qty_down", 5, 2, 7, 2, "-", colors.gray, colors.white)
+    writeText(mon, 9, 2, tostring(station.quantity), colors.white, colors.black)
+    addButton(station, "qty_up", 13, 2, 15, 2, "+", colors.gray, colors.white)
+
+    local chipLabelX = math.max(20, w - 25)
+    writeText(mon, chipLabelX, 2, "Chip", colors.yellow, colors.black)
+    addButton(station, "chip_down", chipLabelX + 5, 2, chipLabelX + 7, 2, "<", colors.gray, colors.white)
+    writeText(mon, chipLabelX + 9, 2, tostring(chip), colors.orange, colors.black)
+    addButton(station, "chip_up", math.min(w - 2, chipLabelX + 17), 2, math.min(w, chipLabelX + 19), 2, ">", colors.gray, colors.white)
+
+    -- Row 3: total and message moved upward
+    writeText(mon, 1, 3, "Total $" .. tostring(total), colors.orange, colors.black)
+    writeText(mon, math.max(20, w - 34), 3, station.message or "", colors.lightBlue, colors.black)
+
+    if state == "betting" then
+        if not station.player then
+            writeText(mon, 1, 5, "Stand in range to play.", colors.red, colors.black)
+            return
+        end
+
+        if station.joined then
+            addButton(station, "cancel", 1, 5, 12, 5, "CANCEL", colors.red, colors.white)
+            addButton(station, "start", 15, 5, 27, 5, "START", colors.orange, colors.black)
+            writeText(mon, 1, 7, "Joined. Waiting to start.", colors.lime, colors.black)
+        else
+            addButton(station, "deal", 1, 5, 12, 5, "DEAL", colors.green, colors.black)
+        end
+
+    elseif state == "playing" then
+        local isTurn = currentTurnStationId == station.id
+        local hand = nil
+
+        if station.hands and station.currentHand then
+            hand = station.hands[station.currentHand]
+        end
+
+        if not station.joined then
+            writeText(mon, 1, 5, "Waiting for next round.", colors.lightGray, colors.black)
+            return
+        end
+
+        if not isTurn then
+            writeText(mon, 1, 5, "Waiting for your turn.", colors.lightGray, colors.black)
+            return
+        end
+
+        writeText(mon, 1, 5, "Your turn H" .. tostring(station.currentHand or 1) .. "/" .. tostring(#station.hands), colors.lime, colors.black)
+
+        -- One-row-tall play buttons
+        addButton(station, "hit", 1, 7, 8, 7, "HIT", colors.green, colors.black)
+        addButton(station, "stand", 10, 7, 19, 7, "STAND", colors.red, colors.white)
+
+        if hand and canDouble(hand) and station.balance >= hand.bet then
+            addButton(station, "double", 21, 7, 28, 7, "X2", colors.orange, colors.black)
+        end
+
+        if hand and canSplit(hand) and station.balance >= hand.bet then
+            addButton(station, "split", 30, 7, 40, 7, "SPLIT", colors.purple, colors.white)
+        end
+
+    elseif state == "dealer" then
+        writeText(mon, 1, 5, "Dealer playing...", colors.orange, colors.black)
+
+    elseif state == "result" then
+        writeText(mon, 1, 5, station.message or "Round over", colors.yellow, colors.black)
+    end
+end
+
+local function drawAll()
+    drawMainTable()
+
+    for _, station in ipairs(STATIONS) do
+        drawStationMonitor(station)
+    end
+end
+
+-- =========================================================
+-- === Radar Detection
+-- =========================================================
+
+local function detectStationPlayer(station)
+    local found = {}
+
+    for _, radar in ipairs(station.radars) do
+        local ok, players = pcall(function()
+            return radar.getPlayers()
+        end)
+
+        if ok and type(players) == "table" then
+            for _, p in ipairs(players) do
+                if p.name and p.distance and p.distance <= DETECT_RADIUS then
+                    found[p.name] = true
+                end
+            end
+        end
+    end
+
+    local list = {}
+
+    for name in pairs(found) do
+        table.insert(list, name)
+    end
+
+    table.sort(list)
+
+    if #list == 1 then
+        return list[1], "Ready"
+    elseif #list > 1 then
+        return nil, "Too many players"
+    else
+        return nil, "Stand on pad"
+    end
+end
+
+local function radarLoop()
+    while true do
+        if state == "betting" then
+            for _, station in ipairs(STATIONS) do
+                local p, msg = detectStationPlayer(station)
+
+                if p ~= station.player then
+                    if station.joined and station.lockedPlayer then
+                        station.balance = changeBalance(
+                            station.lockedPlayer,
+                            totalBet(station),
+                            "BLACKJACK AUTO REFUND: left before round"
+                        )
+                    end
+
+                    station.player = p
+                    station.lockedPlayer = nil
+                    station.joined = false
+                    station.hands = {}
+                    station.currentHand = 1
+
+                    if p then
+                        station.balance = requestBalance(p)
+                        station.message = "Set bet"
+                    else
+                        station.balance = 0
+                        station.message = msg
+                    end
+                elseif p then
+                    station.balance = requestBalance(p)
+                else
+                    station.message = msg
+                end
+            end
+        end
+
+        sleep(0.75)
+    end
+end
+
+-- =========================================================
+-- === Round Helpers
+-- =========================================================
+
+local function getStationById(id)
+    for _, station in ipairs(STATIONS) do
+        if station.id == id then return station end
+    end
+
+    return nil
+end
+
+local function anyJoined()
+    for _, station in ipairs(STATIONS) do
+        if station.joined then return true end
+    end
+
+    return false
+end
+
+local function joinedStations()
+    local list = {}
+
+    for _, station in ipairs(STATIONS) do
+        if station.joined then
+            table.insert(list, station)
+        end
+    end
+
+    table.sort(list, function(a, b)
+        return a.id < b.id
+    end)
+
+    return list
+end
+
+local function allHandsDone()
+    for _, station in ipairs(STATIONS) do
+        if station.joined then
+            for _, hand in ipairs(station.hands or {}) do
+                if not hand.done then
+                    return false
+                end
+            end
+        end
+    end
+
+    return true
+end
+
+local function setNextTurn()
+    if allHandsDone() then
+        currentTurnStationId = nil
+        currentTurnHandIndex = nil
+        state = "dealer"
+        roundMessage = "Dealer playing"
+        return
+    end
+
+    local active = joinedStations()
+
+    for _, station in ipairs(active) do
+        for handIndex, hand in ipairs(station.hands or {}) do
+            if not hand.done then
+                station.currentHand = handIndex
+                currentTurnStationId = station.id
+                currentTurnHandIndex = handIndex
+                roundMessage = station.label .. " turn"
+                station.message = "Your turn"
+                return
+            end
+        end
+    end
+end
+
+local function startRound()
+    if state ~= "betting" then return end
+    if not anyJoined() then return end
+
+    deck = buildDeck()
+    dealerHand = makeHand(0, false)
+    dealerRevealed = false
+
+    addCard(dealerHand)
+    addCard(dealerHand)
+
+    for _, station in ipairs(STATIONS) do
+        if station.joined then
+            station.lockedPlayer = station.player
+            station.hands = {makeHand(totalBet(station), false)}
+            station.currentHand = 1
+            station.message = "Good luck"
+
+            addCard(station.hands[1])
+            addCard(station.hands[1])
+
+            if isBlackjack(station.hands[1]) then
+                station.hands[1].done = true
+                station.message = "Blackjack!"
+            end
+        end
+    end
+
+    state = "playing"
+    roundMessage = "Players playing"
+    setNextTurn()
+end
+
+local function playDealer()
+    dealerRevealed = true
+
+    while handValue(dealerHand) < 17 or (DEALER_HITS_SOFT_17 and isSoft17(dealerHand)) do
+        drawAll()
+        sleep(1)
+        addCard(dealerHand)
+    end
+end
+
+local function settleRound()
+    local dealerValue = handValue(dealerHand)
+    local dealerBust = dealerValue > 21
+
+    for _, station in ipairs(STATIONS) do
+        if station.joined and station.lockedPlayer then
+            local totalNet = 0
+
+            for _, hand in ipairs(station.hands or {}) do
+                local hv = handValue(hand)
+                local payout = 0
+                local result = ""
+
+                if hv > 21 then
+                    result = "Bust"
+                    payout = 0
+
+                elseif isBlackjack(hand) then
+                    result = "Blackjack"
+                    payout = math.floor(hand.bet * BLACKJACK_PAYOUT_MULT)
+
+                elseif dealerBust then
+                    result = "Win"
+                    payout = hand.bet * 2
+
+                elseif hv > dealerValue then
+                    result = "Win"
+                    payout = hand.bet * 2
+
+                elseif hv == dealerValue then
+                    result = "Push"
+                    payout = hand.bet
+
+                else
+                    result = "Lose"
+                    payout = 0
+                end
+
+                hand.result = result
+                hand.payout = payout
+                hand.net = payout - hand.bet
+
+                if payout > 0 then
+                    station.balance = changeBalance(
+                        station.lockedPlayer,
+                        payout,
+                        "BLACKJACK " .. result .. ": payout $" .. payout .. " on bet $" .. hand.bet
+                    )
+                end
+
+                if hand.net > 0 then
+                    sendWinStat(station.lockedPlayer, hand.bet, payout, result)
+                end
+
+                totalNet = totalNet + hand.net
+            end
+
+            station.message = "Net " .. (totalNet >= 0 and "+" or "") .. tostring(totalNet)
+        end
+    end
+
+    state = "result"
+    roundMessage = "Round complete"
+end
+
+local function resetToBetting()
+    for _, station in ipairs(STATIONS) do
+        station.joined = false
+        station.lockedPlayer = nil
+        station.hands = {}
+        station.currentHand = 1
+
+        if station.player then
+            station.balance = requestBalance(station.player)
+            station.message = "Set bet"
+        else
+            station.balance = 0
+            station.message = "Stand on pad"
+        end
+    end
+
+    dealerHand = nil
+    dealerRevealed = false
+    currentTurnStationId = nil
+    currentTurnHandIndex = nil
+    roundMessage = "Place bets"
+    state = "betting"
+end
+
+local function roundLoop()
+    while true do
+        if state == "dealer" then
+            playDealer()
+            drawAll()
+            sleep(1)
+            settleRound()
+            drawAll()
+            sleep(ROUND_RESULT_SECONDS)
+            resetToBetting()
+        end
+
+        sleep(0.1)
+    end
+end
+
+-- =========================================================
+-- === Touch Handling
+-- =========================================================
+
+local function stationByMonitorName(name)
+    for _, station in ipairs(STATIONS) do
+        if station.monitorName == name then
+            return station
+        end
+    end
+
+    return nil
+end
+
+local function buttonAt(station, x, y)
+    for _, button in ipairs(station.buttons or {}) do
+        if x >= button.x1 and x <= button.x2 and y >= button.y1 and y <= button.y2 then
+            return button.name
+        end
+    end
+
+    return nil
+end
+
+local function normalizeBet(station)
+    local chip = CHIP_VALUES[station.chipIndex] or CHIP_VALUES[1]
+
+    if chip * station.quantity > MAX_BET then
+        station.quantity = math.max(1, math.floor(MAX_BET / chip))
+    end
+
+    if station.quantity < 1 then
+        station.quantity = 1
+    end
+end
+
+local function joinStation(station)
+    if not station.player then
+        station.message = "No player"
+        return
+    end
+
+    normalizeBet(station)
+
+    local total = totalBet(station)
+    station.balance = requestBalance(station.player)
+
+    if total > MAX_BET then
+        station.message = "Max bet 25000"
+        return
+    end
+
+    if total > station.balance then
+        station.message = "No balance"
+        return
+    end
+
+    station.balance = changeBalance(
+        station.player,
+        -total,
+        "BLACKJACK BET: $" .. total
+    )
+
+    station.joined = true
+    station.lockedPlayer = station.player
+    station.message = "Dealt in $" .. total
+end
+
+local function cancelJoin(station)
+    if state ~= "betting" then return end
+    if not station.joined then return end
+
+    local refundPlayer = station.lockedPlayer or station.player
+    local refund = totalBet(station)
+
+    station.balance = changeBalance(
+        refundPlayer,
+        refund,
+        "BLACKJACK BET REFUND: $" .. refund
+    )
+
+    station.joined = false
+    station.lockedPlayer = nil
+    station.message = "Cancelled"
+end
+
+local function handlePlayingButton(station, button)
+    if state ~= "playing" then return end
+
+    if currentTurnStationId ~= station.id then
+        station.message = "Not your turn"
+        return
+    end
+
+    local hand = station.hands[currentTurnHandIndex]
+    if not hand or hand.done then return end
+
+    if button == "hit" then
+        addCard(hand)
+
+        if handValue(hand) > 21 then
+            hand.done = true
+            station.message = "Bust"
+            setNextTurn()
+        else
+            station.message = "Hit"
+        end
+
+    elseif button == "stand" then
+        hand.done = true
+        station.message = "Stand"
+        setNextTurn()
+
+    elseif button == "double" then
+        if not canDouble(hand) then
+            station.message = "No double"
+            return
+        end
+
+        if station.balance < hand.bet then
+            station.message = "Need $" .. hand.bet
+            return
+        end
+
+        station.balance = changeBalance(
+            station.lockedPlayer,
+            -hand.bet,
+            "BLACKJACK DOUBLE: extra $" .. hand.bet
+        )
+
+        hand.bet = hand.bet * 2
+        hand.doubled = true
+
+        addCard(hand)
+        hand.done = true
+
+        if handValue(hand) > 21 then
+            station.message = "Double bust"
+        else
+            station.message = "Doubled"
+        end
+
+        setNextTurn()
+
+    elseif button == "split" then
+        if not canSplit(hand) then
+            station.message = "No split"
+            return
+        end
+
+        if station.balance < hand.bet then
+            station.message = "Need $" .. hand.bet
+            return
+        end
+
+        station.balance = changeBalance(
+            station.lockedPlayer,
+            -hand.bet,
+            "BLACKJACK SPLIT: extra $" .. hand.bet
+        )
+
+        local cards = safeCards(hand)
+        local c1 = cards[1]
+        local c2 = cards[2]
+        local bet = hand.bet
+
+        local h1 = makeHand(bet, true)
+        local h2 = makeHand(bet, true)
+
+        table.insert(h1.cards, c1)
+        table.insert(h2.cards, c2)
+
+        addCard(h1)
+        addCard(h2)
+
+        station.hands = {h1, h2}
+        station.currentHand = 1
+        currentTurnHandIndex = 1
+
+        station.message = "Split"
+    end
+end
+
+local function handleStationTouch(station, x, y)
+    local button = buttonAt(station, x, y)
+    if not button then return end
+
+    if state == "betting" then
+        if button == "qty_down" then
+            station.quantity = math.max(1, station.quantity - 1)
+            station.message = station.quantity <= 1 and "Min qty" or "Qty " .. station.quantity
+
+        elseif button == "qty_up" then
+            station.quantity = station.quantity + 1
+            normalizeBet(station)
+
+            if totalBet(station) >= MAX_BET then
+                station.message = "Max bet"
+            else
+                station.message = "Qty " .. station.quantity
+            end
+
+        elseif button == "chip_down" then
+            station.chipIndex = math.max(1, station.chipIndex - 1)
+            normalizeBet(station)
+            station.message = "Chip $" .. tostring(CHIP_VALUES[station.chipIndex])
+
+        elseif button == "chip_up" then
+            station.chipIndex = math.min(#CHIP_VALUES, station.chipIndex + 1)
+            normalizeBet(station)
+            station.message = "Chip $" .. tostring(CHIP_VALUES[station.chipIndex])
+
+        elseif button == "deal" then
+            joinStation(station)
+
+        elseif button == "cancel" then
+            cancelJoin(station)
+
+        elseif button == "start" then
+            startRound()
+        end
+
+    elseif state == "playing" then
+        handlePlayingButton(station, button)
+    end
+end
+
+local function touchLoop()
+    while true do
+        local _, monitorName, x, y = os.pullEvent("monitor_touch")
+        local station = stationByMonitorName(monitorName)
+
+        if station then
+            handleStationTouch(station, x, y)
+        end
+
+        sleep(0.05)
+    end
+end
+
+-- =========================================================
+-- === Display Loop
+-- =========================================================
+
+local function displayLoop()
+    while true do
+        drawAll()
+        sleep(0.15)
+    end
+end
+
+-- =========================================================
+-- === Startup
+-- =========================================================
+
+local seed = (os.epoch and os.epoch("utc") or os.time()) + (os.getComputerID() or 0)
+math.randomseed(seed)
+
+for i = 1, 20 do
+    math.random()
+end
+
+deck = buildDeck()
+
+print("Blackjack table v3 ready.")
+print("Account computer:", ACCOUNT_COMPUTER_ID)
+print("Protocol:", ACCOUNT_PROTOCOL)
+print("Main monitor:", MAIN_MONITOR_NAME)
+print("Station physical order: 1=N, 2=E, 3=S, 4=W")
+print("Main display positions rotated 90 degrees clockwise.")
+print("Radar radius:", DETECT_RADIUS)
+
+parallel.waitForAny(
+    radarLoop,
+    displayLoop,
+    touchLoop,
+    roundLoop
+)
