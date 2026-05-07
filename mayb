@@ -1,0 +1,1308 @@
+-- Account Computer with Radar + Deposit + Rednet Transfer + Background Support
+-- Added:
+--   - Local gambling win stats tracking on this account computer
+--   - Stores stats in /winStats.json
+--   - Tracks only positive winning profit
+--   - Roulette stats are calculated as:
+--       total payout for the spin - total amount bet that spin
+--   - Losses do not subtract from leaderboard
+--   - Slot direct gamble_win_stat messages are tracked
+--   - Public chat command support through manipulator_41:
+--       wc casino stats
+--   - Listens for BOTH:
+--       chat_capture: hidden/captured commands
+--       chat_message: normal visible chat messages from anyone
+--   - Replies publicly with one compact chat.say(message)
+--   - Allows hiding certain players from public casino stats
+
+-- =========================================================
+-- === Top Config
+-- =========================================================
+
+local CHAT_MANIPULATOR_NAME = "manipulator_41"
+local CHAT_COMMAND = "wc casino stats"
+local CHAT_CAPTURE_PATTERN = "^wc casino stats$"
+local CHAT_TOP_COUNT = 3
+local CHAT_COOLDOWN_SECONDS = 5
+
+-- Admin account-adjust commands.
+-- Only these players can run captured balance edits:
+--   + "partialName" 5000
+--   - "partialName" 2500
+--   + partialName 5000
+local ADMIN_ADJUST_CAPTURE_PATTERN = "^%s*[+%-]"
+local ADMIN_PLAYERS = {
+    ["HughJaynis1234"] = true,
+}
+
+-- Add player names here if you do NOT want them shown in the public chat leaderboard.
+-- They can still be tracked in winStats.json, but they will be skipped when
+-- someone uses "wc casino stats".
+local HIDE_FROM_CASINO_STATS_CHAT = {
+    -- ["PlayerNameHere"] = true,
+    ["HughJaynis1234"] = true,
+    ["EmTheTurtle03"] = true,
+    ["RadoSlawGuzior"] = true
+}
+
+-- === Peripheral Setup ===
+local shulkerBox = peripheral.wrap("minecraft:ironshulkerbox_gold_1")
+local obCN = "minecraft:ironchest_obsidian_105"
+local dropper = "minecraft:dropper_3"
+local radar = peripheral.wrap("radar_15")
+local monitor = peripheral.wrap("top")
+local modem = peripheral.wrap("bottom")
+local ri = "redstone_integrator_4025"
+local rip = peripheral.wrap(ri)
+
+if not modem then error("No modem on bottom") end
+rednet.open("bottom")
+
+if not fs.exists("/accounts") then fs.makeDir("/accounts") end
+
+-- === Chat Command Setup ===
+local chat = peripheral.wrap(CHAT_MANIPULATOR_NAME)
+local lastChatCommandAt = 0
+
+if chat then
+    print("Chat manipulator found: " .. CHAT_MANIPULATOR_NAME)
+
+    if chat.capture then
+        local ok, err = pcall(function()
+            chat.capture(CHAT_CAPTURE_PATTERN)
+        end)
+
+        if ok then
+            print("Chat capture enabled for: " .. CHAT_COMMAND)
+        else
+            print("Chat capture failed:")
+            print(err)
+        end
+
+        local okAdmin, errAdmin = pcall(function()
+            chat.capture(ADMIN_ADJUST_CAPTURE_PATTERN)
+        end)
+
+        if okAdmin then
+            print("Admin balance adjustment capture enabled: + / - commands")
+        else
+            print("Admin balance adjustment capture failed:")
+            print(errAdmin)
+        end
+    end
+else
+    print("WARNING: " .. CHAT_MANIPULATOR_NAME .. " not found. Chat commands disabled.")
+end
+
+-- === Gambling Win Stats Config ===
+local WIN_STATS_FILE = "/winStats.json"
+local WIN_STATS_LOG_FILE = "/winStats_log.txt"
+
+local pendingRouletteRounds = {}
+
+local VALID_ITEMS = {
+    ["01cf97"] = 500,
+    ["dd703d"] = 15000,
+    ["e61758"] = 1000,
+    ["1fafe1"] = 5000,
+    ["6d281b"] = 10000,
+}
+
+-- === UI State ===
+local PAYOUT_OPTIONS = {500, 1000, 5000, 10000, 15000}
+local selectedValueIndex = 1
+local selectedQty = 1
+local payoutMode = false
+
+-- =========================================================
+-- === Account Helpers
+-- =========================================================
+
+local function getPlayerFile(player)
+    return "/accounts/" .. player .. ".txt"
+end
+
+local function getBalance(player)
+    local path = getPlayerFile(player)
+    if fs.exists(path) then
+        local f = fs.open(path, "r")
+        local val = tonumber(f.readAll())
+        f.close()
+        return val or 0
+    end
+    return 0
+end
+
+local function setBalance(player, amount)
+    local f = fs.open(getPlayerFile(player), "w")
+    f.write(tostring(amount))
+    f.close()
+end
+
+local function logTransaction(player, message, change)
+    if not fs.exists("/accounts/logs") then fs.makeDir("/accounts/logs") end
+
+    local logPath = "/accounts/logs/" .. player .. ".txt"
+    local time = textutils.formatTime(os.time(), true)
+    local newBalance = getBalance(player)
+    local delta = (change >= 0 and "+" or "") .. tostring(change)
+    local entry = "[" .. time .. "] " .. message .. " " .. delta .. " (Balance: " .. newBalance .. ")"
+
+    local lines = {}
+
+    if fs.exists(logPath) then
+        local file = fs.open(logPath, "r")
+        while true do
+            local line = file.readLine()
+            if not line then break end
+            table.insert(lines, line)
+        end
+        file.close()
+    end
+
+    table.insert(lines, entry)
+
+    while #lines > 500 do
+        table.remove(lines, 1)
+    end
+
+    local file = fs.open(logPath, "w")
+    for _, line in ipairs(lines) do
+        file.writeLine(line)
+    end
+    file.close()
+end
+
+-- =========================================================
+-- === Gambling Win Stats Helpers
+-- =========================================================
+
+local function getMonthKey()
+    if os.date then
+        local ok, val = pcall(function()
+            return os.date("%Y-%m")
+        end)
+
+        if ok and val and type(val) == "string" and #val > 0 then
+            return val
+        end
+    end
+
+    return "current"
+end
+
+local function loadWinStats()
+    if fs.exists(WIN_STATS_FILE) then
+        local f = fs.open(WIN_STATS_FILE, "r")
+        local text = f.readAll()
+        f.close()
+
+        local data = textutils.unserialize(text)
+
+        if type(data) == "table" then
+            data.allTime = data.allTime or {}
+            data.months = data.months or {}
+            return data
+        end
+    end
+
+    return {
+        allTime = {},
+        months = {}
+    }
+end
+
+local function saveWinStats(data)
+    local f = fs.open(WIN_STATS_FILE, "w")
+    f.write(textutils.serialize(data))
+    f.close()
+end
+
+local function appendWinStatsLog(line)
+    local lines = {}
+
+    if fs.exists(WIN_STATS_LOG_FILE) then
+        local f = fs.open(WIN_STATS_LOG_FILE, "r")
+        while true do
+            local l = f.readLine()
+            if not l then break end
+            table.insert(lines, l)
+        end
+        f.close()
+    end
+
+    table.insert(lines, line)
+
+    while #lines > 1000 do
+        table.remove(lines, 1)
+    end
+
+    local f = fs.open(WIN_STATS_LOG_FILE, "w")
+    for _, l in ipairs(lines) do
+        f.writeLine(l)
+    end
+    f.close()
+end
+
+local function ensurePlayerStats(bucket, player)
+    bucket[player] = bucket[player] or {
+        profit = 0,
+        payout = 0,
+        wager = 0,
+        wins = 0,
+        games = {}
+    }
+
+    return bucket[player]
+end
+
+local function ensureGameStats(playerStats, game)
+    playerStats.games[game] = playerStats.games[game] or {
+        profit = 0,
+        payout = 0,
+        wager = 0,
+        wins = 0
+    }
+
+    return playerStats.games[game]
+end
+
+local function addGamblingWinStat(player, game, wager, payout, detail)
+    player = tostring(player or "")
+    game = tostring(game or "unknown")
+    wager = tonumber(wager) or 0
+    payout = tonumber(payout) or 0
+
+    local profit = payout - wager
+
+    if player == "" then return false end
+    if profit <= 0 then return false end
+
+    local data = loadWinStats()
+    local month = getMonthKey()
+
+    data.allTime = data.allTime or {}
+    data.months = data.months or {}
+    data.months[month] = data.months[month] or {}
+
+    local allPlayer = ensurePlayerStats(data.allTime, player)
+    local monthPlayer = ensurePlayerStats(data.months[month], player)
+
+    local allGame = ensureGameStats(allPlayer, game)
+    local monthGame = ensureGameStats(monthPlayer, game)
+
+    allPlayer.profit = allPlayer.profit + profit
+    allPlayer.payout = allPlayer.payout + payout
+    allPlayer.wager = allPlayer.wager + wager
+    allPlayer.wins = allPlayer.wins + 1
+
+    monthPlayer.profit = monthPlayer.profit + profit
+    monthPlayer.payout = monthPlayer.payout + payout
+    monthPlayer.wager = monthPlayer.wager + wager
+    monthPlayer.wins = monthPlayer.wins + 1
+
+    allGame.profit = allGame.profit + profit
+    allGame.payout = allGame.payout + payout
+    allGame.wager = allGame.wager + wager
+    allGame.wins = allGame.wins + 1
+
+    monthGame.profit = monthGame.profit + profit
+    monthGame.payout = monthGame.payout + payout
+    monthGame.wager = monthGame.wager + wager
+    monthGame.wins = monthGame.wins + 1
+
+    saveWinStats(data)
+
+    local time = textutils.formatTime(os.time(), true)
+    local logLine = "[" .. time .. "] "
+        .. player
+        .. " | " .. game
+        .. " | wager $" .. wager
+        .. " | payout $" .. payout
+        .. " | leaderboard +" .. profit
+
+    if detail then
+        logLine = logLine .. " | " .. tostring(detail)
+    end
+
+    appendWinStatsLog(logLine)
+
+    print("Recorded gambling win stat:")
+    print(" Player:", player)
+    print(" Game:", game)
+    print(" Wager:", wager)
+    print(" Payout:", payout)
+    print(" Profit:", profit)
+
+    return true
+end
+
+local function getSortedWinLeaderboard(monthKey)
+    local data = loadWinStats()
+    local source
+
+    if monthKey and data.months and data.months[monthKey] then
+        source = data.months[monthKey]
+    else
+        source = data.allTime or {}
+    end
+
+    local list = {}
+
+    for player, stats in pairs(source) do
+        table.insert(list, {
+            player = player,
+            profit = tonumber(stats.profit) or 0,
+            payout = tonumber(stats.payout) or 0,
+            wager = tonumber(stats.wager) or 0,
+            wins = tonumber(stats.wins) or 0
+        })
+    end
+
+    table.sort(list, function(a, b)
+        return a.profit > b.profit
+    end)
+
+    return list
+end
+
+local function printTopGambleStats(limit, monthKey)
+    limit = limit or 10
+    local list = getSortedWinLeaderboard(monthKey)
+
+    print("=== Gambling Win Leaderboard ===")
+
+    if monthKey then
+        print("Month:", monthKey)
+    else
+        print("All Time")
+    end
+
+    for i = 1, math.min(limit, #list) do
+        local row = list[i]
+        print(i .. ". " .. row.player
+            .. " +" .. row.profit
+            .. " | payout $" .. row.payout
+            .. " | wager $" .. row.wager
+            .. " | wins " .. row.wins)
+    end
+
+    if #list == 0 then
+        print("No gambling win stats yet.")
+    end
+end
+
+-- =========================================================
+-- === Chat Sanitization / Public Casino Stats
+-- =========================================================
+
+local function cleanPlayerName(name)
+    name = tostring(name or "")
+    name = name:gsub("§.", "")
+    name = name:gsub("[^%w_]", "")
+    return name
+end
+
+local function cleanChatText(text)
+    text = tostring(text or "")
+    text = text:gsub("§.", "")
+    text = text:gsub("[\r\n\t]", " ")
+    text = text:gsub("[^%w%s%p]", "")
+    return text
+end
+
+local function normalizeChatMessage(msg)
+    msg = tostring(msg or "")
+    msg = msg:gsub("§.", "")
+    return msg:lower():gsub("^%s+", ""):gsub("%s+$", "")
+end
+
+local casinoStatsSayPublic
+
+-- =========================================================
+-- === Admin Chat Balance Adjustment
+-- =========================================================
+
+local function listAccountNames()
+    local names = {}
+
+    if not fs.exists("/accounts") then
+        return names
+    end
+
+    for _, file in ipairs(fs.list("/accounts")) do
+        if type(file) == "string" and file:match("%.txt$") then
+            local name = file:gsub("%.txt$", "")
+
+            if name ~= "logs" then
+                table.insert(names, name)
+            end
+        end
+    end
+
+    table.sort(names)
+    return names
+end
+
+local function findMatchingAccount(partial)
+    partial = cleanPlayerName(partial):lower()
+
+    if partial == "" then
+        return nil, "No player name entered."
+    end
+
+    local accounts = listAccountNames()
+    local exactMatches = {}
+    local prefixMatches = {}
+    local containsMatches = {}
+
+    for _, account in ipairs(accounts) do
+        local lower = account:lower()
+
+        if lower == partial then
+            table.insert(exactMatches, account)
+        elseif lower:sub(1, #partial) == partial then
+            table.insert(prefixMatches, account)
+        elseif lower:find(partial, 1, true) then
+            table.insert(containsMatches, account)
+        end
+    end
+
+    if #exactMatches == 1 then
+        return exactMatches[1]
+    elseif #prefixMatches == 1 then
+        return prefixMatches[1]
+    elseif #containsMatches == 1 then
+        return containsMatches[1]
+    end
+
+    local combined = {}
+
+    for _, v in ipairs(exactMatches) do table.insert(combined, v) end
+    for _, v in ipairs(prefixMatches) do table.insert(combined, v) end
+    for _, v in ipairs(containsMatches) do table.insert(combined, v) end
+
+    if #combined == 0 then
+        return nil, "No account matched: " .. partial
+    end
+
+    local preview = {}
+    for i = 1, math.min(5, #combined) do
+        table.insert(preview, combined[i])
+    end
+
+    return nil, "Ambiguous name: " .. table.concat(preview, ", ")
+end
+
+local function parseAdminAdjustCommand(message)
+    message = cleanChatText(message)
+
+    -- Quoted name:
+    -- + "rado" 5000
+    local sign, quotedName, amount = message:match("^%s*([+%-])%s*\"([^\"]+)\"%s*(%d+)%s*$")
+
+    if sign and quotedName and amount then
+        amount = tonumber(amount)
+
+        if sign == "-" then
+            amount = -amount
+        end
+
+        return quotedName, amount
+    end
+
+    -- Unquoted name:
+    -- + rado 5000
+    local sign2, name2, amount2 = message:match("^%s*([+%-])%s*(%S+)%s*(%d+)%s*$")
+
+    if sign2 and name2 and amount2 then
+        amount2 = tonumber(amount2)
+
+        if sign2 == "-" then
+            amount2 = -amount2
+        end
+
+        return name2, amount2
+    end
+
+    return nil, nil, "Bad format. Use: + \"name\" 5000 or - \"name\" 5000"
+end
+
+local function handleAdminAdjustCommand(rawPlayer, message)
+    local admin = cleanPlayerName(rawPlayer)
+
+    if not ADMIN_PLAYERS[admin] then
+        print("Rejected balance adjustment from non-admin:", tostring(rawPlayer))
+        print("Message:", tostring(message))
+        return
+    end
+
+    local partialName, delta, parseErr = parseAdminAdjustCommand(message)
+
+    if not partialName then
+        casinoStatsSayPublic("Account edit failed: " .. tostring(parseErr))
+        return
+    end
+
+    local target, findErr = findMatchingAccount(partialName)
+
+    if not target then
+        casinoStatsSayPublic("Account edit failed: " .. tostring(findErr))
+        return
+    end
+
+    delta = tonumber(delta) or 0
+
+    if delta == 0 then
+        casinoStatsSayPublic("Account edit failed: amount was 0.")
+        return
+    end
+
+    local oldBalance = getBalance(target)
+    local newBalance = math.max(0, oldBalance + delta)
+    local actualDelta = newBalance - oldBalance
+
+    setBalance(target, newBalance)
+
+    logTransaction(
+        target,
+        "ADMIN CHAT ADJUST by " .. admin,
+        actualDelta
+    )
+
+    local deltaText = (actualDelta >= 0 and "+" or "") .. tostring(actualDelta)
+
+    casinoStatsSayPublic("Account updated: " .. target .. " " .. deltaText .. " -> $" .. newBalance)
+
+    print("Admin balance adjustment complete.")
+    print("Admin:", admin)
+    print("Target:", target)
+    print("Old:", oldBalance)
+    print("Delta:", actualDelta)
+    print("New:", newBalance)
+end
+
+local function isHiddenFromCasinoStats(player)
+    local clean = cleanPlayerName(player)
+
+    if HIDE_FROM_CASINO_STATS_CHAT[clean] then
+        return true
+    end
+
+    for name, hidden in pairs(HIDE_FROM_CASINO_STATS_CHAT) do
+        if hidden and cleanPlayerName(name):lower() == clean:lower() then
+            return true
+        end
+    end
+
+    return false
+end
+
+function casinoStatsSayPublic(text)
+    text = cleanChatText(text)
+
+    if #text > 230 then
+        text = text:sub(1, 230)
+    end
+
+    if chat and chat.say then
+        local ok, err = pcall(function()
+            chat.say(text)
+        end)
+
+        if not ok then
+            print("chat.say failed:")
+            print(err)
+            print("Message was:", text)
+        end
+    else
+        print("CHAT OUT:", text)
+    end
+
+    sleep(0.25)
+end
+
+local function shortMoney(n)
+    n = tonumber(n) or 0
+    local sign = ""
+
+    if n < 0 then
+        sign = "-"
+        n = math.abs(n)
+    end
+
+    if n >= 1000000 then
+        local v = math.floor((n / 1000000) * 10 + 0.5) / 10
+        return sign .. "$" .. tostring(v) .. "M"
+    elseif n >= 1000 then
+        local v = math.floor((n / 1000) * 10 + 0.5) / 10
+        return sign .. "$" .. tostring(v) .. "k"
+    else
+        return sign .. "$" .. tostring(math.floor(n))
+    end
+end
+
+local function announceCasinoStatsPublic(requester)
+    local leaders = getSortedWinLeaderboard(nil)
+
+    if not leaders or #leaders == 0 then
+        casinoStatsSayPublic("Casino Stats: no winners logged yet.")
+        return
+    end
+
+    local parts = {}
+    local shown = 0
+
+    for i = 1, #leaders do
+        local row = leaders[i]
+        local player = cleanChatText(row.player or "unknown")
+        local profit = tonumber(row.profit) or 0
+
+        if not isHiddenFromCasinoStats(player) then
+            shown = shown + 1
+            table.insert(parts, "#" .. shown .. " " .. player .. " +" .. shortMoney(profit))
+
+            if shown >= CHAT_TOP_COUNT then
+                break
+            end
+        end
+    end
+
+    if shown == 0 then
+        casinoStatsSayPublic("Casino Stats: no visible winners yet.")
+    else
+        casinoStatsSayPublic("Casino Top " .. shown .. ": " .. table.concat(parts, " | "))
+    end
+end
+
+local function chatCommandLoop()
+    if not chat then
+        print(CHAT_MANIPULATOR_NAME .. " chat peripheral missing. Chat command loop disabled.")
+        while true do sleep(10) end
+    end
+
+    if not chat.say then
+        print(CHAT_MANIPULATOR_NAME .. " found, but no say() method. Chat command loop disabled.")
+        while true do sleep(10) end
+    end
+
+    if chat.capture then
+        pcall(function()
+            chat.capture(CHAT_CAPTURE_PATTERN)
+        end)
+
+        pcall(function()
+            chat.capture(ADMIN_ADJUST_CAPTURE_PATTERN)
+        end)
+    end
+
+    print("Casino chat command ready: " .. CHAT_COMMAND)
+    print("Using public chat.say() output.")
+    print("Listening for both chat_capture and chat_message.")
+    print("Hidden casino stats players:")
+    for name, hidden in pairs(HIDE_FROM_CASINO_STATS_CHAT) do
+        if hidden then print("  " .. tostring(name)) end
+    end
+
+    while true do
+        local event = {os.pullEvent()}
+        local eventName = event[1]
+
+        local message = nil
+        local player = nil
+        local pattern = nil
+        local matched = false
+
+        if eventName == "chat_capture" then
+            -- Plethora capture format:
+            -- local _, message, pattern, player, uuid = os.pullEvent("chat_capture")
+            message = event[2]
+            pattern = event[3]
+            player = event[4]
+
+            if pattern == ADMIN_ADJUST_CAPTURE_PATTERN then
+                print("Admin adjust command captured.")
+                print("Message:", tostring(message))
+                print("Player:", tostring(player))
+                handleAdminAdjustCommand(player, message)
+
+            elseif pattern == CHAT_CAPTURE_PATTERN and normalizeChatMessage(message) == CHAT_COMMAND then
+                matched = true
+            end
+
+        elseif eventName == "chat_message" then
+            -- Common format:
+            -- local _, player, message, uuid = os.pullEvent("chat_message")
+            player = event[2]
+            message = event[3]
+
+            if normalizeChatMessage(message) == CHAT_COMMAND then
+                matched = true
+            end
+        end
+
+        if matched then
+            local requester = cleanPlayerName(player)
+            local now = os.clock()
+
+            print("Casino stats command detected.")
+            print("Event:", tostring(eventName))
+            print("Message:", tostring(message))
+            print("Pattern:", tostring(pattern))
+            print("Raw player:", tostring(player))
+            print("Safe player:", tostring(requester))
+
+            if now - lastChatCommandAt >= CHAT_COOLDOWN_SECONDS then
+                lastChatCommandAt = now
+                announceCasinoStatsPublic(requester)
+            else
+                print("Casino stats command ignored: cooldown")
+            end
+        end
+    end
+end
+
+-- =========================================================
+-- === Incoming Stat Handlers
+-- =========================================================
+
+local function handleDirectGambleWinStat(msg)
+    if type(msg) ~= "table" then return end
+    if msg.action ~= "gamble_win_stat" then return end
+
+    local player = msg.player
+    local game = msg.game or "unknown"
+    local wager = tonumber(msg.wager) or 0
+    local payout = tonumber(msg.payout) or 0
+
+    addGamblingWinStat(
+        player,
+        game,
+        wager,
+        payout,
+        "direct stat"
+    )
+end
+
+local function getRouletteRoundKey(player, result)
+    return tostring(player) .. "|" .. tostring(result)
+end
+
+local function cleanupOldPendingRouletteRounds()
+    local now = os.clock()
+
+    for key, round in pairs(pendingRouletteRounds) do
+        if round.lastUpdate and now - round.lastUpdate > 45 then
+            pendingRouletteRounds[key] = nil
+        end
+    end
+end
+
+local function trackRouletteOutcomeNote(player, note)
+    if not player or type(note) ~= "string" then return end
+
+    local winBet, winZone, winResult, winPayout = note:match(
+        "ROULETTE RESULT:%s*WIN%s*%-%s*bet%s*%$(%d+)%s*on%s*(.-),%s*landed%s*(.-),%s*payout%s*%$(%d+)"
+    )
+
+    if winBet and winResult and winPayout then
+        winBet = tonumber(winBet) or 0
+        winPayout = tonumber(winPayout) or 0
+
+        local key = getRouletteRoundKey(player, winResult)
+
+        pendingRouletteRounds[key] = pendingRouletteRounds[key] or {
+            player = player,
+            result = winResult,
+            wager = 0,
+            payout = 0,
+            lastUpdate = os.clock()
+        }
+
+        pendingRouletteRounds[key].wager = pendingRouletteRounds[key].wager + winBet
+        pendingRouletteRounds[key].payout = pendingRouletteRounds[key].payout + winPayout
+        pendingRouletteRounds[key].lastUpdate = os.clock()
+
+        print("Tracked roulette WIN outcome note:")
+        print(" Player:", player)
+        print(" Bet:", winBet)
+        print(" Payout:", winPayout)
+        print(" Result:", winResult)
+        return
+    end
+
+    local lossBet, lossZone, lossResult = note:match(
+        "ROULETTE RESULT:%s*LOSS%s*%-%s*bet%s*%$(%d+)%s*on%s*(.-),%s*landed%s*(.-)$"
+    )
+
+    if lossBet and lossResult then
+        lossBet = tonumber(lossBet) or 0
+
+        local key = getRouletteRoundKey(player, lossResult)
+
+        pendingRouletteRounds[key] = pendingRouletteRounds[key] or {
+            player = player,
+            result = lossResult,
+            wager = 0,
+            payout = 0,
+            lastUpdate = os.clock()
+        }
+
+        pendingRouletteRounds[key].wager = pendingRouletteRounds[key].wager + lossBet
+        pendingRouletteRounds[key].lastUpdate = os.clock()
+
+        print("Tracked roulette LOSS outcome note:")
+        print(" Player:", player)
+        print(" Bet:", lossBet)
+        print(" Result:", lossResult)
+        return
+    end
+end
+
+local function finalizeRoulettePayoutNote(player, note)
+    if not player or type(note) ~= "string" then return end
+
+    local payout, result = note:match(
+        "ROULETTE WIN PAYOUT:%s*%$(%d+),%s*landed%s*(.-)$"
+    )
+
+    if not payout or not result then
+        return
+    end
+
+    payout = tonumber(payout) or 0
+
+    local key = getRouletteRoundKey(player, result)
+    local round = pendingRouletteRounds[key]
+
+    if not round then
+        print("Roulette payout note received but no pending round found.")
+        print(" Player:", player)
+        print(" Result:", result)
+        print(" Payout:", payout)
+        return
+    end
+
+    local totalWager = tonumber(round.wager) or 0
+    local totalPayout = payout
+
+    addGamblingWinStat(
+        player,
+        "roulette",
+        totalWager,
+        totalPayout,
+        "landed " .. tostring(result)
+    )
+
+    pendingRouletteRounds[key] = nil
+end
+
+local function handleCasinoTransferForStats(player, note)
+    if not player or type(note) ~= "string" then return end
+
+    trackRouletteOutcomeNote(player, note)
+    finalizeRoulettePayoutNote(player, note)
+    cleanupOldPendingRouletteRounds()
+end
+
+-- =========================================================
+-- === Deposit / Payout Logic
+-- =========================================================
+
+local function processDeposit(player)
+    local total = 0
+
+    for slot, item in pairs(shulkerBox.list()) do
+        if item.nbtHash then
+            local prefix = string.sub(item.nbtHash, 1, 6)
+            local value = VALID_ITEMS[prefix]
+
+            if value then
+                local moved = shulkerBox.pushItems(obCN, slot, item.count)
+                total = total + (moved * value)
+            end
+        end
+    end
+
+    if total > 0 then
+        local newBal = getBalance(player) + total
+        setBalance(player, newBal)
+        logTransaction(player, "DEPOSIT: Book tokens deposited", total)
+        return newBal, "Deposited!"
+    end
+
+    return getBalance(player), "No valid tokens."
+end
+
+local function processPayout(player)
+    local value = PAYOUT_OPTIONS[selectedValueIndex]
+    local qtyToMove = selectedQty
+    local total = value * qtyToMove
+    local bal = getBalance(player)
+
+    if bal < total then
+        message = "Insufficient balance."
+        return bal
+    end
+
+    local prefix = nil
+
+    for k, v in pairs(VALID_ITEMS) do
+        if v == value then
+            prefix = k
+            break
+        end
+    end
+
+    if not prefix then
+        message = "Token type error."
+        return bal
+    end
+
+    local chest = peripheral.wrap(obCN)
+    local movedTotal = 0
+
+    for slot, item in pairs(chest.list()) do
+        if item.nbtHash and string.sub(item.nbtHash, 1, 6) == prefix then
+            while movedTotal < qtyToMove and item.count > 0 do
+                local moved = chest.pushItems(dropper, slot, 1)
+
+                if moved > 0 then
+                    movedTotal = movedTotal + 1
+                    sleep(0.05)
+                else
+                    break
+                end
+            end
+        end
+
+        if movedTotal >= qtyToMove then break end
+    end
+
+    if movedTotal < qtyToMove then
+        message = "Only moved " .. movedTotal .. "/" .. qtyToMove
+        return bal
+    end
+
+    setBalance(player, bal - total)
+    logTransaction(player, "PAYOUT: " .. qtyToMove .. " x $" .. value, -total)
+    message = "Dispensed " .. qtyToMove .. " x $" .. value
+    return getBalance(player)
+end
+
+-- =========================================================
+-- === Radar Loop
+-- =========================================================
+
+local activePlayer, balance, distance, message = nil, 0, nil, ""
+local smalrad, largerad = 1.75, 4
+
+local function radarLoop()
+    while true do
+        local players = radar.getPlayers()
+        local valP, cP = {}, nil
+
+        for _, p in ipairs(players) do
+            if p.distance <= largerad then
+                table.insert(valP, p)
+
+                if p.distance <= smalrad then
+                    if not cP or p.distance < cP.distance then
+                        cP = p
+                    end
+                end 
+            end
+        end
+
+        if not rip then
+            print("no rip")
+
+        elseif #valP == 1 and cP then
+            activePlayer = cP.name
+            distance = cP.distance
+            balance = getBalance(activePlayer)
+            rip.setOutput("bottom", true)
+            message = ""
+
+        elseif #valP == 1 and not cP then
+            activePlayer, distance = nil, nil
+            rip.setOutput("bottom", false)
+            message = "Not Close Enough!"
+
+        elseif #valP > 1 then
+            activePlayer, distance = nil, nil
+            rip.setOutput("bottom", false)
+            message = "Too Many Players!"
+
+        else
+            activePlayer, distance = nil, nil
+            rip.setOutput("bottom", false)
+            message = ""
+        end
+
+        sleep(0.05)
+    end
+end
+
+-- =========================================================
+-- === Background / Display / Touch
+-- =========================================================
+
+local function drawBlitBackground()
+    if not fs.exists("account_bg.nfv") then return end
+
+    local file = fs.open("account_bg.nfv", "r")
+    local w, h = file.readLine():match("(%d+)%s+(%d+)")
+
+    for y = 1, tonumber(h) do
+        local line = file.readLine()
+
+        if line then
+            local text, fg, bg = line:match("^(.-)|(.-)|(.+)$")
+            monitor.setCursorPos(1, y)
+            monitor.blit(text, fg, bg)
+        end
+    end
+
+    file.close()
+end
+
+local function displayLoop()
+    monitor.setTextScale(1)
+
+    while true do
+        monitor.clear()
+        drawBlitBackground()
+
+        if activePlayer and not payoutMode then
+            monitor.setCursorPos(15, 24)
+            monitor.setBackgroundColor(colors.yellow)
+            monitor.setTextColor(colors.purple)
+            monitor.write("Instructions: With Empty Hand, Open Shulker Box and Put Credits In")
+
+            monitor.setCursorPos(15, 25)
+            monitor.write("Then, aiming carefully, right click 'deposit' to transfer")
+
+            monitor.setCursorPos(15, 26)
+            monitor.write("Use 'Pull Out Books' to convert Balance back to books")
+
+            monitor.setCursorPos(30, 34)
+            monitor.setBackgroundColor(colors.orange)
+            monitor.setTextColor(colors.black)
+            monitor.write("Welcome, " .. activePlayer)
+
+            monitor.setCursorPos(30, 35)
+            monitor.write("Balance: $" .. balance)
+
+            monitor.setBackgroundColor(colors.green)
+            monitor.setCursorPos(30, 37)
+            monitor.write("[ Deposit Books ]")
+
+            if message then
+                monitor.setCursorPos(30, 38)
+                monitor.write(message)
+            end
+
+            monitor.setCursorPos(30, 30)
+            monitor.setBackgroundColor(colors.lime)
+            monitor.setTextColor(colors.black)
+            monitor.write("[ Pull Out Books ]")
+
+        elseif activePlayer and payoutMode then
+            drawBlitBackground()
+
+            monitor.setCursorPos(30, 30)
+            monitor.setBackgroundColor(colors.black)
+            monitor.setTextColor(colors.white)
+            monitor.write("Select Book Value and Quantity with + and -")
+
+            monitor.setCursorPos(30, 28)
+            monitor.write("Balance $" .. balance)
+
+            monitor.setCursorPos(20, 32)
+            monitor.setBackgroundColor(colors.gray)
+            monitor.setTextColor(colors.white)
+            monitor.write("[-]")
+
+            monitor.setCursorPos(25, 32)
+            monitor.setBackgroundColor(colors.black)
+            monitor.write("Book: $" .. PAYOUT_OPTIONS[selectedValueIndex])
+
+            monitor.setCursorPos(42, 32)
+            monitor.setBackgroundColor(colors.gray)
+            monitor.write("[+]")
+
+            monitor.setCursorPos(48, 32)
+            monitor.setBackgroundColor(colors.gray)
+            monitor.write("[-]")
+
+            monitor.setCursorPos(53, 32)
+            monitor.setBackgroundColor(colors.black)
+            monitor.write("Qty: " .. selectedQty)
+
+            monitor.setCursorPos(62, 32)
+            monitor.setBackgroundColor(colors.gray)
+            monitor.write("[+]")
+
+            monitor.setCursorPos(35, 35)
+            monitor.setBackgroundColor(colors.lime)
+            monitor.setTextColor(colors.black)
+            monitor.write("[ Payout ]")
+
+            monitor.setCursorPos(35, 37)
+            monitor.setBackgroundColor(colors.red)
+            monitor.setTextColor(colors.white)
+            monitor.write("[ Back ]")
+
+            if message then
+                monitor.setCursorPos(25, 39)
+                monitor.setBackgroundColor(colors.black)
+                monitor.setTextColor(colors.yellow)
+                monitor.write(message)
+            end
+
+        else
+            monitor.setCursorPos(30, 35)
+            monitor.write("Stand on the block...")
+
+            monitor.setCursorPos(30, 36)
+            monitor.write("Only 1 Player Inside Marked Area!")
+        end
+
+        sleep(0.1)
+    end
+end
+
+local function touchLoop()
+    while true do
+        local _, _, x, y = os.pullEvent("monitor_touch")
+
+        if activePlayer then
+            if payoutMode then
+                if y == 32 and x >= 20 and x <= 22 then
+                    selectedValueIndex = math.max(1, selectedValueIndex - 1)
+
+                elseif y == 32 and x >= 42 and x <= 44 then
+                    selectedValueIndex = math.min(#PAYOUT_OPTIONS, selectedValueIndex + 1)
+
+                elseif y == 32 and x >= 48 and x <= 50 then
+                    selectedQty = math.max(1, selectedQty - 1)
+
+                elseif y == 32 and x >= 62 and x <= 64 then
+                    selectedQty = math.min(16, selectedQty + 1)
+
+                elseif y == 35 and x >= 35 and x <= 50 then
+                    balance = processPayout(activePlayer)
+
+                elseif y == 37 and x >= 35 and x <= 50 then
+                    payoutMode = false
+                    message = ""
+                end
+            else
+                if y == 30 and x >= 30 and x <= 40 then
+                    payoutMode = true
+
+                elseif y >= 36 and y <= 38 then
+                    balance, message = processDeposit(activePlayer)
+                end
+            end
+        end
+
+        sleep(0.1)
+    end
+end
+
+-- =========================================================
+-- === Rednet Listener
+-- =========================================================
+
+local function rednetListener()
+    print("Account Computer Rednet Listener starting...")
+    print("Local gambling win stats file:", WIN_STATS_FILE)
+    print("Roulette stat rule: total payout - total spin wager.")
+    print("Losses do not subtract from leaderboard.")
+    printTopGambleStats(5)
+
+    while true do 
+        local sender, msg, protocol = rednet.receive()
+
+        print("Rednet received from:", sender, "via protocol:", protocol)
+        print("Message:", textutils.serialize(msg))
+      
+        if protocol == "casino" and type(msg) == "table" then
+            if msg.action == "get_Players" then
+                print("Sending player list...")
+
+                local fileList = fs.list("/accounts")
+                local accountList = {}
+
+                for _, name in ipairs(fileList) do
+                    if type(name) == "string" and name:match("%.txt$") and not name:match("logs") then
+                        table.insert(accountList, name:gsub("%.txt$", ""))
+                    end
+                end
+
+                table.sort(accountList)
+                rednet.send(sender, {action = "players_list", players = accountList}, "casino")
+
+            elseif msg.action == "get_balance" then
+                rednet.send(sender, {player = msg.player, balance = getBalance(msg.player)}, "casino")
+
+            elseif msg.action == "transfer" then
+                local old = getBalance(msg.player)
+                local new = math.max(0, old + msg.delta)
+
+                setBalance(msg.player, new)
+                logTransaction(msg.player, msg.note or "Transfer", msg.delta)
+
+                handleCasinoTransferForStats(msg.player, msg.note)
+
+                rednet.send(sender, {player = msg.player, balance = new}, "casino")
+
+            elseif msg.action == "gamble_win_stat" then
+                handleDirectGambleWinStat(msg)
+
+            elseif msg.action == "list_accounts" then
+                local fileList = fs.list("/accounts")
+                local accountList = {}
+
+                for _, name in ipairs(fileList) do
+                    if type(name) == "string" and name:match("%.txt$") and not name:match("logs") then
+                        table.insert(accountList, name:gsub("%.txt$", ""))
+                    end
+                end
+
+                rednet.send(sender, {accounts = accountList}, "casino")
+
+            elseif msg.action == "get_gamble_leaderboard" then
+                local month = msg.month
+                local limit = tonumber(msg.limit) or 10
+                local list = getSortedWinLeaderboard(month)
+
+                local trimmed = {}
+
+                for i = 1, math.min(limit, #list) do
+                    table.insert(trimmed, list[i])
+                end
+
+                rednet.send(sender, {
+                    action = "gamble_leaderboard",
+                    month = month or "all_time",
+                    leaders = trimmed
+                }, "casino")
+            end
+        end
+    end
+end
+
+-- =========================================================
+-- === Main Execution
+-- =========================================================
+
+parallel.waitForAny(
+    radarLoop,
+    displayLoop,
+    touchLoop,
+    rednetListener,
+    chatCommandLoop
+)
