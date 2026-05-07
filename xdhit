@@ -1387,7 +1387,7 @@ local function drawBetTotals(mon, viewingStation)
     local viewingIndex = viewingStation and viewingStation.index or nil
     local stackOffsets = {0, 2, 3}
 
-    for zone, positions in pairs(monitores) do
+    for zone, positions in pairs(monitors) do
         if not zone:match("chip_") and zone ~= "clear" and zone ~= "spin" then
             local center = positions[1]
 
