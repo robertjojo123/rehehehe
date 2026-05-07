@@ -1,0 +1,889 @@
+-- blackjack_revamped_account.lua
+-- Revamped Blackjack table for CC:Tweaked / Plethora radar
+--
+-- Uses your existing NFV assets:
+--   BJOPEN.nfv, BJBETTING.nfv, BJPLAY.nfv
+--   card/text assets used by blitChar(): green_*, red_*, purple_*, suit files, result files
+--
+-- Account integration:
+--   Talks to account computer over rednet protocol "casino"
+--   get_balance / transfer actions are compatible with the newer account code
+--
+-- Gameplay:
+--   Hit, Stand, Double, Split
+--   Split creates two independent hands with independent bets
+--   Double works on any unplayed 2-card hand if funds allow
+--   Dealer hits soft 17
+--   Blackjack pays 3:2 on original non-split hand only
+
+-- =========================================================
+-- === CONFIG
+-- =========================================================
+
+local ACCOUNT_COMPUTER_ID = 8166
+local ACCOUNT_PROTOCOL = "casino"
+
+local MONITOR = "monitor_632"
+local RADAR = "radar_16"
+local MODEM_SIDE = "left"
+
+local MIN_PLAYER_DISTANCE = 1.0
+local MAX_PLAYER_DISTANCE = 1.65
+
+local CHIP_VALUES = {500, 2500, 25000}
+local DEFAULT_CHIP = 500
+local MAX_BET = 25000
+
+local DEALER_HITS_SOFT_17 = true
+local BLACKJACK_PAYS_NUM = 5   -- 5/2 = 2.5 return, net +1.5x after original wager removed
+local BLACKJACK_PAYS_DEN = 2
+
+local RESULT_HOLD_SECONDS = 4
+local ACCOUNT_TIMEOUT = 2
+
+-- Touch boxes from your original UI
+local TOUCH = {
+    welcomeStart = {x1 = 15, x2 = 43, y1 = 20, y2 = 35},
+
+    chip500 = {x1 = 14, x2 = 23, y1 = 24, y2 = 30},
+    chip2500 = {x1 = 27, x2 = 42, y1 = 24, y2 = 30},
+    chip25000 = {x1 = 46, x2 = 65, y1 = 24, y2 = 30},
+
+    betMinus = {x1 = 14, x2 = 17, y1 = 33, y2 = 37},
+    betPlus = {x1 = 23, x2 = 26, y1 = 33, y2 = 37},
+    deal = {x1 = 52, x2 = 64, y1 = 30, y2 = 38},
+
+    hit = {x1 = 12, x2 = 24, y1 = 25, y2 = 29},
+    double = {x1 = 12, x2 = 24, y1 = 30, y2 = 34},
+    stand = {x1 = 52, x2 = 64, y1 = 25, y2 = 29},
+    split = {x1 = 52, x2 = 64, y1 = 30, y2 = 34},
+
+    leftHand = {x1 = 12, x2 = 16, y1 = 15, y2 = 20},
+    rightHand = {x1 = 60, x2 = 66, y1 = 15, y2 = 20},
+}
+
+-- =========================================================
+-- === SETUP
+-- =========================================================
+
+local monitor = peripheral.wrap(MONITOR)
+local radar = peripheral.wrap(RADAR)
+local modem = peripheral.wrap(MODEM_SIDE)
+
+if not monitor then error("Missing monitor: " .. MONITOR) end
+if not radar then error("Missing radar: " .. RADAR) end
+if not modem then error("Missing modem on " .. MODEM_SIDE) end
+
+rednet.open(MODEM_SIDE)
+monitor.setTextScale(0.5)
+
+math.randomseed((os.epoch and os.epoch("utc") or os.time()) + (os.getComputerID() or 0))
+for i = 1, 20 do math.random() end
+
+-- =========================================================
+-- === STATE
+-- =========================================================
+
+local state = "welcome"
+local player = nil
+local lastDetectedPlayer = nil
+local balance = 0
+local statusMessage = ""
+
+local betChip = DEFAULT_CHIP
+local betCount = 1
+
+local deck = {}
+local dealer = {}
+local hands = {}
+local currentHandIndex = 1
+local revealDealer = false
+
+local resultLines = {}
+local totalNetChange = 0
+local totalWagerThisRound = 0
+local totalReturnThisRound = 0
+
+-- =========================================================
+-- === UTILS / DRAWING
+-- =========================================================
+
+local function inside(x, y, box)
+    return x >= box.x1 and x <= box.x2 and y >= box.y1 and y <= box.y2
+end
+
+local function safeNumber(n)
+    return tonumber(n) or 0
+end
+
+local function clampBetCount()
+    if betCount < 1 then betCount = 1 end
+    while betChip * betCount > MAX_BET do
+        betCount = betCount - 1
+    end
+    if betCount < 1 then betCount = 1 end
+end
+
+local function drawNFV(path)
+    if not fs.exists(path) then
+        monitor.setBackgroundColor(colors.black)
+        monitor.clear()
+        monitor.setCursorPos(2, 2)
+        monitor.setTextColor(colors.red)
+        monitor.write("Missing " .. path)
+        return
+    end
+
+    local f = fs.open(path, "r")
+    local size = f.readLine()
+    local w, h = size:match("(%d+)%s+(%d+)")
+    h = tonumber(h) or 0
+
+    for y = 1, h do
+        local line = f.readLine() or ""
+        for x = 1, #line do
+            local color = line:sub(x, x)
+            local n = tonumber(color, 16)
+            if n then
+                monitor.setCursorPos(x + 10, y)
+                monitor.setBackgroundColor(2 ^ n)
+                monitor.write(" ")
+            end
+        end
+    end
+
+    f.close()
+end
+
+local function blitChar(x, y, name)
+    local path = name .. ".nfv"
+    if not fs.exists(path) then return 0 end
+
+    local f = fs.open(path, "r")
+    local size = f.readLine()
+    local w, h = size:match("(%d+)%s+(%d+)")
+    w, h = tonumber(w) or 0, tonumber(h) or 0
+
+    for dy = 1, h do
+        local line = f.readLine() or ""
+        monitor.setCursorPos(x, y + dy - 1)
+        monitor.blit(line, line, line)
+    end
+
+    f.close()
+    return w + 1
+end
+
+local function drawNameString(x, y, str)
+    str = tostring(str or "")
+    for i = 1, #str do
+        local ch = str:sub(i, i):lower()
+        if ch:match("[%w_]") then
+            x = x + blitChar(x, y, "green_" .. ch)
+        else
+            x = x + 2
+        end
+    end
+end
+
+local function drawNumberString(x, y, str, color)
+    str = tostring(str or "")
+    for i = 1, #str do
+        local ch = str:sub(i, i)
+        local asset = nil
+
+        if ch == "+" then asset = (color or "") .. "plus"
+        elseif ch == "-" then asset = (color or "") .. "minus"
+        elseif ch == "$" then asset = (color or "") .. "dollar"
+        else asset = (color or "") .. ch end
+
+        local moved = blitChar(x, y, asset)
+        if moved <= 0 then
+            monitor.setCursorPos(x, y)
+            monitor.setTextColor(colors.white)
+            monitor.setBackgroundColor(colors.black)
+            monitor.write(ch)
+            moved = 2
+        end
+        x = x + moved
+    end
+end
+
+local function writeText(x, y, text, fg, bg)
+    monitor.setCursorPos(x, y)
+    monitor.setTextColor(fg or colors.white)
+    monitor.setBackgroundColor(bg or colors.black)
+    monitor.write(tostring(text or ""))
+end
+
+-- =========================================================
+-- === ACCOUNT COMMUNICATION
+-- =========================================================
+
+local function accountRequest(payload)
+    rednet.send(ACCOUNT_COMPUTER_ID, payload, ACCOUNT_PROTOCOL)
+    local id, msg = rednet.receive(ACCOUNT_PROTOCOL, ACCOUNT_TIMEOUT)
+    if id == ACCOUNT_COMPUTER_ID and type(msg) == "table" then
+        return msg
+    end
+    return nil
+end
+
+local function getBalance(name)
+    if not name then return 0 end
+
+    local msg = accountRequest({
+        action = "get_balance",
+        player = name
+    })
+
+    if msg and msg.player == name then
+        return safeNumber(msg.balance)
+    end
+
+    return balance or 0
+end
+
+local function transferBalance(name, delta, note)
+    if not name or delta == 0 then return balance or 0 end
+
+    local msg = accountRequest({
+        action = "transfer",
+        player = name,
+        delta = delta,
+        note = note or "BLACKJACK TRANSFER"
+    })
+
+    if msg and msg.player == name then
+        balance = safeNumber(msg.balance)
+        return balance
+    end
+
+    -- Fallback display only if account response times out.
+    balance = math.max(0, (balance or 0) + delta)
+    return balance
+end
+
+local function sendBlackjackWinStat()
+    local profit = totalReturnThisRound - totalWagerThisRound
+    if profit <= 0 then return end
+
+    rednet.send(ACCOUNT_COMPUTER_ID, {
+        action = "gamble_win_stat",
+        player = player,
+        game = "blackjack",
+        wager = totalWagerThisRound,
+        payout = totalReturnThisRound
+    }, ACCOUNT_PROTOCOL)
+end
+
+-- =========================================================
+-- === CARDS
+-- =========================================================
+
+local function cardBaseValue(face)
+    if face == "A" then return 11 end
+    if face == "K" or face == "Q" or face == "J" or face == "T" then return 10 end
+    return tonumber(face) or 0
+end
+
+local function shuffleDeck()
+    local suits = {"H", "D", "S", "C"}
+    local faces = {"A", "2", "3", "4", "5", "6", "7", "8", "9", "T", "J", "Q", "K"}
+    local newDeck = {}
+
+    for _ = 1, 4 do -- four deck shoe; smoother blackjack than 2 decks
+        for _, suit in ipairs(suits) do
+            for _, face in ipairs(faces) do
+                table.insert(newDeck, {
+                    face = face,
+                    value = cardBaseValue(face),
+                    suit = suit
+                })
+            end
+        end
+    end
+
+    for i = #newDeck, 2, -1 do
+        local j = math.random(i)
+        newDeck[i], newDeck[j] = newDeck[j], newDeck[i]
+    end
+
+    return newDeck
+end
+
+local function drawCard()
+    if #deck < 20 then
+        deck = shuffleDeck()
+    end
+    return table.remove(deck)
+end
+
+local function handValue(hand)
+    local total, aces = 0, 0
+
+    for _, card in ipairs(hand.cards) do
+        total = total + card.value
+        if card.face == "A" then aces = aces + 1 end
+    end
+
+    while total > 21 and aces > 0 do
+        total = total - 10
+        aces = aces - 1
+    end
+
+    return total
+end
+
+local function hasSoft17(hand)
+    local total, aces = 0, 0
+
+    for _, card in ipairs(hand.cards) do
+        if card.face == "A" then
+            aces = aces + 1
+            total = total + 11
+        else
+            total = total + card.value
+        end
+    end
+
+    while total > 21 and aces > 0 do
+        total = total - 10
+        aces = aces - 1
+    end
+
+    return total == 17 and aces > 0
+end
+
+local function isBlackjack(hand)
+    return #hand.cards == 2 and handValue(hand) == 21 and not hand.fromSplit
+end
+
+local function canSplitHand(hand)
+    if not hand or hand.fromSplit then return false end
+    if #hand.cards ~= 2 then return false end
+    return cardBaseValue(hand.cards[1].face) == cardBaseValue(hand.cards[2].face)
+end
+
+local function dealerShouldHit()
+    local dealerHand = {cards = dealer}
+    local v = handValue(dealerHand)
+    if v < 17 then return true end
+    if DEALER_HITS_SOFT_17 and v == 17 and hasSoft17(dealerHand) then return true end
+    return false
+end
+
+local function drawHand(x, y, handOrCards)
+    local cardList = handOrCards.cards or handOrCards
+    for i, card in ipairs(cardList) do
+        local cx = x + (i - 1) * 4
+        drawNumberString(cx, y, card.face:lower(), "purple_")
+        if i == #cardList then
+            blitChar(cx + 4, y, card.suit:lower())
+        end
+    end
+end
+
+-- =========================================================
+-- === ROUND HELPERS
+-- =========================================================
+
+local function currentHand()
+    return hands[currentHandIndex]
+end
+
+local function currentBetTotal()
+    return betChip * betCount
+end
+
+local function resetRound(keepPlayer)
+    deck = {}
+    dealer = {}
+    hands = {}
+    currentHandIndex = 1
+    revealDealer = false
+    resultLines = {}
+    totalNetChange = 0
+    totalWagerThisRound = 0
+    totalReturnThisRound = 0
+    statusMessage = ""
+
+    if keepPlayer and player then
+        balance = getBalance(player)
+    end
+end
+
+local function makeHand(card1, card2, bet, fromSplit)
+    return {
+        cards = {card1, card2},
+        bet = bet,
+        finished = false,
+        stood = false,
+        busted = false,
+        doubled = false,
+        fromSplit = fromSplit or false,
+        result = "",
+        net = 0,
+        returned = 0
+    }
+end
+
+local function beginRound()
+    local bet = currentBetTotal()
+
+    if not player then
+        statusMessage = "No player detected."
+        return
+    end
+
+    balance = getBalance(player)
+
+    if bet > MAX_BET then
+        statusMessage = "Max bet is $" .. MAX_BET
+        return
+    end
+
+    if bet > balance then
+        statusMessage = "Insufficient balance."
+        return
+    end
+
+    resetRound(false)
+
+    transferBalance(player, -bet, "BLACKJACK BET: $" .. bet)
+    totalWagerThisRound = totalWagerThisRound + bet
+
+    deck = shuffleDeck()
+    local c1 = drawCard()
+    local d1 = drawCard()
+    local c2 = drawCard()
+    local d2 = drawCard()
+
+    hands = {makeHand(c1, c2, bet, false)}
+    dealer = {d1, d2}
+    currentHandIndex = 1
+    revealDealer = false
+    state = "playing"
+
+    local playerBJ = isBlackjack(hands[1])
+    local dealerBJ = handValue({cards = dealer}) == 21
+
+    if playerBJ or dealerBJ then
+        revealDealer = true
+
+        if playerBJ and dealerBJ then
+            hands[1].result = "push"
+            hands[1].returned = bet
+            hands[1].net = 0
+            transferBalance(player, bet, "BLACKJACK PUSH: returned $" .. bet)
+            totalReturnThisRound = totalReturnThisRound + bet
+
+        elseif playerBJ then
+            local returned = math.floor((bet * BLACKJACK_PAYS_NUM) / BLACKJACK_PAYS_DEN)
+            hands[1].result = "blackjackwin"
+            hands[1].returned = returned
+            hands[1].net = returned - bet
+            transferBalance(player, returned, "BLACKJACK 3:2 WIN: returned $" .. returned)
+            totalReturnThisRound = totalReturnThisRound + returned
+
+        else
+            hands[1].result = "loser"
+            hands[1].returned = 0
+            hands[1].net = -bet
+        end
+
+        totalNetChange = hands[1].net
+        resultLines = {{label = hands[1].result, net = hands[1].net}}
+        sendBlackjackWinStat()
+        state = "result"
+    end
+end
+
+local function moveToNextUnfinishedHand()
+    for i = currentHandIndex + 1, #hands do
+        if not hands[i].finished then
+            currentHandIndex = i
+            return true
+        end
+    end
+
+    for i = 1, currentHandIndex - 1 do
+        if not hands[i].finished then
+            currentHandIndex = i
+            return true
+        end
+    end
+
+    return false
+end
+
+local function settleRound()
+    revealDealer = true
+
+    local anyLiveHand = false
+    for _, hand in ipairs(hands) do
+        if not hand.busted then anyLiveHand = true end
+    end
+
+    if anyLiveHand then
+        while dealerShouldHit() do
+            drawScreen()
+            sleep(1.0)
+            table.insert(dealer, drawCard())
+        end
+    end
+
+    local dealerScore = handValue({cards = dealer})
+    resultLines = {}
+    totalNetChange = 0
+
+    for i, hand in ipairs(hands) do
+        local playerScore = handValue(hand)
+        local result = "loser"
+        local returned = 0
+        local net = -hand.bet
+
+        if playerScore > 21 then
+            result = "bust"
+            returned = 0
+            net = -hand.bet
+        elseif dealerScore > 21 or playerScore > dealerScore then
+            result = "win"
+            returned = hand.bet * 2
+            net = returned - hand.bet
+        elseif playerScore == dealerScore then
+            result = "push"
+            returned = hand.bet
+            net = 0
+        else
+            result = "loser"
+            returned = 0
+            net = -hand.bet
+        end
+
+        hand.result = result
+        hand.returned = returned
+        hand.net = net
+        totalNetChange = totalNetChange + net
+        totalReturnThisRound = totalReturnThisRound + returned
+
+        if returned > 0 then
+            transferBalance(player, returned, "BLACKJACK " .. result .. ": hand " .. i .. " returned $" .. returned)
+        end
+
+        table.insert(resultLines, {label = result, net = net})
+    end
+
+    sendBlackjackWinStat()
+    state = "result"
+end
+
+local function finishCurrentHand()
+    local hand = currentHand()
+    if not hand then return end
+
+    hand.finished = true
+
+    if not moveToNextUnfinishedHand() then
+        settleRound()
+    end
+end
+
+local function hitCurrentHand()
+    local hand = currentHand()
+    if not hand or hand.finished then return end
+
+    table.insert(hand.cards, drawCard())
+    hand.hasHit = true
+
+    if handValue(hand) > 21 then
+        hand.busted = true
+        hand.finished = true
+        statusMessage = "Hand busted."
+
+        if not moveToNextUnfinishedHand() then
+            settleRound()
+        end
+    end
+end
+
+local function standCurrentHand()
+    local hand = currentHand()
+    if not hand or hand.finished then return end
+    hand.stood = true
+    finishCurrentHand()
+end
+
+local function doubleCurrentHand()
+    local hand = currentHand()
+    if not hand or hand.finished then return end
+
+    if #hand.cards ~= 2 or hand.hasHit then
+        statusMessage = "Double only before hitting."
+        return
+    end
+
+    balance = getBalance(player)
+
+    if balance < hand.bet then
+        statusMessage = "Not enough balance to double."
+        return
+    end
+
+    transferBalance(player, -hand.bet, "BLACKJACK DOUBLE: extra $" .. hand.bet)
+    totalWagerThisRound = totalWagerThisRound + hand.bet
+    hand.bet = hand.bet * 2
+    hand.doubled = true
+
+    table.insert(hand.cards, drawCard())
+    hand.hasHit = true
+
+    if handValue(hand) > 21 then
+        hand.busted = true
+    end
+
+    finishCurrentHand()
+end
+
+local function splitCurrentHand()
+    local hand = currentHand()
+    if not hand or hand.finished then return end
+
+    if #hands >= 2 then
+        statusMessage = "Only one split allowed."
+        return
+    end
+
+    if not canSplitHand(hand) then
+        statusMessage = "Can only split matching values."
+        return
+    end
+
+    balance = getBalance(player)
+
+    if balance < hand.bet then
+        statusMessage = "Not enough balance to split."
+        return
+    end
+
+    transferBalance(player, -hand.bet, "BLACKJACK SPLIT: second hand $" .. hand.bet)
+    totalWagerThisRound = totalWagerThisRound + hand.bet
+
+    local first = hand.cards[1]
+    local second = hand.cards[2]
+
+    hands = {
+        makeHand(first, drawCard(), hand.bet, true),
+        makeHand(second, drawCard(), hand.bet, true)
+    }
+
+    currentHandIndex = 1
+    statusMessage = "Split into two hands."
+end
+
+-- =========================================================
+-- === DRAWING SCREENS
+-- =========================================================
+
+function drawScreen()
+    monitor.setTextScale(0.5)
+
+    if not player then
+        monitor.setBackgroundColor(colors.black)
+        monitor.clear()
+        writeText(28, 18, "No Player Detected", colors.white, colors.black)
+        return
+    end
+
+    if state == "welcome" then
+        drawNFV("BJOPEN.nfv")
+        drawNameString(11, 21, player)
+        if statusMessage ~= "" then writeText(12, 35, statusMessage, colors.yellow, colors.black) end
+
+    elseif state == "betting" then
+        drawNFV("BJBETTING.nfv")
+        drawNumberString(36, 19, tostring(balance), "red_")
+        drawNumberString(18, 32, tostring(betCount), "red_")
+        drawNumberString(28, 32, tostring(currentBetTotal()), "red_")
+        if statusMessage ~= "" then writeText(12, 38, statusMessage, colors.yellow, colors.black) end
+
+    elseif state == "playing" then
+        drawNFV("BJPLAY.nfv")
+        local hand = currentHand()
+        local totalBet = 0
+        for _, h in ipairs(hands) do totalBet = totalBet + h.bet end
+        drawNumberString(25, 25, tostring(totalBet), "red_")
+
+        if revealDealer then
+            drawHand(12, 10, dealer)
+            drawNumberString(59, 10, tostring(handValue({cards = dealer})), "purple_")
+        else
+            drawHand(12, 10, {dealer[1]})
+        end
+
+        if #hands > 1 then
+            writeText(12, 15, "<", colors.lime, colors.black)
+            writeText(63, 15, ">", colors.lime, colors.black)
+            writeText(31, 15, "Hand " .. currentHandIndex .. "/" .. #hands, colors.yellow, colors.black)
+        end
+
+        if hand then
+            drawHand(12, 18, hand)
+            drawNumberString(59, 18, tostring(handValue(hand)), "purple_")
+            writeText(12, 36, "Bet $" .. tostring(hand.bet), colors.yellow, colors.black)
+
+            local canSplit = canSplitHand(hand) and #hands == 1 and balance >= hand.bet
+            local canDouble = (#hand.cards == 2 and not hand.hasHit and balance >= hand.bet)
+
+            writeText(2, 2, canDouble and "Double OK" or "", colors.lightBlue, colors.black)
+            writeText(2, 3, canSplit and "Split OK" or "", colors.lime, colors.black)
+        end
+
+        if statusMessage ~= "" then writeText(12, 38, statusMessage, colors.yellow, colors.black) end
+
+    elseif state == "result" then
+        monitor.setBackgroundColor(colors.black)
+        monitor.clear()
+
+        if #resultLines > 1 then
+            for i, row in ipairs(resultLines) do
+                blitChar(2, 6 + i * 6, row.label)
+                local netText = (row.net >= 0 and "+" or "") .. tostring(row.net)
+                drawNumberString(40, 6 + i * 6, netText, "red_")
+            end
+            local totalText = (totalNetChange >= 0 and "+" or "") .. tostring(totalNetChange)
+            writeText(24, 34, "Total", colors.white, colors.black)
+            drawNumberString(40, 34, totalText, "red_")
+        else
+            local row = resultLines[1] or {label = "push", net = 0}
+            local xOffset = row.label == "blackjackwin" and 12 or 28
+            blitChar(xOffset, 15, row.label)
+            local netText = (row.net >= 0 and "+" or "") .. tostring(row.net)
+            drawNumberString(30, 30, netText, "red_")
+        end
+
+        writeText(18, 38, "Touch to continue", colors.gray, colors.black)
+    end
+end
+
+-- =========================================================
+-- === PLAYER DETECTION / INPUT
+-- =========================================================
+
+local function detectPlayer()
+    local candidates = {}
+
+    for _, p in ipairs(radar.getPlayers()) do
+        if p.distance >= MIN_PLAYER_DISTANCE and p.distance <= MAX_PLAYER_DISTANCE then
+            table.insert(candidates, p)
+        end
+    end
+
+    table.sort(candidates, function(a, b) return a.distance < b.distance end)
+
+    if #candidates == 1 then
+        return candidates[1].name
+    end
+
+    return nil
+end
+
+local function handleTouch(_, _, x, y)
+    if not player then return end
+
+    if state == "welcome" then
+        if inside(x, y, TOUCH.welcomeStart) then
+            balance = getBalance(player)
+            statusMessage = ""
+            state = "betting"
+        end
+
+    elseif state == "betting" then
+        if inside(x, y, TOUCH.chip500) then
+            betChip = 500
+        elseif inside(x, y, TOUCH.chip2500) then
+            betChip = 2500
+        elseif inside(x, y, TOUCH.chip25000) then
+            betChip = 25000
+        elseif inside(x, y, TOUCH.betMinus) then
+            betCount = math.max(1, betCount - 1)
+        elseif inside(x, y, TOUCH.betPlus) then
+            betCount = betCount + 1
+        elseif inside(x, y, TOUCH.deal) then
+            beginRound()
+        end
+
+        clampBetCount()
+
+    elseif state == "playing" then
+        local hand = currentHand()
+        if not hand then return end
+
+        if inside(x, y, TOUCH.hit) then
+            hitCurrentHand()
+
+        elseif inside(x, y, TOUCH.double) then
+            -- Same physical button area as split in your old UI.
+            -- If splitting is possible, split takes priority; otherwise it doubles.
+            if canSplitHand(hand) and #hands == 1 then
+                splitCurrentHand()
+            else
+                doubleCurrentHand()
+            end
+
+        elseif inside(x, y, TOUCH.stand) then
+            standCurrentHand()
+
+        elseif inside(x, y, TOUCH.leftHand) and #hands > 1 then
+            if currentHandIndex > 1 then currentHandIndex = currentHandIndex - 1 end
+
+        elseif inside(x, y, TOUCH.rightHand) and #hands > 1 then
+            if currentHandIndex < #hands then currentHandIndex = currentHandIndex + 1 end
+        end
+
+    elseif state == "result" then
+        resetRound(true)
+        state = "welcome"
+    end
+end
+
+-- =========================================================
+-- === MAIN LOOP
+-- =========================================================
+
+parallel.waitForAny(
+    function()
+        while true do
+            local detected = detectPlayer()
+
+            if detected ~= lastDetectedPlayer then
+                lastDetectedPlayer = detected
+
+                if state == "welcome" or state == "betting" or state == "result" then
+                    player = detected
+                    if player then
+                        balance = getBalance(player)
+                    else
+                        balance = 0
+                    end
+                end
+            end
+
+            sleep(0.5)
+        end
+    end,
+
+    function()
+        while true do
+            drawScreen()
+            sleep(0.1)
+        end
+    end,
+
+    function()
+        while true do
+            local e = {os.pullEvent("monitor_touch")}
+            handleTouch(table.unpack(e))
+        end
+    end
+)
