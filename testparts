@@ -1,0 +1,90 @@
+-- winTest.lua
+-- Green win-particle spiral above this turtle and the block to its right.
+
+-- CHANGE THIS to match the direction the turtle is facing.
+-- Options: "north", "south", "east", "west"
+local FACING = "north"
+
+-- Particle settings
+local PARTICLE = "happyVillager" -- green-ish for MC 1.12 style
+local DURATION_STEPS = 90
+local RADIUS = 0.38
+local MIN_Y = 2.0
+local MAX_Y = 5.0
+local DELAY = 0.03
+
+-- Right-side block offset based on turtle facing.
+local RIGHT_OFFSET = {
+    north = {x = 1,  z = 0},
+    south = {x = -1, z = 0},
+    east  = {x = 0,  z = 1},
+    west  = {x = 0,  z = -1},
+}
+
+local right = RIGHT_OFFSET[FACING]
+if not right then
+    error("Bad FACING value. Use north/south/east/west.")
+end
+
+local function runParticleCommand(x, y, z, count)
+    count = count or 2
+
+    -- Minecraft 1.12-ish particle command:
+    -- particle <name> <x> <y> <z> <dx> <dy> <dz> <speed> <count>
+    local cmd = string.format(
+        "particle %s ~%.3f ~%.3f ~%.3f 0.02 0.02 0.02 0.01 %d",
+        PARTICLE,
+        x,
+        y,
+        z,
+        count
+    )
+
+    if commands and commands.exec then
+        local ok, result = commands.exec(cmd)
+        return ok, result
+    end
+
+    error("No commands API found. This turtle needs command/particle capability.")
+end
+
+local function spiralAt(baseX, baseZ)
+    for i = 1, DURATION_STEPS do
+        local t = i / DURATION_STEPS
+        local angle = i * 0.45
+
+        local y = MIN_Y + ((MAX_Y - MIN_Y) * t)
+        local x = baseX + math.cos(angle) * RADIUS
+        local z = baseZ + math.sin(angle) * RADIUS
+
+        runParticleCommand(x, y, z, 2)
+        sleep(DELAY)
+    end
+end
+
+local function doubleSpiral()
+    for i = 1, DURATION_STEPS do
+        local t = i / DURATION_STEPS
+        local angle = i * 0.45
+
+        local y = MIN_Y + ((MAX_Y - MIN_Y) * t)
+
+        -- Spiral over turtle block
+        local x1 = math.cos(angle) * RADIUS
+        local z1 = math.sin(angle) * RADIUS
+
+        -- Spiral over block to turtle's right
+        local x2 = right.x + math.cos(angle + math.pi) * RADIUS
+        local z2 = right.z + math.sin(angle + math.pi) * RADIUS
+
+        runParticleCommand(x1, y, z1, 2)
+        runParticleCommand(x2, y, z2, 2)
+
+        sleep(DELAY)
+    end
+end
+
+print("Starting green win particle test...")
+print("Facing:", FACING)
+doubleSpiral()
+print("Done.")
