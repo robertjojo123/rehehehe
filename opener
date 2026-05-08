@@ -1,0 +1,177 @@
+-- startup.lua
+-- Private blackjack ad trigger through manipulators 42 and 43.
+--
+-- Triggers once each:
+-- 1) chat contains "njord" + "emerged"
+-- 2) chat contains "rado" + "back" + "house"
+--
+-- After 5 seconds, privately tells Rado and Em:
+-- "check out blackjack home slices, play a hand or two, ur gonna like what ive added"
+
+local DELAY_SECONDS = 5
+
+local TARGETS = {
+    {
+        player = "RadoSlawGuzior",
+        manipulator = "manipulator_42",
+    },
+    {
+        player = "EmTheTurtle03",
+        manipulator = "manipulator_43",
+    },
+}
+
+local MESSAGE = "check out blackjack home slices, play a hand or two, ur gonna like what ive added"
+
+local TRIGGERS = {
+    {
+        name = "njord_emerged",
+        words = {"njord", "emerged"},
+        file = "trigger_njord_emerged.txt",
+    },
+    {
+        name = "rado_back_house",
+        words = {"rado", "back", "house"},
+        file = "trigger_rado_back_house.txt",
+    },
+}
+
+local chats = {}
+
+for _, target in ipairs(TARGETS) do
+    local chat = peripheral.wrap(target.manipulator)
+
+    if not chat then
+        error("Could not find " .. target.manipulator)
+    end
+
+    chats[target.player] = chat
+end
+
+local function lower(s)
+    return string.lower(tostring(s or ""))
+end
+
+local function hasAll(msg, words)
+    msg = lower(msg)
+
+    for _, word in ipairs(words) do
+        if not msg:find(lower(word), 1, true) then
+            return false
+        end
+    end
+
+    return true
+end
+
+local function alreadyTriggered(file)
+    return fs.exists(file)
+end
+
+local function markTriggered(file, triggerName, msg)
+    local f = fs.open(file, "w")
+    f.writeLine("triggered=true")
+    f.writeLine("trigger=" .. tostring(triggerName))
+    f.writeLine("clock=" .. tostring(os.clock()))
+    f.writeLine("message=" .. tostring(msg))
+    f.close()
+end
+
+local function privateTell(chat, player, message)
+    -- Different manipulator/chat peripherals sometimes order args differently,
+    -- so try common tell signatures safely.
+
+    if type(chat.tell) == "function" then
+        local attempts = {
+            function() return chat.tell(player, message) end,
+            function() return chat.tell(message, player) end,
+        }
+
+        for _, attempt in ipairs(attempts) do
+            local ok = pcall(attempt)
+            if ok then return true end
+        end
+    end
+
+    if type(chat.sendMessageToPlayer) == "function" then
+        local attempts = {
+            function() return chat.sendMessageToPlayer(message, player) end,
+            function() return chat.sendMessageToPlayer(player, message) end,
+        }
+
+        for _, attempt in ipairs(attempts) do
+            local ok = pcall(attempt)
+            if ok then return true end
+        end
+    end
+
+    return false
+end
+
+local function sendPrivateAds()
+    for _, target in ipairs(TARGETS) do
+        local chat = chats[target.player]
+        local ok = privateTell(chat, target.player, MESSAGE)
+
+        if ok then
+            print("Told " .. target.player .. " via " .. target.manipulator)
+        else
+            print("FAILED to tell " .. target.player .. " via " .. target.manipulator)
+        end
+    end
+end
+
+local function getMessageFromEvent(event)
+    local eventName = event[1]
+
+    if eventName == "chat" then
+        return event[3] or event[2]
+    elseif eventName == "chat_message" then
+        return event[3] or event[2]
+    elseif eventName == "playerChat" then
+        return event[3] or event[2]
+    elseif eventName == "chatMessage" then
+        return event[3] or event[2]
+    end
+
+    return nil
+end
+
+local function tryTrigger(trigger, msg)
+    if alreadyTriggered(trigger.file) then
+        return false
+    end
+
+    if hasAll(msg, trigger.words) then
+        print("Matched trigger: " .. trigger.name)
+        print("Message: " .. tostring(msg))
+
+        -- Mark first so it cannot double-trigger during delay/reboot.
+        markTriggered(trigger.file, trigger.name, msg)
+
+        sleep(DELAY_SECONDS)
+        sendPrivateAds()
+
+        print("Private blackjack ad sent for trigger: " .. trigger.name)
+        return true
+    end
+
+    return false
+end
+
+print("Listening for private blackjack ad triggers...")
+print("Trigger 1: njord + emerged")
+print("Trigger 2: rado + back + house")
+print("Will tell RadoSlawGuzior through manipulator_42")
+print("Will tell EmTheTurtle03 through manipulator_43")
+
+while true do
+    local event = {os.pullEvent()}
+    local msg = getMessageFromEvent(event)
+
+    if msg then
+        for _, trigger in ipairs(TRIGGERS) do
+            tryTrigger(trigger, msg)
+        end
+    end
+end
