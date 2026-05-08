@@ -1,0 +1,67 @@
+-- startup.lua
+-- Listens for chat messages containing both "Njord" and "emerged"
+-- then sends: "check out black jack g"
+
+local CHAT_PERIPHERAL = "manipulator_41" -- change if needed
+local COOLDOWN_SECONDS = 30
+
+local chat = peripheral.wrap(CHAT_PERIPHERAL)
+
+if not chat then
+    error("Could not find chat/manipulator peripheral: " .. CHAT_PERIPHERAL)
+end
+
+local lastSent = 0
+
+local function lower(s)
+    return string.lower(tostring(s or ""))
+end
+
+local function containsNeedles(msg)
+    msg = lower(msg)
+    return msg:find("njord", 1, true) and msg:find("emerged", 1, true)
+end
+
+local function sendChat(message)
+    if chat.say then
+        chat.say(message)
+    elseif chat.tell then
+        -- fallback, but tell usually needs a player target
+        error("Peripheral has tell but no say; need public chat method")
+    elseif chat.sendMessage then
+        chat.sendMessage(message)
+    else
+        error("No known chat send method found on " .. CHAT_PERIPHERAL)
+    end
+end
+
+print("Listening for: Njord + emerged")
+
+while true do
+    local event = {os.pullEvent()}
+
+    -- Common chat event formats vary by mod/peripheral.
+    -- This handles several likely versions.
+    local eventName = event[1]
+    local msg = nil
+
+    if eventName == "chat" then
+        msg = event[3] or event[2]
+    elseif eventName == "chat_message" then
+        msg = event[3] or event[2]
+    elseif eventName == "playerChat" then
+        msg = event[3] or event[2]
+    end
+
+    if msg and containsNeedles(msg) then
+        local now = os.clock()
+
+        if now - lastSent >= COOLDOWN_SECONDS then
+            lastSent = now
+            print("Matched chat:", msg)
+            sendChat("check out black jack g")
+        else
+            print("Matched but cooldown active")
+        end
+    end
+end
