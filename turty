@@ -1,0 +1,275 @@
+-- blackjack_particle_turtle_422.lua
+-- One central particle turtle for all blackjack stations.
+-- Particle peripheral must be on LEFT with method spawn.
+--
+-- Local tests:
+--   blackjack_particle_turtle_422 1 win
+--   blackjack_particle_turtle_422 4 lose
+--
+-- Coordinates below are RELATIVE to this turtle:
+--   +x east, -x west
+--   +y up
+--   +z south, -z north
+
+local MODEM_SIDE = "right"
+local PARTICLE_SIDE = "left"
+local PROTOCOL = "bj_particles"
+
+local PARTICLE_WIN = "happyVillager"
+local PARTICLE_LOSE = "reddust"
+
+-- Sharper word settings.
+local TEXT_SCALE = 0.198
+local TEXT_REPEAT = 34
+local TEXT_REPEAT_DELAY = 0.05
+local DOT_STACK = 2
+
+-- Spiral settings.
+local SPIRAL_STEPS = 175
+local SPIRAL_START_Y = 0.0 -- starts on same Y level as turtle/block base
+local SPIRAL_END_Y = 6.0
+local SPIRAL_DELAY = 0.012
+local SPIRAL_RADIUS = 0.78
+
+-- Direction vectors used for words.
+local AXIS = {
+    px = {x = 1, z = 0},
+    nx = {x = -1, z = 0},
+    pz = {x = 0, z = 1},
+    nz = {x = 0, z = -1},
+}
+
+-- wordAxis = direction the word reads left-to-right in world space.
+-- viewDir = direction from the word toward the player/viewer.
+--
+-- Station 4:
+--   blocks are x -3, z -1 and adjacent z +1 from there, so (-3,-1) and (-3,0)
+--   word is 2 blocks +x from those spiral blocks.
+--   word reads -z to +z, readable looking +x from the -x side.
+--
+-- Station 1:
+--   blocks are z -5, x +1 and +2.
+--   word uses same relative rule: 2 blocks out from those blocks toward its player/view direction.
+--
+-- Station 2:
+--   You gave facing/read direction but not exact spiral blocks yet.
+--   I put a clear placeholder. Change spiralA/spiralB when you know the coords.
+--
+-- Station 3:
+--   interpreting "r in the +z" as 5 in the +z, with x +1 and +2.
+local STATION_FX = {
+    [1] = {
+        spiralA = {x = 1, y = 0, z = -5},
+        spiralB = {x = 2, y = 0, z = -5},
+        wordOffsetFromSpiralCenter = {x = 0, y = 2, z = -2},
+        wordAxis = "px",
+        viewDir = "pz",
+    },
+
+    [2] = {
+        -- TODO: replace these two blocks if station 2's actual blocks are different.
+        -- Player faces -x, so the message is placed 2 blocks +x from the spiral center,
+        -- and is readable looking in -x.
+        spiralA = {x = 5, y = 0, z = -1},
+        spiralB = {x = 5, y = 0, z = 0},
+        wordOffsetFromSpiralCenter = {x = 2, y = 2, z = 0},
+        wordAxis = "pz",
+        viewDir = "nx",
+    },
+
+    [3] = {
+        spiralA = {x = 1, y = 0, z = 5},
+        spiralB = {x = 2, y = 0, z = 5},
+        wordOffsetFromSpiralCenter = {x = 0, y = 2, z = 2},
+        wordAxis = "nx",
+        viewDir = "nz",
+    },
+
+    [4] = {
+        spiralA = {x = -3, y = 0, z = -1},
+        spiralB = {x = -3, y = 0, z = 0},
+        wordOffsetFromSpiralCenter = {x = 2, y = 2, z = 0},
+        wordAxis = "pz",
+        viewDir = "px",
+    },
+}
+
+local p = peripheral.wrap(PARTICLE_SIDE)
+if not p then error("No particle peripheral on " .. PARTICLE_SIDE) end
+if type(p.spawn) ~= "function" then error("Particle peripheral has no spawn method") end
+
+local function openAnyModem()
+    if peripheral.isPresent(MODEM_SIDE) and peripheral.getType(MODEM_SIDE) == "modem" then
+        rednet.open(MODEM_SIDE)
+        return true
+    end
+
+    for _, side in ipairs({"left", "right", "top", "bottom", "front", "back"}) do
+        if peripheral.isPresent(side) and peripheral.getType(side) == "modem" then
+            rednet.open(side)
+            MODEM_SIDE = side
+            return true
+        end
+    end
+
+    return false
+end
+
+local function spawnParticle(name, x, y, z)
+    local attempts = {
+        function() return p.spawn(name, x, y, z) end,
+        function() return p.spawn(name, x, y, z, 0, 0, 0) end,
+        function() return p.spawn(name, x, y, z, 0, 0, 0, 0) end,
+        function() return p.spawn(name, x, y, z, 0, 0, 0, 0, 1) end,
+    }
+
+    for _, attempt in ipairs(attempts) do
+        local ok = pcall(attempt)
+        if ok then return true end
+    end
+
+    return false
+end
+
+local FONT = {
+    W = {"10001","10001","10101","10101","01010"},
+    I = {"111","010","010","010","111"},
+    N = {"1001","1101","1011","1001","1001"},
+    E = {"1111","1000","1110","1000","1111"},
+    R = {"1110","1001","1110","1010","1001"},
+    L = {"1000","1000","1000","1000","1111"},
+    O = {"111","101","101","101","111"},
+    S = {"111","100","111","001","111"},
+}
+
+local function add(a, b)
+    return {
+        x = (a.x or 0) + (b.x or 0),
+        y = (a.y or 0) + (b.y or 0),
+        z = (a.z or 0) + (b.z or 0),
+    }
+end
+
+local function mid(a, b)
+    return {
+        x = ((a.x or 0) + (b.x or 0)) / 2,
+        y = ((a.y or 0) + (b.y or 0)) / 2,
+        z = ((a.z or 0) + (b.z or 0)) / 2,
+    }
+end
+
+local function textWidth(text)
+    local width = 0
+    for i = 1, #text do
+        local glyph = FONT[text:sub(i, i)]
+        if glyph then width = width + #glyph[1] + 1 end
+    end
+    return math.max(0, width - 1)
+end
+
+local function drawWordOnce(word, particle, cfg)
+    local axis = AXIS[cfg.wordAxis or "px"]
+    local view = AXIS[cfg.viewDir or "pz"]
+    if not axis or not view then return end
+
+    local center = add(mid(cfg.spiralA, cfg.spiralB), cfg.wordOffsetFromSpiralCenter or {x = 0, y = 2, z = 0})
+    local width = textWidth(word)
+    local cursor = -((width * TEXT_SCALE) / 2)
+
+    for i = 1, #word do
+        local glyph = FONT[word:sub(i, i)]
+        if glyph then
+            local glyphW = #glyph[1]
+            local glyphH = #glyph
+
+            for row = 1, glyphH do
+                local line = glyph[row]
+                for col = 1, glyphW do
+                    if line:sub(col, col) == "1" then
+                        local along = cursor + ((col - 1) * TEXT_SCALE)
+                        local up = (glyphH - row) * TEXT_SCALE
+
+                        -- Flipped so the word is readable from the configured view side.
+                        local x = center.x + (axis.x * along)
+                        local y = center.y + up
+                        local z = center.z + (axis.z * along)
+
+                        for _ = 1, DOT_STACK do
+                            spawnParticle(particle, x, y, z)
+                        end
+                    end
+                end
+            end
+
+            cursor = cursor + (glyphW * TEXT_SCALE) + TEXT_SCALE
+        end
+    end
+end
+
+local function drawWordHeld(word, particle, cfg)
+    for _ = 1, TEXT_REPEAT do
+        drawWordOnce(word, particle, cfg)
+        sleep(TEXT_REPEAT_DELAY)
+    end
+end
+
+local function drawTwoBlockSpiral(particle, cfg)
+    local c = mid(cfg.spiralA, cfg.spiralB)
+    local y0 = cfg.spiralA.y or 0
+
+    for i = 1, SPIRAL_STEPS do
+        local t = i / SPIRAL_STEPS
+        local angle = i * 0.38
+        local y = y0 + SPIRAL_START_Y + ((SPIRAL_END_Y - SPIRAL_START_Y) * t)
+
+        local x = c.x + math.cos(angle) * SPIRAL_RADIUS
+        local z = c.z + math.sin(angle) * SPIRAL_RADIUS
+
+        spawnParticle(particle, x, y, z)
+        sleep(SPIRAL_DELAY)
+    end
+end
+
+local function playEffect(stationId, outcome)
+    local cfg = STATION_FX[tonumber(stationId)]
+    if not cfg then
+        print("No FX config for station " .. tostring(stationId))
+        return
+    end
+
+    local word, particle
+    if outcome == "lose" or outcome == "loser" then
+        word = "LOSER"
+        particle = PARTICLE_LOSE
+    else
+        word = "WINNER"
+        particle = PARTICLE_WIN
+    end
+
+    parallel.waitForAll(
+        function() drawTwoBlockSpiral(particle, cfg) end,
+        function() drawWordHeld(word, particle, cfg) end
+    )
+end
+
+local args = {...}
+if args[1] and args[2] then
+    playEffect(tonumber(args[1]), args[2])
+    return
+end
+
+if not openAnyModem() then
+    print("No modem found. Local tests:")
+    print(shell.getRunningProgram() .. " 1 win")
+    print(shell.getRunningProgram() .. " 4 lose")
+    return
+end
+
+print("Central BJ particle turtle listening on " .. MODEM_SIDE)
+
+while true do
+    local _, msg = rednet.receive(PROTOCOL)
+    if type(msg) == "table" and msg.action == "blackjack_fx" then
+        playEffect(msg.stationId, msg.outcome)
+    end
+end
