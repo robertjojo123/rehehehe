@@ -1,0 +1,65 @@
+-- winParticleTest_singleSpiral.lua
+-- Single spiral around turtle block + block to its right.
+-- Uses particle peripheral on LEFT with method: spawn
+
+local p = peripheral.wrap("left")
+if not p then error("No peripheral on left") end
+if type(p.spawn) ~= "function" then error("Left peripheral has no spawn method") end
+
+-- Change this to match the turtle's facing direction.
+local FACING = "north" -- north/south/east/west
+
+local RIGHT_OFFSET = {
+    north = {x = 1,  z = 0},
+    south = {x = -1, z = 0},
+    east  = {x = 0,  z = 1},
+    west  = {x = 0,  z = -1},
+}
+
+local right = RIGHT_OFFSET[FACING]
+if not right then error("Bad FACING") end
+
+-- Change particle here if needed
+local PARTICLE = "happyVillager"
+
+local function spawnParticle(x, y, z)
+    -- Most likely signature for your particle peripheral:
+    local ok = pcall(function()
+        p.spawn(PARTICLE, x, y, z)
+    end)
+
+    if not ok then
+        -- fallback signatures
+        pcall(function() p.spawn(PARTICLE, x, y, z, 0, 0, 0) end)
+        pcall(function() p.spawn(PARTICLE, x, y, z, 0, 0, 0, 0) end)
+        pcall(function() p.spawn(PARTICLE, x, y, z, 0, 0, 0, 0, 1) end)
+    end
+end
+
+local STEPS = 160
+local START_Y = 1.0
+local END_Y = 6.0
+local DELAY = 0.02
+
+-- Center between turtle block and right block
+local centerX = right.x / 2
+local centerZ = right.z / 2
+
+-- Radius should wrap around both blocks
+local radius = 0.75
+
+for i = 1, STEPS do
+    local t = i / STEPS
+    local angle = i * 0.35
+
+    local y = START_Y + ((END_Y - START_Y) * t)
+
+    local x = centerX + math.cos(angle) * radius
+    local z = centerZ + math.sin(angle) * radius
+
+    spawnParticle(x, y, z)
+
+    sleep(DELAY)
+end
+
+print("Single two-block spiral done.")
