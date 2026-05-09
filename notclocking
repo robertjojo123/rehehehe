@@ -1,0 +1,2094 @@
+-- multiplayer_roulette_ui_local_lamps.lua
+-- Single-computer multiplayer roulette controller
+
+-- =========================================================
+-- === Config
+-- =========================================================
+
+local ACCOUNT_COMPUTER_ID = 8166
+local ACCOUNT_PROTOCOL = "casino"
+
+local MODEM_SIDE = "bottom"
+
+local COUNTDOWN_SECONDS = 6
+local SPIN_SETTLE_SECONDS = 6
+local RESULT_DISPLAY_SECONDS = 5
+local RESET_DELAY_SECONDS = 2
+
+local MIN_DISTANCE = 1
+local MAX_DISTANCE = 1.55
+
+-- Per-station maximum possible payout exposure.
+-- This is NOT max stake.
+-- This means no station can place bets that could pay more than this total
+-- on any single roulette result.
+local MAX_STATION_POSSIBLE_PAYOUT = 75000
+
+local LAST_ROLLS_FILE = "/roulette_last_rolls.json"
+local MAX_LAST_ROLLS = 4
+
+-- Dark green custom button background for UNDO/SPIN
+local DARK_BUTTON_BG = colors.brown
+local DARK_BUTTON_BG_HEX = 0x178530
+local DARK_BUTTON_BG_BLIT = "c"
+
+-- =========================================================
+-- === Better RNG Helper
+-- =========================================================
+
+local rngSpinCounter = 0
+
+local function reseedRouletteRNG()
+    rngSpinCounter = rngSpinCounter + 1
+
+    local epoch = 0
+    if os.epoch then
+        epoch = os.epoch("utc") or 0
+    end
+
+    local clockPart = math.floor((os.clock() or 0) * 1000000)
+    local timePart = math.floor((os.time() or 0) * 100000)
+    local idPart = os.getComputerID() or 0
+
+    local seed =
+        epoch
+        + clockPart
+        + timePart
+        + (idPart * 7919)
+        + (rngSpinCounter * 104729)
+
+    seed = seed % 2147483647
+
+    math.randomseed(seed)
+
+    for i = 1, 32 do
+        math.random()
+    end
+
+    print("Roulette RNG reseeded:", seed)
+end
+
+local function rouletteRandom(minVal, maxVal)
+    for i = 1, 5 do
+        math.random()
+    end
+
+    return math.random(minVal, maxVal)
+end
+
+-- =========================================================
+-- === Station Chip Colors
+-- =========================================================
+
+local STATION_CHIP_COLORS = {
+    [1] = {
+        slot = colors.blue,
+        hex = 0x2F80FF
+    },
+    [2] = {
+        slot = colors.orange,
+        hex = 0xFF8C1A
+    },
+    [3] = {
+        slot = colors.yellow,
+        hex = 0xFFD84D
+    }
+}
+
+local STATIONS = {
+    {
+        index = 1,
+        name = "Station 1",
+        monitorName = "monitor_622",
+        touchAliases = {"monitor_622", "top"},
+        radarName = "radar_13",
+        lastRollMonitorName = "monitor_956",
+        speakerName = "speaker_334",
+        activePlayer = nil,
+        lockedPlayer = nil,
+        lastPlayer = nil,
+        balance = 0,
+        selectedChip = nil,
+        message = ""
+    },
+    {
+        index = 2,
+        name = "Station 2",
+        monitorName = "monitor_947",
+        touchAliases = {"monitor_947"},
+        radarName = "radar_40",
+        lastRollMonitorName = "monitor_949",
+        speakerName = "speaker_335",
+        activePlayer = nil,
+        lockedPlayer = nil,
+        lastPlayer = nil,
+        balance = 0,
+        selectedChip = nil,
+        message = ""
+    },
+    {
+        index = 3,
+        name = "Station 3",
+        monitorName = "monitor_948",
+        touchAliases = {"monitor_948"},
+        radarName = "radar_39",
+        lastRollMonitorName = "monitor_954",
+        speakerName = "speaker_336",
+        activePlayer = nil,
+        lockedPlayer = nil,
+        lastPlayer = nil,
+        balance = 0,
+        selectedChip = nil,
+        message = ""
+    }
+}
+
+local START_ID = 7097
+local END_ID = 7136
+
+local RESULT_BLINK_SECONDS = 5
+local RESULT_BLINK_DELAY = 0.25
+
+local CORNER_LAMPS = {
+    ["colorful_lamp_7102"] = true,
+    ["colorful_lamp_7122"] = true
+}
+
+local WHEEL_ORDER_BY_LAMP_ASC = {
+    "0","26","3","35","12","19","7","29","18","22","9","31",
+    "14","20","1","33","16","24","5","00","23","8","30","11",
+    "36","13","27","6","34","17","25","2","21","4","28","15","32","10"
+}
+
+local redNumbers = {
+    ["1"]=true, ["3"]=true, ["5"]=true, ["7"]=true, ["9"]=true,
+    ["12"]=true, ["14"]=true, ["16"]=true, ["18"]=true,
+    ["21"]=true, ["23"]=true, ["25"]=true, ["27"]=true,
+    ["28"]=true, ["30"]=true, ["32"]=true, ["34"]=true, ["36"]=true
+}
+
+local ALL_ROULETTE_RESULTS = {
+    "0", "00",
+    "1","2","3","4","5","6","7","8","9","10","11","12",
+    "13","14","15","16","17","18","19","20","21","22","23","24",
+    "25","26","27","28","29","30","31","32","33","34","35","36"
+}
+
+-- =========================================================
+-- === Peripherals
+-- =========================================================
+
+local modem = peripheral.wrap(MODEM_SIDE)
+if not modem then error("No modem on " .. MODEM_SIDE) end
+rednet.open(MODEM_SIDE)
+
+for _, station in ipairs(STATIONS) do
+    station.monitor = peripheral.wrap(station.monitorName)
+    station.radar = peripheral.wrap(station.radarName)
+    station.lastRollMonitor = peripheral.wrap(station.lastRollMonitorName)
+    station.speaker = peripheral.wrap(station.speakerName)
+
+    if not station.monitor then
+        error("Could not wrap betting monitor: " .. station.monitorName)
+    end
+
+    if not station.radar then
+        error("Could not wrap radar: " .. station.radarName)
+    end
+
+    if not station.lastRollMonitor then
+        error("Could not wrap last-roll monitor: " .. station.lastRollMonitorName)
+    end
+
+    if not station.speaker then
+        print("WARNING: Could not wrap speaker: " .. tostring(station.speakerName))
+    end
+
+    station.monitor.setTextScale(0.5)
+    station.lastRollMonitor.setTextScale(3)
+
+    if station.monitor.setPaletteColor then
+        for _, colorData in pairs(STATION_CHIP_COLORS) do
+            station.monitor.setPaletteColor(colorData.slot, colorData.hex)
+        end
+
+        station.monitor.setPaletteColor(DARK_BUTTON_BG, DARK_BUTTON_BG_HEX)
+    end
+end
+
+-- =========================================================
+-- === Shared Game State
+-- =========================================================
+
+local monitorHitboxes = {}
+
+local roundState = "open"
+local countdownEndsAt = nil
+local lastResult = nil
+local tableMessage = "Bets open"
+
+local lastRolls = {}
+
+local placedBets = {}
+
+local betHistory = {}
+
+local balances = {}
+
+local playerLastStation = {}
+
+local playerStationNumber = {}
+
+local accountBusy = false
+
+local function acquireAccountLock()
+    while accountBusy do
+        sleep(0.05)
+    end
+    accountBusy = true
+end
+
+local function releaseAccountLock()
+    accountBusy = false
+end
+
+-- =========================================================
+-- === Native CC:Tweaked Speaker Sounds
+-- =========================================================
+
+local function playNote(station, instrument, volume, pitch)
+    if not station or not station.speaker then return end
+
+    pcall(function()
+        station.speaker.playNote(instrument, volume or 1, pitch or 12)
+    end)
+end
+
+local function playAllSpinTick()
+    for _, station in ipairs(STATIONS) do
+        playNote(station, "hat", 0.45, 12)
+    end
+end
+
+local function playStationWinSound(station)
+    if not station then return end
+
+    playNote(station, "pling", 1, 9)
+    sleep(0.08)
+    playNote(station, "pling", 1, 12)
+    sleep(0.08)
+    playNote(station, "pling", 1, 16)
+end
+
+local function playStationLoseSound(station)
+    if not station then return end
+
+    playNote(station, "bass", 1, 4)
+    sleep(0.12)
+    playNote(station, "bass", 1, 3)
+end
+
+local function playStartupSound(station)
+    if not station then return end
+
+    playNote(station, "pling", 0.8, 8)
+end
+
+local function getStationForPlayer(player)
+    return playerLastStation[player]
+end
+
+-- =========================================================
+-- === Last Roll JSON Persistence
+-- =========================================================
+
+local function jsonEscape(s)
+    s = tostring(s)
+    s = s:gsub("\\", "\\\\")
+    s = s:gsub('"', '\\"')
+    return s
+end
+
+local function encodeRollsJson(rolls)
+    local parts = {}
+
+    for _, roll in ipairs(rolls) do
+        table.insert(parts, '"' .. jsonEscape(roll) .. '"')
+    end
+
+    return "[" .. table.concat(parts, ",") .. "]"
+end
+
+local function decodeRollsJson(text)
+    local rolls = {}
+
+    if type(text) ~= "string" then
+        return rolls
+    end
+
+    for value in text:gmatch('"(.-)"') do
+        value = value:gsub('\\"', '"')
+        value = value:gsub("\\\\", "\\")
+        table.insert(rolls, value)
+
+        if #rolls >= MAX_LAST_ROLLS then
+            break
+        end
+    end
+
+    return rolls
+end
+
+local function saveLastRolls()
+    local file = fs.open(LAST_ROLLS_FILE, "w")
+    if file then
+        file.write(encodeRollsJson(lastRolls))
+        file.close()
+    end
+end
+
+local function loadLastRolls()
+    if not fs.exists(LAST_ROLLS_FILE) then
+        return {}
+    end
+
+    local file = fs.open(LAST_ROLLS_FILE, "r")
+    if not file then
+        return {}
+    end
+
+    local text = file.readAll()
+    file.close()
+
+    local rolls = decodeRollsJson(text)
+
+    while #rolls > MAX_LAST_ROLLS do
+        table.remove(rolls)
+    end
+
+    return rolls
+end
+
+lastRolls = loadLastRolls()
+
+-- =========================================================
+-- === Roulette Win Logic
+-- =========================================================
+
+local function isDozen(betZone, result)
+    local n = tonumber(result)
+    if not n then return false end
+    if betZone == "1st12" then return n >= 1 and n <= 12 end
+    if betZone == "2nd12" then return n >= 13 and n <= 24 end
+    if betZone == "3rd12" then return n >= 25 and n <= 36 end
+    return false
+end
+
+local function isColumn(betZone, result)
+    local n = tonumber(result)
+    if not n then return false end
+    if betZone == "2to1_top" then return n % 3 == 0 end
+    if betZone == "2to1_mid" then return n % 3 == 2 end
+    if betZone == "2to1_bot" then return n % 3 == 1 end
+    return false
+end
+
+local function isExtra(betZone, result)
+    local n = tonumber(result)
+    if not n then return false end
+    if betZone == "1to18" then return n >= 1 and n <= 18 end
+    if betZone == "19to36" then return n >= 19 and n <= 36 end
+    if betZone == "even" then return n % 2 == 0 end
+    if betZone == "odd" then return n % 2 == 1 end
+    return false
+end
+
+local function isColor(betZone, result)
+    if betZone == "red" and redNumbers[result] then return true end
+    if betZone == "black" and not redNumbers[result] and result ~= "0" and result ~= "00" then return true end
+    return false
+end
+
+local function getZoneMultiplier(zone)
+    if zone == "0" or zone == "00" or tonumber(zone) then
+        return 36
+    elseif zone == "1st12" or zone == "2nd12" or zone == "3rd12" then
+        return 3
+    elseif zone == "2to1_top" or zone == "2to1_mid" or zone == "2to1_bot" then
+        return 3
+    elseif zone == "1to18" or zone == "19to36"
+        or zone == "even" or zone == "odd"
+        or zone == "red" or zone == "black" then
+        return 2
+    end
+
+    return 1
+end
+
+local function getZoneMax(zone)
+    local mult = getZoneMultiplier(zone)
+
+    if mult == 36 then
+        return 1400
+    elseif mult == 3 then
+        return 17000
+    elseif mult == 2 then
+        return 25000
+    else
+        return 25000
+    end
+end
+
+local function betWon(betZone, spin)
+    if betZone == spin then
+        return true, 36
+    elseif betZone == "1st12" or betZone == "2nd12" or betZone == "3rd12" then
+        return isDozen(betZone, spin), 3
+    elseif betZone == "2to1_top" or betZone == "2to1_mid" or betZone == "2to1_bot" then
+        return isColumn(betZone, spin), 3
+    elseif betZone == "1to18" or betZone == "19to36"
+        or betZone == "even" or betZone == "odd"
+        or betZone == "red" or betZone == "black" then
+
+        return (isExtra(betZone, spin) or isColor(betZone, spin)), 2
+    end
+
+    return false, 0
+end
+
+local function getRouletteTextColor(number)
+    number = tostring(number)
+
+    if number == "0" or number == "00" then
+        return colors.lime
+    elseif redNumbers[number] then
+        return colors.red
+    else
+        return colors.black
+    end
+end
+
+-- =========================================================
+-- === Account Communication
+-- =========================================================
+
+local function requestBalance(player)
+    acquireAccountLock()
+
+    rednet.send(ACCOUNT_COMPUTER_ID, {
+        action = "get_balance",
+        player = player
+    }, ACCOUNT_PROTOCOL)
+
+    local id, msg = rednet.receive(ACCOUNT_PROTOCOL, 2)
+
+    releaseAccountLock()
+
+    if id == ACCOUNT_COMPUTER_ID and type(msg) == "table" and msg.player == player then
+        local bal = tonumber(msg.balance) or 0
+        balances[player] = bal
+        return bal
+    end
+
+    return balances[player] or 0
+end
+
+local function sendBalanceChange(player, delta, note)
+    acquireAccountLock()
+
+    rednet.send(ACCOUNT_COMPUTER_ID, {
+        action = "transfer",
+        player = player,
+        delta = delta,
+        note = note or "Roulette transfer"
+    }, ACCOUNT_PROTOCOL)
+
+    local id, msg = rednet.receive(ACCOUNT_PROTOCOL, 2)
+
+    releaseAccountLock()
+
+    if id == ACCOUNT_COMPUTER_ID and type(msg) == "table" and msg.player == player then
+        local bal = tonumber(msg.balance) or (balances[player] or 0)
+        balances[player] = bal
+        return bal
+    end
+
+    balances[player] = (balances[player] or 0) + delta
+    return balances[player]
+end
+
+local function sendAccountLog(player, note)
+    sendBalanceChange(player, 0, note)
+end
+
+-- =========================================================
+-- === Local Roulette Logs
+-- =========================================================
+
+local function logRoulette(player, text)
+    if not fs.exists("/roulette_logs") then fs.makeDir("/roulette_logs") end
+
+    local path = "/roulette_logs/" .. player .. ".txt"
+    local time = textutils.formatTime(os.time(), true)
+    local line = "[" .. time .. "] " .. text
+
+    local lines = {}
+
+    if fs.exists(path) then
+        local f = fs.open(path, "r")
+        while true do
+            local l = f.readLine()
+            if not l then break end
+            table.insert(lines, l)
+        end
+        f.close()
+    end
+
+    table.insert(lines, line)
+
+    while #lines > 500 do
+        table.remove(lines, 1)
+    end
+
+    local f = fs.open(path, "w")
+    for _, l in ipairs(lines) do
+        f.writeLine(l)
+    end
+    f.close()
+end
+
+-- =========================================================
+-- === Shared Bet Helpers
+-- =========================================================
+
+local function bettingOpen()
+    return roundState == "open" or roundState == "countdown"
+end
+
+local function autoRefundAllowed()
+    return roundState == "open"
+end
+
+local function getPlayerTotalBet(player)
+    local total = 0
+
+    if placedBets[player] then
+        for _, amt in pairs(placedBets[player]) do
+            total = total + amt
+        end
+    end
+
+    return total
+end
+
+local function getTotalTableBet()
+    local total = 0
+
+    for _, bets in pairs(placedBets) do
+        for _, amt in pairs(bets) do
+            total = total + amt
+        end
+    end
+
+    return total
+end
+
+local function getPlayerZoneBet(player, zone)
+    if placedBets[player] then
+        return placedBets[player][zone] or 0
+    end
+
+    return 0
+end
+
+local function getStationZoneBet(stationIndex, zone)
+    local total = 0
+
+    for player, bets in pairs(placedBets) do
+        if playerStationNumber[player] == stationIndex then
+            total = total + (bets[zone] or 0)
+        end
+    end
+
+    return total
+end
+
+local function getStationPayoutOnResult(stationIndex, result)
+    local payout = 0
+
+    for player, bets in pairs(placedBets) do
+        if playerStationNumber[player] == stationIndex then
+            for zone, amount in pairs(bets) do
+                local won, mult = betWon(zone, result)
+
+                if won then
+                    payout = payout + (amount * mult)
+                end
+            end
+        end
+    end
+
+    return payout
+end
+
+local function getMaxAllowedByPayoutCap(stationIndex, zone)
+    local maxAllowed = math.huge
+
+    for _, result in ipairs(ALL_ROULETTE_RESULTS) do
+        local won, mult = betWon(zone, result)
+
+        if won then
+            local currentPayout = getStationPayoutOnResult(stationIndex, result)
+            local remainingPayoutRoom = MAX_STATION_POSSIBLE_PAYOUT - currentPayout
+            local allowedHere = math.floor(remainingPayoutRoom / mult)
+
+            if allowedHere < maxAllowed then
+                maxAllowed = allowedHere
+            end
+        end
+    end
+
+    if maxAllowed == math.huge then
+        return 0
+    end
+
+    return math.max(0, maxAllowed)
+end
+
+local function getStationDisplayPlayer(station)
+    return station.activePlayer or station.lockedPlayer
+end
+
+local function setStationMessageForPlayer(player, msg)
+    local station = playerLastStation[player]
+
+    if station then
+        station.message = msg
+    end
+end
+
+local function refreshStationBalanceForPlayer(player)
+    local station = playerLastStation[player]
+
+    if station then
+        station.balance = balances[player] or requestBalance(player)
+    end
+end
+
+local function refundPlayerBets(player, reason)
+    local refund = getPlayerTotalBet(player)
+
+    if refund > 0 then
+        sendBalanceChange(player, refund, reason or "ROULETTE REFUND")
+        logRoulette(player, "REFUND $" .. refund .. " - " .. (reason or "refund"))
+
+        placedBets[player] = nil
+        betHistory[player] = nil
+        balances[player] = requestBalance(player)
+
+        setStationMessageForPlayer(player, "Auto-refunded $" .. refund)
+        refreshStationBalanceForPlayer(player)
+    end
+
+    return refund
+end
+
+local function clearAllBets()
+    placedBets = {}
+    betHistory = {}
+end
+
+local function clearStationLocks()
+    for _, station in ipairs(STATIONS) do
+        station.lockedPlayer = nil
+        station.selectedChip = nil
+    end
+end
+
+local function lockCurrentBettingPlayersToStations()
+    for _, station in ipairs(STATIONS) do
+        if station.activePlayer and getPlayerTotalBet(station.activePlayer) > 0 then
+            station.lockedPlayer = station.activePlayer
+            playerLastStation[station.activePlayer] = station
+            playerStationNumber[station.activePlayer] = station.index
+        end
+    end
+end
+
+-- =========================================================
+-- === Last Rolls
+-- =========================================================
+
+local function addLastRoll(number)
+    table.insert(lastRolls, 1, tostring(number))
+
+    while #lastRolls > MAX_LAST_ROLLS do
+        table.remove(lastRolls)
+    end
+
+    saveLastRolls()
+end
+
+local function drawSingleLastRollMonitor(mon)
+    local w, h = mon.getSize()
+
+    mon.setTextScale(3)
+    mon.setBackgroundColor(colors.lightBlue)
+    mon.clear()
+
+    local function centered(y, text, textColor)
+        text = tostring(text)
+        local x = math.max(1, math.floor((w - #text) / 2) + 1)
+
+        mon.setCursorPos(x, y)
+        mon.setBackgroundColor(colors.lightBlue)
+        mon.setTextColor(textColor)
+        mon.write(text)
+    end
+
+    for i = 1, math.min(#lastRolls, MAX_LAST_ROLLS) do
+        local num = tostring(lastRolls[i])
+        centered(i, num, getRouletteTextColor(num))
+    end
+end
+
+local function drawLastRollMonitors()
+    for _, station in ipairs(STATIONS) do
+        drawSingleLastRollMonitor(station.lastRollMonitor)
+    end
+end
+
+-- =========================================================
+-- === Lamp Wheel
+-- =========================================================
+
+local function visualRgb(r, g, b)
+    r = math.max(0, math.min(31, r))
+    g = math.max(0, math.min(31, g))
+    b = math.max(0, math.min(31, b))
+    return b + (g * 32) + (r * 1024)
+end
+
+local RGB = {
+    OFF = 0,
+
+    RED = visualRgb(31, 0, 0),
+    BLACK = visualRgb(7, 7, 7),
+    ZERO = visualRgb(10, 31, 0),
+    CORNER = visualRgb(0, 0, 31),
+
+    BALL = visualRgb(31, 31, 31),
+    TRAIL_1 = visualRgb(31, 20, 0),
+    TRAIL_2 = visualRgb(24, 10, 0),
+    TRAIL_3 = visualRgb(12, 5, 0),
+
+    RESULT = visualRgb(31, 31, 31)
+}
+
+local ALL_LAMPS = {}
+local RESULT_LAMPS = {}
+local LAMP_TO_NUMBER = {}
+local LAMPS = {}
+
+local numberIndex = 1
+
+for id = START_ID, END_ID do
+    local name = "colorful_lamp_" .. id
+    table.insert(ALL_LAMPS, name)
+
+    local lamp = peripheral.wrap(name)
+    if lamp then
+        LAMPS[name] = lamp
+    else
+        print("WARNING: could not wrap " .. name)
+    end
+
+    if not CORNER_LAMPS[name] then
+        local num = WHEEL_ORDER_BY_LAMP_ASC[numberIndex]
+        LAMP_TO_NUMBER[name] = num
+        table.insert(RESULT_LAMPS, name)
+        numberIndex = numberIndex + 1
+    end
+end
+
+if #RESULT_LAMPS ~= #WHEEL_ORDER_BY_LAMP_ASC then
+    error("Result lamp count mismatch. Lamps="
+        .. #RESULT_LAMPS .. " Numbers="
+        .. #WHEEL_ORDER_BY_LAMP_ASC)
+end
+
+local function setLampByName(name, color)
+    local lamp = LAMPS[name]
+    if not lamp then return end
+
+    if lamp.setLampColor then
+        lamp.setLampColor(color)
+    elseif lamp.setColor then
+        lamp.setColor(color)
+    elseif lamp.setColour then
+        lamp.setColour(color)
+    end
+end
+
+local function getBaseColor(lampName)
+    if CORNER_LAMPS[lampName] then
+        return RGB.CORNER
+    end
+
+    local num = LAMP_TO_NUMBER[lampName]
+
+    if num == "0" or num == "00" then
+        return RGB.ZERO
+    elseif redNumbers[num] then
+        return RGB.RED
+    else
+        return RGB.BLACK
+    end
+end
+
+local function drawBaseWheel()
+    for _, lampName in ipairs(ALL_LAMPS) do
+        setLampByName(lampName, getBaseColor(lampName))
+    end
+end
+
+local function prevIndex(i, max)
+    i = i - 1
+    if i < 1 then i = max end
+    return i
+end
+
+local function findIndex(list, value)
+    for i, v in ipairs(list) do
+        if v == value then return i end
+    end
+
+    return nil
+end
+
+local trailHistory = {}
+local currentAnimIndex = math.random(1, #ALL_LAMPS)
+
+local function resetTrail()
+    trailHistory = {}
+end
+
+local function pushTrail(index)
+    table.insert(trailHistory, 1, index)
+
+    while #trailHistory > 3 do
+        table.remove(trailHistory)
+    end
+end
+
+local function drawBall(currentIndex)
+    drawBaseWheel()
+
+    if trailHistory[3] then
+        setLampByName(ALL_LAMPS[trailHistory[3]], RGB.TRAIL_3)
+    end
+
+    if trailHistory[2] then
+        setLampByName(ALL_LAMPS[trailHistory[2]], RGB.TRAIL_2)
+    end
+
+    if trailHistory[1] then
+        setLampByName(ALL_LAMPS[trailHistory[1]], RGB.TRAIL_1)
+    end
+
+    setLampByName(ALL_LAMPS[currentIndex], RGB.BALL)
+end
+
+local function blinkResult(resultLamp)
+    local start = os.clock()
+
+    while os.clock() - start < RESULT_BLINK_SECONDS do
+        drawBaseWheel()
+        setLampByName(resultLamp, RGB.RESULT)
+        sleep(RESULT_BLINK_DELAY)
+
+        drawBaseWheel()
+        sleep(RESULT_BLINK_DELAY)
+    end
+
+    drawBaseWheel()
+    setLampByName(resultLamp, RGB.RESULT)
+end
+
+local debugCounts = {}
+
+local function debugRecordResult(result)
+    debugCounts[result] = (debugCounts[result] or 0) + 1
+
+    print("Result:", result, "Count:", debugCounts[result])
+
+    local total = 0
+    for _, c in pairs(debugCounts) do
+        total = total + c
+    end
+
+    if total % 20 == 0 then
+        print("---- Result counts after " .. total .. " spins ----")
+        for _, num in ipairs(WHEEL_ORDER_BY_LAMP_ASC) do
+            print(num .. ": " .. tostring(debugCounts[num] or 0))
+        end
+    end
+end
+
+local function performFinalSpinSlowdown()
+    resetTrail()
+
+    reseedRouletteRNG()
+    local resultNumberIndex = rouletteRandom(1, #RESULT_LAMPS)
+
+    local resultLamp = RESULT_LAMPS[resultNumberIndex]
+    local resultAnimIndex = findIndex(ALL_LAMPS, resultLamp)
+    local resultNumber = WHEEL_ORDER_BY_LAMP_ASC[resultNumberIndex]
+
+    debugRecordResult(resultNumber)
+
+    if not resultAnimIndex then
+        error("Could not find result lamp in ALL_LAMPS: " .. tostring(resultLamp))
+    end
+
+    local laps = 2
+    local distance = (currentAnimIndex - resultAnimIndex) % #ALL_LAMPS
+    local totalSteps = (laps * #ALL_LAMPS) + distance
+
+    local delays = {}
+    local rawTotal = 0
+
+    for step = 1, totalSteps do
+        local progress = step / totalSteps
+        local d = 0.01 + (progress * progress * progress * 0.14)
+
+        if totalSteps - step < 8 then
+            d = d + 0.045
+        end
+
+        delays[step] = d
+        rawTotal = rawTotal + d
+    end
+
+    local scale = SPIN_SETTLE_SECONDS / rawTotal
+
+    for step = 1, totalSteps do
+        pushTrail(currentAnimIndex)
+        currentAnimIndex = prevIndex(currentAnimIndex, #ALL_LAMPS)
+
+        drawBall(currentAnimIndex)
+
+        if step % 4 == 0 then
+            playAllSpinTick()
+        end
+
+        sleep(delays[step] * scale)
+    end
+
+    drawBaseWheel()
+    setLampByName(resultLamp, RGB.RESULT)
+    blinkResult(resultLamp)
+
+    return resultNumber
+end
+
+local spinRequest = false
+local spinFinished = false
+local spinResult = nil
+local spinError = nil
+local lampBusy = false
+local lastSpinSoundAt = nil
+
+local function runLocalSpin()
+    if lampBusy then
+        return nil, "Wheel already spinning"
+    end
+
+    spinRequest = true
+    spinFinished = false
+    spinResult = nil
+    spinError = nil
+
+    while not spinFinished do
+        sleep(0.05)
+    end
+
+    if spinError then
+        return nil, spinError
+    end
+
+    return spinResult, nil
+end
+
+local function lampAnimationLoop()
+    drawBaseWheel()
+
+    while true do
+        if spinRequest and not lampBusy then
+            lampBusy = true
+            spinRequest = false
+
+            local ok, resultOrErr = pcall(performFinalSpinSlowdown)
+
+            if ok then
+                spinResult = resultOrErr
+                spinError = nil
+            else
+                spinResult = nil
+                spinError = tostring(resultOrErr)
+            end
+
+            spinFinished = true
+            lampBusy = false
+            resetTrail()
+
+        else
+            if not lampBusy and roundState == "countdown" then
+                pushTrail(currentAnimIndex)
+                currentAnimIndex = prevIndex(currentAnimIndex, #ALL_LAMPS)
+                drawBall(currentAnimIndex)
+
+                if not lastSpinSoundAt or os.clock() - lastSpinSoundAt >= 0.14 then
+                    playAllSpinTick()
+                    lastSpinSoundAt = os.clock()
+                end
+
+                sleep(0.035)
+
+            elseif not lampBusy and roundState == "open" then
+                pushTrail(currentAnimIndex)
+                currentAnimIndex = prevIndex(currentAnimIndex, #ALL_LAMPS)
+                drawBall(currentAnimIndex)
+                sleep(0.18)
+
+            else
+                sleep(0.05)
+            end
+        end
+    end
+end
+
+-- =========================================================
+-- === Monitor Drawing: 114x114 2x3 Subpixel Frame
+-- =========================================================
+
+local FRAME_FILE = "frame.txt"
+
+local FRAME_COLOR = {
+    ["0"] = colors.white,
+    ["1"] = colors.orange,
+    ["2"] = colors.magenta,
+    ["3"] = colors.black,
+    ["4"] = colors.yellow,
+    ["5"] = colors.lime,
+    ["6"] = colors.pink,
+    ["7"] = colors.gray,
+    ["8"] = colors.lightGray,
+    ["9"] = colors.lightBlue,
+
+    a = colors.purple,
+    b = colors.gray,
+    c = DARK_BUTTON_BG,
+    d = colors.red,
+    e = colors.green,
+    f = colors.white
+}
+
+local BLIT_BY_COLOR = {
+    [colors.white] = "0",
+    [colors.orange] = "1",
+    [colors.magenta] = "2",
+    [colors.lightBlue] = "3",
+    [colors.yellow] = "4",
+    [colors.lime] = "5",
+    [colors.pink] = "6",
+    [colors.gray] = "7",
+    [colors.lightGray] = "8",
+    [colors.cyan] = "9",
+    [colors.purple] = "a",
+    [colors.blue] = "b",
+    [colors.brown] = "c",
+    [colors.green] = "d",
+    [colors.red] = "e",
+    [colors.black] = "f"
+}
+
+local function colorToBlit(color)
+    return BLIT_BY_COLOR[color or colors.white] or "0"
+end
+
+local function sixelChar(mask)
+    if mask > 31 then
+        return string.char(0x80 + (63 - mask)), true
+    end
+
+    return string.char(0x80 + mask), false
+end
+
+local function splitLines(text)
+    local lines = {}
+    text = tostring(text or ""):gsub("\r\n", "\n"):gsub("\r", "\n")
+
+    for line in (text .. "\n"):gmatch("(.-)\n") do
+        table.insert(lines, line)
+    end
+
+    while #lines > 0 and lines[#lines] == "" do
+        table.remove(lines)
+    end
+
+    return lines
+end
+
+local function loadSubpixelFrame(path)
+    local file = fs.open(path, "r")
+    if not file then
+        error("Could not open " .. path .. ". Save your 114x114 art as frame.txt on this computer.")
+    end
+
+    local raw = file.readAll()
+    file.close()
+
+    local lines = splitLines(raw)
+    if #lines < 2 then
+        error(path .. " is too short.")
+    end
+
+    local width, height = lines[1]:match("^(%d+)%s+(%d+)$")
+    width = tonumber(width)
+    height = tonumber(height)
+
+    if not width or not height then
+        error("First line of " .. path .. " must be like: 114 114")
+    end
+
+    if width % 2 ~= 0 or height % 3 ~= 0 then
+        error(path .. " must be sized for 2x3 packing. Got " .. width .. "x" .. height)
+    end
+
+    local grid = {}
+
+    for y = 1, height do
+        local row = lines[y + 1] or ""
+        if #row < width then
+            row = row .. string.rep("e", width - #row)
+        end
+
+        grid[y] = {}
+
+        for x = 1, width do
+            local ch = row:sub(x, x)
+            grid[y][x] = FRAME_COLOR[ch] or colors.green
+        end
+    end
+
+    return {
+        width = width,
+        height = height,
+        grid = grid
+    }
+end
+
+local backgroundFrame = loadSubpixelFrame(FRAME_FILE)
+
+local function drawPackedFrame(mon, frame)
+    local grid = frame.grid
+    local charW = math.floor(frame.width / 2)
+    local charH = math.floor(frame.height / 3)
+    local bitValues = {1, 2, 4, 8, 16, 32}
+
+    for cy = 1, charH do
+        local chars = {}
+        local fgs = {}
+        local bgs = {}
+
+        for cx = 1, charW do
+            local pts = {
+                grid[(cy - 1) * 3 + 1][(cx - 1) * 2 + 1],
+                grid[(cy - 1) * 3 + 1][(cx - 1) * 2 + 2],
+                grid[(cy - 1) * 3 + 2][(cx - 1) * 2 + 1],
+                grid[(cy - 1) * 3 + 2][(cx - 1) * 2 + 2],
+                grid[(cy - 1) * 3 + 3][(cx - 1) * 2 + 1],
+                grid[(cy - 1) * 3 + 3][(cx - 1) * 2 + 2],
+            }
+
+            local counts = {}
+            local ordered = {}
+
+            for i = 1, 6 do
+                local color = pts[i]
+                local key = tostring(color)
+
+                if not counts[key] then
+                    counts[key] = {
+                        color = color,
+                        count = 0,
+                        first = i
+                    }
+
+                    table.insert(ordered, counts[key])
+                end
+
+                counts[key].count = counts[key].count + 1
+            end
+
+            table.sort(ordered, function(a, b)
+                if a.count == b.count then
+                    return a.first < b.first
+                end
+
+                return a.count > b.count
+            end)
+
+            local bg = ordered[1].color
+            local fg = ordered[2] and ordered[2].color or bg
+
+            local mask = 0
+
+            if fg ~= bg then
+                for i = 1, 6 do
+                    if pts[i] == fg then
+                        mask = mask + bitValues[i]
+                    end
+                end
+            end
+
+            if mask == 0 then
+                table.insert(chars, " ")
+                table.insert(fgs, colorToBlit(bg))
+                table.insert(bgs, colorToBlit(bg))
+            else
+                local ch, inverted = sixelChar(mask)
+
+                table.insert(chars, ch)
+
+                if inverted then
+                    table.insert(fgs, colorToBlit(bg))
+                    table.insert(bgs, colorToBlit(fg))
+                else
+                    table.insert(fgs, colorToBlit(fg))
+                    table.insert(bgs, colorToBlit(bg))
+                end
+            end
+        end
+
+        mon.setCursorPos(1, cy)
+        mon.blit(table.concat(chars), table.concat(fgs), table.concat(bgs))
+    end
+end
+
+local function drawBackground(mon)
+    if mon.setPaletteColor then
+        pcall(function()
+            mon.setPaletteColor(DARK_BUTTON_BG, DARK_BUTTON_BG_HEX)
+        end)
+    end
+
+    mon.setBackgroundColor(colors.green)
+    mon.clear()
+    drawPackedFrame(mon, backgroundFrame)
+end
+
+-- =========================================================
+-- === Touch Hitboxes for frame.txt
+-- =========================================================
+
+local zoneRects = {}
+
+local function addRectZone(name, x1, y1, x2, y2)
+    table.insert(zoneRects, {
+        name = name,
+        x1 = x1,
+        y1 = y1,
+        x2 = x2,
+        y2 = y2
+    })
+
+    monitorHitboxes[name] = {
+        {
+            math.floor((x1 + x2) / 2),
+            math.floor((y1 + y2) / 2)
+        }
+    }
+end
+
+-- zero boxes
+addRectZone("0", 2, 7, 5, 12)
+addRectZone("00", 2, 13, 5, 18)
+
+-- main number grid
+local topRow = {3, 6, 9, 12, 15, 18, 21, 24, 27, 30, 33, 36}
+local midRow = {2, 5, 8, 11, 14, 17, 20, 23, 26, 29, 32, 35}
+local botRow = {1, 4, 7, 10, 13, 16, 19, 22, 25, 28, 31, 34}
+
+local function addNumberRow(nums, y1, y2)
+    for i, n in ipairs(nums) do
+        local x1 = 5 + ((i - 1) * 4)
+        addRectZone(tostring(n), x1, y1, x1 + 3, y2)
+    end
+end
+
+addNumberRow(topRow, 7, 12)
+addNumberRow(midRow, 13, 18)
+addNumberRow(botRow, 19, 23)
+
+-- right column bets
+addRectZone("2to1_top", 53, 7, 57, 12)
+addRectZone("2to1_mid", 53, 13, 57, 18)
+addRectZone("2to1_bot", 53, 19, 57, 23)
+
+-- dozens
+addRectZone("1st12", 5, 24, 21, 27)
+addRectZone("2nd12", 22, 24, 37, 27)
+addRectZone("3rd12", 38, 24, 53, 27)
+
+-- outside bets
+addRectZone("1to18", 2, 28, 11, 31)
+addRectZone("even", 12, 28, 21, 31)
+addRectZone("red", 22, 28, 29, 31)
+addRectZone("black", 30, 28, 37, 31)
+addRectZone("odd", 38, 28, 45, 31)
+addRectZone("19to36", 46, 28, 57, 31)
+
+-- chips
+addRectZone("chip_100", 25, 32, 29, 34)
+addRectZone("chip_500", 31, 32, 35, 34)
+addRectZone("chip_1000", 37, 32, 43, 34)
+addRectZone("chip_2500", 46, 32, 56, 34)
+
+-- controls
+addRectZone("clear", 22, 35, 32, 38)
+addRectZone("undo", 34, 35, 43, 38)
+addRectZone("spin", 45, 35, 57, 38)
+
+local function getZoneAt(x, y)
+    for _, zone in ipairs(zoneRects) do
+        if x >= zone.x1
+            and x <= zone.x2
+            and y >= zone.y1
+            and y <= zone.y2 then
+
+            return zone.name
+        end
+    end
+
+    return nil
+end
+
+-- Static labels/numbers are part of frame.txt now.
+local function drawBoardLabels(mon)
+end
+
+-- =========================================================
+-- === Countdown / Dynamic Overlay
+-- =========================================================
+
+local function getCountdownText(station)
+    if roundState == "countdown" and countdownEndsAt then
+        local remaining = math.max(0, math.ceil(countdownEndsAt - os.clock()))
+        return "SPIN IN: " .. remaining
+
+    elseif roundState == "spinning" then
+        return "NO MORE BETS - SPINNING"
+
+    elseif roundState == "payout" then
+        if station and station.message and station.message:match("^Result") then
+            return station.message
+        end
+
+        if lastResult then
+            return "RESULT: " .. tostring(lastResult)
+        end
+
+        return "RESULT"
+
+    else
+        return tableMessage or "Bets open"
+    end
+end
+
+local function formatBetAmount(amount)
+    return tostring(math.floor((amount or 0) / 100))
+end
+
+local function drawSingleStationBet(mon, x, y, stationIndex, amount)
+    if not amount or amount <= 0 then return end
+
+    local colorData = STATION_CHIP_COLORS[stationIndex]
+    local textColor = colorData and colorData.slot or colors.white
+    local text = formatBetAmount(amount)
+
+    mon.setCursorPos(x, y)
+    mon.setBackgroundColor(colors.black)
+    mon.setTextColor(textColor)
+    mon.write(text)
+end
+
+local function drawBetTotals(mon, viewingStation)
+    local viewingIndex = viewingStation and viewingStation.index or nil
+    local stackOffsets = {0, 2, 3}
+
+    for zone, positions in pairs(monitorHitboxes) do
+        if not zone:match("chip_") and zone ~= "clear" and zone ~= "spin" then
+            local center = positions[1]
+
+            if center then
+                local stationAmounts = {}
+                local hasAny = false
+
+                for i = 1, #STATIONS do
+                    local amt = getStationZoneBet(i, zone)
+                    stationAmounts[i] = amt
+
+                    if amt > 0 then
+                        hasAny = true
+                    end
+                end
+
+                if hasAny then
+                    local displayOrder = {}
+
+                    if viewingIndex and stationAmounts[viewingIndex] and stationAmounts[viewingIndex] > 0 then
+                        table.insert(displayOrder, viewingIndex)
+                    end
+
+                    for i = 1, #STATIONS do
+                        if i ~= viewingIndex and stationAmounts[i] and stationAmounts[i] > 0 then
+                            table.insert(displayOrder, i)
+                        end
+                    end
+
+                    for displaySlot, stationIndex in ipairs(displayOrder) do
+                        local offset = stackOffsets[displaySlot] or (displaySlot + 1)
+                        local amount = stationAmounts[stationIndex]
+
+                        drawSingleStationBet(
+                            mon,
+                            center[1],
+                            center[2] + offset,
+                            stationIndex,
+                            amount
+                        )
+                    end
+                end
+            end
+        end
+    end
+end
+
+local function writeClipped(mon, x, y, text, textColor, bgColor, maxWidth)
+    text = tostring(text or "")
+
+    if #text > maxWidth then
+        text = text:sub(1, maxWidth)
+    end
+
+    mon.setCursorPos(x, y)
+    mon.setBackgroundColor(bgColor or colors.black)
+    mon.setTextColor(textColor or colors.white)
+    mon.write(text .. string.rep(" ", math.max(0, maxWidth - #text)))
+end
+
+local function drawStation(station)
+    local mon = station.monitor
+    local displayPlayer = getStationDisplayPlayer(station)
+
+    drawBackground(mon)
+
+    -- Keep dynamic status tucked into the lower-left so it does not fight the table hitboxes.
+    writeClipped(mon, 2, 34, getCountdownText(station), colors.orange, colors.black, 20)
+
+    if displayPlayer then
+        local bal = balances[displayPlayer] or station.balance or 0
+        writeClipped(mon, 2, 35, "Bal: $" .. tostring(bal), colors.yellow, colors.green, 20)
+
+        local chipText = station.selectedChip and ("Chip $" .. station.selectedChip) or "Select chip"
+        writeClipped(mon, 2, 36, tostring(displayPlayer), colors.white, colors.black, 20)
+        writeClipped(mon, 2, 37, chipText, colors.white, colors.black, 20)
+    else
+        writeClipped(mon, 2, 35, "Stand at table", colors.yellow, colors.green, 20)
+        writeClipped(mon, 2, 36, "No player", colors.white, colors.black, 20)
+        writeClipped(mon, 2, 37, "Select station", colors.white, colors.black, 20)
+    end
+
+    writeClipped(mon, 2, 38, station.message or "", colors.yellow, colors.black, 20)
+
+    drawBetTotals(mon, station)
+end
+
+-- =========================================================
+-- === Radar / Player Detection
+-- =========================================================
+
+local function scanStation(station)
+    local players = station.radar.getPlayers()
+    local valid = {}
+    local present = {}
+
+    for _, p in ipairs(players) do
+        if p.distance <= MAX_DISTANCE then
+            present[p.name] = true
+        end
+
+        if p.distance >= MIN_DISTANCE and p.distance <= MAX_DISTANCE then
+            table.insert(valid, p)
+        end
+    end
+
+    table.sort(valid, function(a, b)
+        return a.distance < b.distance
+    end)
+
+    if #valid == 1 then
+        return valid[1].name, "", present
+    elseif #valid > 1 then
+        return nil, "Too many players!", present
+    else
+        return nil, "", present
+    end
+end
+
+local function getAllPresentPlayers()
+    local present = {}
+
+    for _, station in ipairs(STATIONS) do
+        local _, _, stationPresent = scanStation(station)
+
+        for player in pairs(stationPresent) do
+            present[player] = true
+        end
+    end
+
+    return present
+end
+
+local function autoRefundLeftPlayers()
+    if not autoRefundAllowed() then return end
+
+    local present = getAllPresentPlayers()
+
+    for player in pairs(placedBets) do
+        if not present[player] then
+            refundPlayerBets(player, "ROULETTE AUTO-REFUND: left table before spin")
+        end
+    end
+end
+
+-- =========================================================
+-- === Round Logic
+-- =========================================================
+
+local function payAllPlayers(result)
+    for player, bets in pairs(placedBets) do
+        local totalPayout = 0
+        local totalLost = 0
+
+        for zone, amount in pairs(bets) do
+            local won, mult = betWon(zone, result)
+
+            if won then
+                local payout = amount * mult
+                totalPayout = totalPayout + payout
+
+                local msg = "ROULETTE RESULT: WIN - bet $" .. amount
+                    .. " on " .. zone
+                    .. ", landed " .. result
+                    .. ", payout $" .. payout
+
+                logRoulette(player, msg)
+                sendAccountLog(player, msg)
+            else
+                totalLost = totalLost + amount
+
+                local msg = "ROULETTE RESULT: LOSS - bet $" .. amount
+                    .. " on " .. zone
+                    .. ", landed " .. result
+
+                logRoulette(player, msg)
+                sendAccountLog(player, msg)
+            end
+        end
+
+        local station = getStationForPlayer(player)
+
+        if totalPayout > 0 then
+            local resultMsg = "Result " .. result .. ": paying $" .. totalPayout
+            setStationMessageForPlayer(player, resultMsg)
+
+            if station then
+                station.message = resultMsg
+            end
+
+            playStationWinSound(station)
+
+            sendBalanceChange(
+                player,
+                totalPayout,
+                "ROULETTE WIN PAYOUT: $" .. totalPayout .. ", landed " .. result
+            )
+
+            balances[player] = requestBalance(player)
+        else
+            local resultMsg = "Result " .. result .. ": lost $" .. totalLost
+            setStationMessageForPlayer(player, resultMsg)
+
+            if station then
+                station.message = resultMsg
+            end
+
+            playStationLoseSound(station)
+        end
+
+        refreshStationBalanceForPlayer(player)
+    end
+end
+
+local function startCountdown(player, station)
+    if roundState == "open" then
+        lockCurrentBettingPlayersToStations()
+
+        if station and player then
+            station.lockedPlayer = player
+            playerLastStation[player] = station
+            playerStationNumber[player] = station.index
+        end
+
+        roundState = "countdown"
+        countdownEndsAt = os.clock() + COUNTDOWN_SECONDS
+        tableMessage = "Spin countdown started"
+
+    elseif roundState == "countdown" then
+        if station then
+            station.message = "Spin already starting!"
+        end
+    else
+        if station then
+            station.message = "Wheel is locked."
+        end
+    end
+end
+
+local function roundLoop()
+    while true do
+        if roundState == "countdown" and countdownEndsAt and os.clock() >= countdownEndsAt then
+            lockCurrentBettingPlayersToStations()
+
+            roundState = "spinning"
+            tableMessage = "No more bets!"
+
+            local result, err = runLocalSpin()
+
+            if result then
+                lastResult = tostring(result)
+                addLastRoll(lastResult)
+
+                roundState = "payout"
+                tableMessage = "Result: " .. lastResult
+
+                payAllPlayers(lastResult)
+                sleep(RESULT_DISPLAY_SECONDS)
+
+                clearAllBets()
+                tableMessage = "Bets open"
+                lastResult = nil
+                countdownEndsAt = nil
+
+                sleep(RESET_DELAY_SECONDS)
+
+                roundState = "open"
+                clearStationLocks()
+            else
+                tableMessage = err or "Spin failed - refunding"
+
+                for player in pairs(placedBets) do
+                    refundPlayerBets(player, "ROULETTE REFUND: spin failed")
+                end
+
+                clearAllBets()
+                lastResult = nil
+                countdownEndsAt = nil
+                roundState = "open"
+                clearStationLocks()
+            end
+        end
+
+        sleep(0.1)
+    end
+end
+
+-- =========================================================
+-- === Touch Handling
+-- =========================================================
+
+local function findStationByMonitorName(name)
+    for _, station in ipairs(STATIONS) do
+        if station.monitorName == name then
+            return station
+        end
+
+        if station.touchAliases then
+            for _, alias in ipairs(station.touchAliases) do
+                if alias == name then
+                    return station
+                end
+            end
+        end
+    end
+
+    return nil
+end
+
+local function placeBet(station, zone)
+    if not station.activePlayer then return end
+
+    if not bettingOpen() then
+        station.message = "Bets are locked."
+        return
+    end
+
+    if not station.selectedChip then
+        station.message = "Select a chip first."
+        return
+    end
+
+    local player = station.activePlayer
+    local chip = station.selectedChip
+    local balance = balances[player] or station.balance or 0
+
+    if balance < chip then
+        station.message = "Not enough balance."
+        return
+    end
+
+    local stationIndex = station.index
+
+    local zoneMax = getZoneMax(zone)
+    local stationZoneCurrent = getStationZoneBet(stationIndex, zone)
+    local zoneAvailable = math.max(0, zoneMax - stationZoneCurrent)
+
+    local payoutCapAvailable = getMaxAllowedByPayoutCap(stationIndex, zone)
+
+    local allowable = math.min(chip, zoneAvailable, payoutCapAvailable)
+
+    if allowable <= 0 then
+        if zoneAvailable <= 0 then
+            station.message = "Your zone max reached."
+        elseif payoutCapAvailable <= 0 then
+            station.message = "Max payout reached."
+        else
+            station.message = "No more allowed here."
+        end
+        return
+    end
+
+    local newBal = sendBalanceChange(
+        player,
+        -allowable,
+        "ROULETTE BET: $" .. allowable .. " on " .. zone
+    )
+
+    balances[player] = newBal
+    station.balance = newBal
+
+    placedBets[player] = placedBets[player] or {}
+    placedBets[player][zone] = (placedBets[player][zone] or 0) + allowable
+
+    betHistory[player] = betHistory[player] or {}
+    table.insert(betHistory[player], {
+        zone = zone,
+        amount = allowable
+    })
+
+    playerLastStation[player] = station
+    playerStationNumber[player] = station.index
+
+    if roundState == "countdown" then
+        station.lockedPlayer = player
+    end
+
+    logRoulette(player, "BET: $" .. allowable .. " on " .. zone)
+
+    if allowable < chip then
+        station.message = "Only $" .. allowable .. " allowed."
+    else
+        station.message = "Placed $" .. allowable .. " on " .. zone
+    end
+end
+
+local function undoLastBet(station)
+    if not station.activePlayer then return end
+
+    if roundState ~= "open" then
+        station.message = "Bets are locked."
+        return
+    end
+
+    local player = station.activePlayer
+    local history = betHistory[player]
+
+    if not history or #history <= 0 then
+        station.message = "No bet to undo."
+        return
+    end
+
+    local lastBet = table.remove(history)
+    local zone = lastBet.zone
+    local amount = lastBet.amount or 0
+
+    if amount <= 0 or not zone then
+        station.message = "Undo failed."
+        return
+    end
+
+    if placedBets[player] and placedBets[player][zone] then
+        placedBets[player][zone] = placedBets[player][zone] - amount
+
+        if placedBets[player][zone] <= 0 then
+            placedBets[player][zone] = nil
+        end
+
+        local hasAny = false
+        for _, amt in pairs(placedBets[player]) do
+            if amt and amt > 0 then
+                hasAny = true
+                break
+            end
+        end
+
+        if not hasAny then
+            placedBets[player] = nil
+        end
+    end
+
+    if #history <= 0 then
+        betHistory[player] = nil
+    end
+
+    local newBal = sendBalanceChange(
+        player,
+        amount,
+        "ROULETTE UNDO BET: refunded $" .. amount .. " from " .. zone
+    )
+
+    balances[player] = newBal
+    station.balance = newBal
+
+    logRoulette(player, "UNDO BET: refunded $" .. amount .. " from " .. zone)
+
+    station.message = "Undid $" .. amount .. " on " .. zone
+end
+
+local function clearPlayerBets(station)
+    if not station.activePlayer then return end
+
+    if not bettingOpen() then
+        station.message = "Bets are locked."
+        return
+    end
+
+    if roundState == "countdown" then
+        station.message = "Spin started. Bets locked in."
+        return
+    end
+
+    local player = station.activePlayer
+    local refund = refundPlayerBets(player, "ROULETTE REFUND: cleared bets")
+    betHistory[player] = nil
+
+    if refund > 0 then
+        station.balance = balances[station.activePlayer] or requestBalance(station.activePlayer)
+        station.message = "Refunded $" .. refund
+    else
+        station.message = "No bets to clear."
+    end
+end
+
+local function handleStationTouch(station, x, y)
+    if not station.activePlayer then
+        station.message = "Stand at this station."
+        return
+    end
+
+    playerLastStation[station.activePlayer] = station
+    playerStationNumber[station.activePlayer] = station.index
+
+    local zone = getZoneAt(x, y)
+    if not zone then return end
+
+    if zone:match("chip_") then
+        local val = tonumber(zone:match("chip_(%d+)"))
+
+        if val and (balances[station.activePlayer] or 0) >= val then
+            station.selectedChip = val
+            station.message = "Selected chip $" .. val
+        else
+            station.message = "Not enough for $" .. tostring(val or "?")
+        end
+
+    elseif zone == "clear" then
+        clearPlayerBets(station)
+
+    elseif zone == "undo" then
+        undoLastBet(station)
+
+    elseif zone == "spin" then
+        if getTotalTableBet() <= 0 then
+            station.message = "No bets on table."
+        else
+            startCountdown(station.activePlayer, station)
+            station.message = "Spin countdown started."
+        end
+
+    else
+        placeBet(station, zone)
+    end
+end
+
+local function touchLoop()
+    while true do
+        local _, monitorName, x, y = os.pullEvent("monitor_touch")
+        local station = findStationByMonitorName(monitorName)
+
+        if station then
+            handleStationTouch(station, x, y)
+        else
+            print("Unmatched monitor_touch from: " .. tostring(monitorName) .. " at " .. x .. "," .. y)
+        end
+
+        sleep(0.05)
+    end
+end
+
+-- =========================================================
+-- === Main Loops
+-- =========================================================
+
+local function radarLoop()
+    while true do
+        for _, station in ipairs(STATIONS) do
+            local player, status = scanStation(station)
+
+            if player then
+                playerLastStation[player] = station
+                playerStationNumber[player] = station.index
+
+                if station.activePlayer ~= player then
+                    station.activePlayer = player
+                    station.lastPlayer = player
+                    station.balance = requestBalance(player)
+                    balances[player] = station.balance
+                    station.selectedChip = nil
+
+                    if not station.lockedPlayer then
+                        station.message = "Welcome, " .. player
+                    end
+                else
+                    station.balance = balances[player] or requestBalance(player)
+                end
+            else
+                station.activePlayer = nil
+
+                if not station.lockedPlayer then
+                    station.balance = 0
+                    station.selectedChip = nil
+
+                    if status and status ~= "" then
+                        station.message = status
+                    end
+                end
+            end
+        end
+
+        autoRefundLeftPlayers()
+
+        sleep(0.75)
+    end
+end
+
+local function displayLoop()
+    while true do
+        for _, station in ipairs(STATIONS) do
+            drawStation(station)
+        end
+
+        drawLastRollMonitors()
+
+        sleep(0.18)
+    end
+end
+
+-- =========================================================
+-- === Startup
+-- =========================================================
+
+local startupSeed = 0
+
+if os.epoch then
+    startupSeed = startupSeed + (os.epoch("utc") or 0)
+end
+
+startupSeed = startupSeed
+    + math.floor((os.clock() or 0) * 1000000)
+    + math.floor((os.time() or 0) * 100000)
+    + ((os.getComputerID() or 0) * 7919)
+
+startupSeed = startupSeed % 2147483647
+
+math.randomseed(startupSeed)
+
+for i = 1, 50 do
+    math.random()
+end
+
+print("Startup RNG seed:", startupSeed)
+
+print("Multiplayer roulette controller starting...")
+print("Computer ID: " .. os.getComputerID())
+print("Account computer: " .. ACCOUNT_COMPUTER_ID)
+print("Stations:")
+
+for _, station in ipairs(STATIONS) do
+    print("  " .. station.name .. ": "
+        .. station.monitorName .. " / "
+        .. station.radarName .. " / "
+        .. station.lastRollMonitorName .. " / "
+        .. tostring(station.speakerName))
+
+    if station.speaker then
+        print("    Speaker found.")
+        playStartupSound(station)
+        sleep(0.1)
+    else
+        print("    Speaker MISSING.")
+    end
+end
+
+print("Station chip colors:")
+for i, colorData in pairs(STATION_CHIP_COLORS) do
+    print("  Station " .. i .. " color slot: " .. tostring(colorData.slot) .. " hex: " .. string.format("#%06X", colorData.hex))
+end
+
+print("Station 1 touch aliases: monitor_622, top")
+print("Per-station max possible payout:", MAX_STATION_POSSIBLE_PAYOUT)
+print("Subpixel frame UI enabled: frame.txt")
+print("Frame hitboxes embedded in this file.")
+print("Dark button background enabled: #178530")
+print("Result lamps: " .. #RESULT_LAMPS)
+print("Animation lamps: " .. #ALL_LAMPS)
+print("Countdown: " .. COUNTDOWN_SECONDS .. "s")
+print("Slowdown duration after lock: " .. SPIN_SETTLE_SECONDS .. "s")
+print("Last rolls loaded: " .. #lastRolls)
+print("Last rolls file: " .. LAST_ROLLS_FILE)
+print("Better RNG enabled.")
+print("")
+
+drawBaseWheel()
+drawLastRollMonitors()
+
+parallel.waitForAny(
+    radarLoop,
+    displayLoop,
+    touchLoop,
+    lampAnimationLoop,
+    roundLoop
+)
