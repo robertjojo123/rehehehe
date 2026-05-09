@@ -1,0 +1,470 @@
+-- roulette_hitbox_tester.lua
+-- Put this file beside your 114x114 frame.txt.
+-- It renders frame.txt, draws optional hitbox outlines, and prints/touches coords.
+-- Monitor touch coords are normal monitor coords: 57 wide x 38 tall at textScale 0.5.
+
+-- =========================================================
+-- === CONFIG
+-- =========================================================
+
+local FRAME_FILE = "frame.txt"
+local MONITOR_NAME = nil -- nil = first monitor found. Or set "monitor_622", etc.
+
+local SHOW_HITBOXES = true
+local SHOW_ZONE_NAMES_IN_TERMINAL = true
+local CLEAR_TERMINAL_ON_START = true
+
+-- If true, it redraws the background + hitboxes after every click.
+local REDRAW_AFTER_CLICK = true
+
+-- Overlay colors. These sit on top of your frame art.
+local HITBOX_BORDER_COLOR = colors.yellow
+local HITBOX_TEXT_COLOR = colors.white
+local HITBOX_FILL_COLOR = colors.gray
+
+-- This is the same current hitbox set from the new roulette UI file.
+-- x/y are monitor character coords, not 114x114 subpixels.
+-- Format: {x1, y1, x2, y2}
+local HITBOXES = {
+    -- Zero boxes
+    ["0"] = {2, 7, 5, 12},
+    ["00"] = {2, 13, 5, 18},
+
+    -- Main number grid
+    ["3"]  = {5, 7, 8, 12},
+    ["6"]  = {9, 7, 12, 12},
+    ["9"]  = {13, 7, 16, 12},
+    ["12"] = {17, 7, 20, 12},
+    ["15"] = {21, 7, 24, 12},
+    ["18"] = {25, 7, 28, 12},
+    ["21"] = {29, 7, 32, 12},
+    ["24"] = {33, 7, 36, 12},
+    ["27"] = {37, 7, 40, 12},
+    ["30"] = {41, 7, 44, 12},
+    ["33"] = {45, 7, 48, 12},
+    ["36"] = {49, 7, 52, 12},
+
+    ["2"]  = {5, 13, 8, 18},
+    ["5"]  = {9, 13, 12, 18},
+    ["8"]  = {13, 13, 16, 18},
+    ["11"] = {17, 13, 20, 18},
+    ["14"] = {21, 13, 24, 18},
+    ["17"] = {25, 13, 28, 18},
+    ["20"] = {29, 13, 32, 18},
+    ["23"] = {33, 13, 36, 18},
+    ["26"] = {37, 13, 40, 18},
+    ["29"] = {41, 13, 44, 18},
+    ["32"] = {45, 13, 48, 18},
+    ["35"] = {49, 13, 52, 18},
+
+    ["1"]  = {5, 19, 8, 23},
+    ["4"]  = {9, 19, 12, 23},
+    ["7"]  = {13, 19, 16, 23},
+    ["10"] = {17, 19, 20, 23},
+    ["13"] = {21, 19, 24, 23},
+    ["16"] = {25, 19, 28, 23},
+    ["19"] = {29, 19, 32, 23},
+    ["22"] = {33, 19, 36, 23},
+    ["25"] = {37, 19, 40, 23},
+    ["28"] = {41, 19, 44, 23},
+    ["31"] = {45, 19, 48, 23},
+    ["34"] = {49, 19, 52, 23},
+
+    -- Right column bets
+    ["2to1_top"] = {53, 7, 57, 12},
+    ["2to1_mid"] = {53, 13, 57, 18},
+    ["2to1_bot"] = {53, 19, 57, 23},
+
+    -- Dozens
+    ["1st12"] = {5, 24, 21, 27},
+    ["2nd12"] = {22, 24, 37, 27},
+    ["3rd12"] = {38, 24, 53, 27},
+
+    -- Outside bets
+    ["1to18"] = {2, 28, 11, 31},
+    ["even"] = {12, 28, 21, 31},
+    ["red"] = {22, 28, 29, 31},
+    ["black"] = {30, 28, 37, 31},
+    ["odd"] = {38, 28, 45, 31},
+    ["19to36"] = {46, 28, 57, 31},
+
+    -- Chips
+    ["chip_100"] = {25, 32, 29, 34},
+    ["chip_500"] = {31, 32, 35, 34},
+    ["chip_1000"] = {37, 32, 43, 34},
+    ["chip_2500"] = {46, 32, 56, 34},
+
+    -- Controls
+    ["clear"] = {22, 35, 32, 38},
+    ["undo"] = {34, 35, 43, 38},
+    ["spin"] = {45, 35, 57, 38},
+}
+
+-- Put any new test zones here while you map them.
+-- Example:
+-- EXTRA_HITBOXES["street_1_2_3"] = {5, 18, 8, 19}
+local EXTRA_HITBOXES = {
+}
+
+-- =========================================================
+-- === MONITOR / FRAME RENDERER
+-- =========================================================
+
+local function getMonitor()
+    if MONITOR_NAME and peripheral.isPresent(MONITOR_NAME) then
+        return peripheral.wrap(MONITOR_NAME), MONITOR_NAME
+    end
+
+    local name = peripheral.find("monitor")
+    if not name then
+        error("No monitor found")
+    end
+
+    if type(name) == "string" then
+        return peripheral.wrap(name), name
+    end
+
+    return name, peripheral.getName(name)
+end
+
+local mon, monName = getMonitor()
+mon.setTextScale(0.5)
+
+local FRAME_COLOR = {
+    ["0"] = colors.white,
+    ["1"] = colors.orange,
+    ["2"] = colors.magenta,
+    ["3"] = colors.black,
+    ["4"] = colors.yellow,
+    ["5"] = colors.lime,
+    ["6"] = colors.pink,
+    ["7"] = colors.gray,
+    ["8"] = colors.lightGray,
+    ["9"] = colors.lightBlue,
+    a = colors.purple,
+    b = colors.gray,
+    c = colors.brown,
+    d = colors.red,
+    e = colors.green,
+    f = colors.white
+}
+
+local BLIT_BY_COLOR = {
+    [colors.white] = "0",
+    [colors.orange] = "1",
+    [colors.magenta] = "2",
+    [colors.lightBlue] = "3",
+    [colors.yellow] = "4",
+    [colors.lime] = "5",
+    [colors.pink] = "6",
+    [colors.gray] = "7",
+    [colors.lightGray] = "8",
+    [colors.cyan] = "9",
+    [colors.purple] = "a",
+    [colors.blue] = "b",
+    [colors.brown] = "c",
+    [colors.green] = "d",
+    [colors.red] = "e",
+    [colors.black] = "f"
+}
+
+local function colorToBlit(color)
+    return BLIT_BY_COLOR[color or colors.white] or "0"
+end
+
+local function sixelChar(mask)
+    if mask > 31 then
+        return string.char(0x80 + (63 - mask)), true
+    end
+    return string.char(0x80 + mask), false
+end
+
+local function splitLines(text)
+    local lines = {}
+    text = tostring(text or ""):gsub("\r\n", "\n"):gsub("\r", "\n")
+    for line in (text .. "\n"):gmatch("(.-)\n") do
+        table.insert(lines, line)
+    end
+    while #lines > 0 and lines[#lines] == "" do
+        table.remove(lines)
+    end
+    return lines
+end
+
+local function loadSubpixelFrame(path)
+    local file = fs.open(path, "r")
+    if not file then
+        error("Could not open " .. path)
+    end
+
+    local raw = file.readAll()
+    file.close()
+
+    local lines = splitLines(raw)
+    local width, height = lines[1]:match("^(%d+)%s+(%d+)$")
+    width = tonumber(width)
+    height = tonumber(height)
+
+    if not width or not height then
+        error("First line of " .. path .. " must be width height, example: 114 114")
+    end
+
+    local grid = {}
+    for y = 1, height do
+        local row = lines[y + 1] or ""
+        if #row < width then
+            row = row .. string.rep("e", width - #row)
+        end
+
+        grid[y] = {}
+        for x = 1, width do
+            local ch = row:sub(x, x)
+            grid[y][x] = FRAME_COLOR[ch] or colors.green
+        end
+    end
+
+    return {
+        width = width,
+        height = height,
+        grid = grid
+    }
+end
+
+local frame = loadSubpixelFrame(FRAME_FILE)
+
+local function drawPackedFrame()
+    local grid = frame.grid
+    local charW = math.floor(frame.width / 2)
+    local charH = math.floor(frame.height / 3)
+    local bitValues = {1, 2, 4, 8, 16, 32}
+
+    for cy = 1, charH do
+        local chars = {}
+        local fgs = {}
+        local bgs = {}
+
+        for cx = 1, charW do
+            local pts = {
+                grid[(cy - 1) * 3 + 1][(cx - 1) * 2 + 1],
+                grid[(cy - 1) * 3 + 1][(cx - 1) * 2 + 2],
+                grid[(cy - 1) * 3 + 2][(cx - 1) * 2 + 1],
+                grid[(cy - 1) * 3 + 2][(cx - 1) * 2 + 2],
+                grid[(cy - 1) * 3 + 3][(cx - 1) * 2 + 1],
+                grid[(cy - 1) * 3 + 3][(cx - 1) * 2 + 2],
+            }
+
+            local counts = {}
+            local ordered = {}
+
+            for i = 1, 6 do
+                local color = pts[i]
+                local key = tostring(color)
+                if not counts[key] then
+                    counts[key] = {color = color, count = 0, first = i}
+                    table.insert(ordered, counts[key])
+                end
+                counts[key].count = counts[key].count + 1
+            end
+
+            table.sort(ordered, function(a, b)
+                if a.count == b.count then return a.first < b.first end
+                return a.count > b.count
+            end)
+
+            local bg = ordered[1].color
+            local fg = ordered[2] and ordered[2].color or bg
+
+            local mask = 0
+            if fg ~= bg then
+                for i = 1, 6 do
+                    if pts[i] == fg then
+                        mask = mask + bitValues[i]
+                    end
+                end
+            end
+
+            if mask == 0 then
+                table.insert(chars, " ")
+                table.insert(fgs, colorToBlit(bg))
+                table.insert(bgs, colorToBlit(bg))
+            else
+                local ch, inverted = sixelChar(mask)
+                table.insert(chars, ch)
+                if inverted then
+                    table.insert(fgs, colorToBlit(bg))
+                    table.insert(bgs, colorToBlit(fg))
+                else
+                    table.insert(fgs, colorToBlit(fg))
+                    table.insert(bgs, colorToBlit(bg))
+                end
+            end
+        end
+
+        mon.setCursorPos(1, cy)
+        mon.blit(table.concat(chars), table.concat(fgs), table.concat(bgs))
+    end
+end
+
+-- =========================================================
+-- === HITBOX DRAWING / TESTING
+-- =========================================================
+
+local function mergeHitboxes()
+    local merged = {}
+    for name, box in pairs(HITBOXES) do
+        merged[name] = box
+    end
+    for name, box in pairs(EXTRA_HITBOXES) do
+        merged[name] = box
+    end
+    return merged
+end
+
+local function zoneAt(x, y)
+    local all = mergeHitboxes()
+
+    -- Prefer extra hitboxes over built-in if overlapping.
+    for name, box in pairs(EXTRA_HITBOXES) do
+        if x >= box[1] and x <= box[3] and y >= box[2] and y <= box[4] then
+            return name
+        end
+    end
+
+    for name, box in pairs(HITBOXES) do
+        if x >= box[1] and x <= box[3] and y >= box[2] and y <= box[4] then
+            return name
+        end
+    end
+
+    return nil
+end
+
+local function writeAt(x, y, text, fg, bg)
+    local w, h = mon.getSize()
+    if x < 1 or y < 1 or x > w or y > h then return end
+
+    text = tostring(text or "")
+    if #text > w - x + 1 then
+        text = text:sub(1, w - x + 1)
+    end
+
+    mon.setCursorPos(x, y)
+    mon.setTextColor(fg or colors.white)
+    mon.setBackgroundColor(bg or colors.black)
+    mon.write(text)
+end
+
+local function drawBox(box, name)
+    local x1, y1, x2, y2 = box[1], box[2], box[3], box[4]
+
+    for x = x1, x2 do
+        writeAt(x, y1, " ", HITBOX_TEXT_COLOR, HITBOX_BORDER_COLOR)
+        writeAt(x, y2, " ", HITBOX_TEXT_COLOR, HITBOX_BORDER_COLOR)
+    end
+
+    for y = y1, y2 do
+        writeAt(x1, y, " ", HITBOX_TEXT_COLOR, HITBOX_BORDER_COLOR)
+        writeAt(x2, y, " ", HITBOX_TEXT_COLOR, HITBOX_BORDER_COLOR)
+    end
+
+    -- Short center label, enough to identify zones without covering everything.
+    local label = tostring(name)
+    if label:match("^chip_") then
+        label = label:gsub("chip_", "")
+    elseif label == "2to1_top" then
+        label = "2T"
+    elseif label == "2to1_mid" then
+        label = "2M"
+    elseif label == "2to1_bot" then
+        label = "2B"
+    elseif label == "1to18" then
+        label = "1-18"
+    elseif label == "19to36" then
+        label = "19-36"
+    end
+
+    label = label:sub(1, math.max(1, x2 - x1 - 1))
+    local lx = x1 + 1
+    local ly = y1 + math.floor((y2 - y1) / 2)
+    if x2 - x1 >= 3 then
+        writeAt(lx, ly, label, HITBOX_TEXT_COLOR, HITBOX_FILL_COLOR)
+    end
+end
+
+local function drawHitboxOverlay()
+    if not SHOW_HITBOXES then return end
+
+    local all = mergeHitboxes()
+    for name, box in pairs(all) do
+        drawBox(box, name)
+    end
+end
+
+local function redraw(lastX, lastY, lastZone)
+    mon.setBackgroundColor(colors.green)
+    mon.clear()
+    drawPackedFrame()
+    drawHitboxOverlay()
+
+    local msg = "X=" .. tostring(lastX or "-") .. " Y=" .. tostring(lastY or "-")
+    if lastZone then
+        msg = msg .. " Zone=" .. lastZone
+    else
+        msg = msg .. " Zone=none"
+    end
+
+    writeAt(1, 1, msg, colors.yellow, colors.black)
+end
+
+local function printHitboxes()
+    print("Current hitboxes:")
+    print("name = {x1,y1,x2,y2}")
+    local all = mergeHitboxes()
+    local names = {}
+
+    for name in pairs(all) do
+        table.insert(names, name)
+    end
+
+    table.sort(names)
+
+    for _, name in ipairs(names) do
+        local b = all[name]
+        print(name .. " = {" .. b[1] .. "," .. b[2] .. "," .. b[3] .. "," .. b[4] .. "}")
+    end
+end
+
+if CLEAR_TERMINAL_ON_START then
+    term.clear()
+    term.setCursorPos(1, 1)
+end
+
+print("Roulette hitbox tester running.")
+print("Monitor: " .. tostring(monName))
+print("Touch monitor to print x,y and matched zone.")
+print("Edit HITBOXES or EXTRA_HITBOXES at top, then rerun.")
+print("Press Ctrl+T to stop.")
+print("")
+
+if SHOW_ZONE_NAMES_IN_TERMINAL then
+    printHitboxes()
+    print("")
+end
+
+redraw()
+
+while true do
+    local event, side, x, y = os.pullEvent("monitor_touch")
+
+    if side == monName or not MONITOR_NAME then
+        local zone = zoneAt(x, y)
+
+        print("touch x=" .. tostring(x) .. " y=" .. tostring(y) .. " zone=" .. tostring(zone or "none"))
+
+        if REDRAW_AFTER_CLICK then
+            redraw(x, y, zone)
+        else
+            writeAt(1, 1, "X=" .. x .. " Y=" .. y .. " Zone=" .. tostring(zone or "none"), colors.yellow, colors.black)
+        end
+    end
+end
