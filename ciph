@@ -1,0 +1,100 @@
+local cipher = peripheral.wrap("advanced_cipher_0")
+if not cipher then error("No advanced_cipher_0") end
+
+local function dump(name, value)
+    print("===" .. name .. "===")
+    print(textutils.serialize(value))
+end
+
+local function try(label, fn)
+    print()
+    print("TRY: " .. label)
+
+    local ok, a, b, c, d = pcall(fn)
+
+    print("OK:", ok)
+
+    if ok then
+        dump("RET1", a)
+        dump("RET2", b)
+        dump("RET3", c)
+        dump("RET4", d)
+        return a, b, c, d
+    else
+        print("ERR:", a)
+    end
+end
+
+local keys
+
+keys = try("createRandomKeySet()", function()
+    return cipher.createRandomKeySet()
+end)
+
+if not keys then
+    keys = try("createRandomKeySet(128)", function()
+        return cipher.createRandomKeySet(128)
+    end)
+end
+
+if not keys then
+    keys = try("createRandomKeySet(256)", function()
+        return cipher.createRandomKeySet(256)
+    end)
+end
+
+if not keys then
+    keys = try("createRandomKeySet(512)", function()
+        return cipher.createRandomKeySet(512)
+    end)
+end
+
+if not keys then
+    error("Could not create key set")
+end
+
+print()
+print("Generated key set:")
+print(textutils.serialize(keys))
+
+local msg = "hello casino"
+
+-- Try common encrypt/decrypt signatures.
+local encrypted
+
+encrypted = try("encrypt(message, keys)", function()
+    return cipher.encrypt(msg, keys)
+end)
+
+if encrypted then
+    try("decrypt(encrypted, keys)", function()
+        return cipher.decrypt(encrypted, keys)
+    end)
+end
+
+if type(keys) == "table" then
+    local possiblePublic = keys.public or keys.pub or keys.publicKey or keys[1]
+    local possiblePrivate = keys.private or keys.priv or keys.privateKey or keys[2]
+
+    if possiblePublic then
+        encrypted = try("encrypt(message, public)", function()
+            return cipher.encrypt(msg, possiblePublic)
+        end)
+
+        if encrypted and possiblePrivate then
+            try("decrypt(encrypted, private)", function()
+                return cipher.decrypt(encrypted, possiblePrivate)
+            end)
+        end
+
+        encrypted = try("encrypt(public, message)", function()
+            return cipher.encrypt(possiblePublic, msg)
+        end)
+
+        if encrypted and possiblePrivate then
+            try("decrypt(private, encrypted)", function()
+                return cipher.decrypt(possiblePrivate, encrypted)
+            end)
+        end
+    end
+end
