@@ -1,0 +1,555 @@
+-- =========================================================
+-- Lightweight Neural Interface PLAYER ONLY Finder / 3D Box HUD
+-- Revamped:
+--   - NO keyboard readers
+--   - NO char readers
+--   - NO block scanners
+--   - NO laser/shooter/fire logic
+--   - Only nearby real-player finder
+--   - Uses 3D canvas boxes when available, with 2D fallback dots
+-- =========================================================
+
+-- === Config ===
+local MODEM_SIDE = "front"
+
+-- Lower range / slower scan = less CC-thread stress.
+local SENSE_RANGE = 80
+local SCAN_SECONDS = 1.50
+local HUD_REFRESH_SECONDS = 0.25
+
+local MAX_TRACKED = 8
+
+-- 3D box settings
+local USE_3D_BOXES = true
+local BOX_SIZE = 0.45
+local BOX_COLOR = 0x55FF55
+local CLOSE_BOX_COLOR = 0xFF5555
+local MID_BOX_COLOR = 0xFFFF55
+
+-- 2D fallback dots, used if canvas3d is not available.
+local SHOW_2D_FALLBACK_DOTS = true
+
+-- Exact names to never show.
+local ignoredExactNames = {
+    ["Cow"] = true,
+    ["Chicken"] = true,
+    ["Pig"] = true,
+    ["Sheep"] = true,
+    ["Villager"] = true,
+    ["Bat"] = true,
+    ["Horse"] = true,
+    ["Ocelot"] = true,
+    ["Wolf"] = true,
+    ["Cat"] = true,
+    ["Mooshroom"] = true,
+    ["Rabbit"] = true,
+    ["Parrot"] = true,
+    ["Squid"] = true,
+    ["Turtle"] = true,
+    ["Dolphin"] = true,
+    ["Fox"] = true,
+    ["Pufferfish"] = true,
+    ["Salmon"] = true,
+    ["Tropical Fish"] = true,
+    ["Trader Llama"] = true,
+    ["Wandering Trader"] = true,
+    ["Iron Golem"] = true,
+    ["Snow Golem"] = true,
+    ["Item"] = true,
+    ["Item Frame"] = true,
+    ["Glass Item Frame"] = true,
+    ["Painting"] = true,
+    ["Armor Stand"] = true,
+    ["Flag"] = true,
+    ["Shop"] = true,
+}
+
+-- Prefixes/entities to never show.
+local ignoredPrefixes = {
+    "Bug", "Rab", "Crab", "Squid", "Zombie", "Skeleton", "Husk", "Parrot",
+    "Spider", "Creeper", "Glass", "Item", "item", "Painting", "painting",
+    "Flag", "gcflag", "flag", "quark", "Armor", "armor",
+    "Shop_", "Bot_", "ItemFrame", "XPO", "Commonfolk", "commonfolk",
+    "Villager", "Trader", "Wandering", "minecraft:", "quark:"
+}
+
+-- Common mob/entity internal names, lowercase contains-match.
+local ignoredContainsLower = {
+    "cow", "chicken", "pig", "sheep", "villager", "bat", "horse", "ocelot",
+    "wolf", "cat", "mooshroom", "rabbit", "parrot", "squid", "turtle",
+    "dolphin", "fox", "pufferfish", "salmon", "tropical_fish",
+    "trader_llama", "wandering_trader", "iron_golem", "snow_golem",
+    "zombie", "skeleton", "husk", "spider", "creeper", "enderman",
+    "slime", "magma_cube", "armor_stand", "item_frame", "painting",
+    "commonfolk", "npc", "shop", "bot"
+}
+
+-- Optional explicit allowlist. Leave empty to accept any username-looking name.
+local playerAllowlist = {
+    -- ["HughJaynis1234"] = true,
+    -- ["RadoslawGuzior"] = true,
+    -- ["EmTheTurtle03"] = true,
+}
+
+-- === Helpers ===
+local function cleanName(name)
+    name = tostring(name or "")
+    name = name:gsub("§.", "")
+    name = name:gsub("^%s+", ""):gsub("%s+$", "")
+    return name
+end
+
+local function isIgnoredPrefix(name)
+    for _, prefix in ipairs(ignoredPrefixes) do
+        if name:sub(1, #prefix) == prefix then
+            return true
+        end
+    end
+
+    return false
+end
+
+local function containsIgnoredInternalName(name)
+    local lower = tostring(name or ""):lower()
+
+    for _, bad in ipairs(ignoredContainsLower) do
+        if lower:find(bad, 1, true) then
+            return true
+        end
+    end
+
+    return false
+end
+
+local function isUsernameLike(name)
+    -- Minecraft username-ish: letters/numbers/underscore, 3-16 chars.
+    -- This filters out most mob/commonfolk/display entities.
+    return type(name) == "string"
+        and #name >= 3
+        and #name <= 16
+        and name:match("^[%w_]+$") ~= nil
+end
+
+local function entityDisplayName(e)
+    return cleanName(e.displayName or e.name or "Unknown")
+end
+
+local function isLikelyPlayer(e)
+    local display = entityDisplayName(e)
+    local internal = cleanName(e.name or "")
+
+    if playerAllowlist[display] or playerAllowlist[internal] then
+        return true
+    end
+
+    if ignoredExactNames[display] or ignoredExactNames[internal] then
+        return false
+    end
+
+    if isIgnoredPrefix(display) or isIgnoredPrefix(internal) then
+        return false
+    end
+
+    if containsIgnoredInternalName(display) or containsIgnoredInternalName(internal) then
+        return false
+    end
+
+    if not isUsernameLike(display) then
+        return false
+    end
+
+    if not e.x or not e.y or not e.z then
+        return false
+    end
+
+    return true
+end
+
+local function distanceOf(e)
+    local x = tonumber(e.x) or 0
+    local y = tonumber(e.y) or 0
+    local z = tonumber(e.z) or 0
+    return math.sqrt(x * x + y * y + z * z)
+end
+
+local function shortName(name, maxLen)
+    name = tostring(name or "Unknown")
+    maxLen = maxLen or 18
+
+    if #name > maxLen then
+        return name:sub(1, maxLen - 3) .. "..."
+    end
+
+    return name
+end
+
+local function clamp(v, lo, hi)
+    if v < lo then return lo end
+    if v > hi then return hi end
+    return v
+end
+
+local function colorForDistance(dist)
+    dist = tonumber(dist) or 999
+
+    if dist <= 10 then
+        return CLOSE_BOX_COLOR
+    elseif dist <= 25 then
+        return MID_BOX_COLOR
+    end
+
+    return BOX_COLOR
+end
+
+-- === Setup ===
+pcall(function()
+    rednet.open(MODEM_SIDE)
+end)
+
+local ni = peripheral.find("neuralInterface")
+if not ni then
+    error("Neural Interface not found")
+end
+
+local canvas = ni.canvas()
+canvas.clear()
+
+-- 3D canvas setup is version-dependent, so this is defensive.
+local canvas3d = nil
+local boxGroup = nil
+local boxes3d = {}
+
+if USE_3D_BOXES then
+    pcall(function()
+        if ni.canvas3d then
+            canvas3d = ni.canvas3d()
+        end
+    end)
+
+    if canvas3d then
+        pcall(function()
+            if canvas3d.clear then
+                canvas3d.clear()
+            end
+        end)
+
+        pcall(function()
+            if canvas3d.create then
+                boxGroup = canvas3d.create()
+            else
+                boxGroup = canvas3d
+            end
+        end)
+    end
+end
+
+-- === 2D Canvas Text ===
+local titleText = canvas.addText({10, 10}, "NI Player Finder")
+titleText.setScale(1.4)
+titleText.setColor(0x80DFFF)
+
+local statusText = canvas.addText({10, 28}, "Starting...")
+statusText.setScale(1)
+statusText.setColor(0xFFFFFF)
+
+local playerText = canvas.addText({10, 45}, "")
+playerText.setScale(1)
+playerText.setColor(0xFFAAFF)
+
+local centerText = canvas.addText({245, 128}, "+")
+centerText.setScale(1.5)
+centerText.setColor(0xFFFFFF)
+
+-- 2D fallback dots.
+local dotLabels = {}
+for i = 1, MAX_TRACKED do
+    local dot = canvas.addText({245, 128}, "")
+    dot.setScale(1)
+    dot.setColor(0x55FF55)
+    dotLabels[i] = dot
+end
+
+-- === State ===
+local lastPlayers = {}
+local lastSenseAt = 0
+local lastHudKey = ""
+
+local taskHeartbeat = {
+    scan = os.clock(),
+    hud = os.clock(),
+}
+
+local WATCHDOG_SECONDS = 20
+local WATCHDOG_CHECK_SECONDS = 5
+
+-- === 3D Box Handling ===
+local function clear3DBoxes()
+    for _, obj in pairs(boxes3d) do
+        pcall(function()
+            if obj and obj.remove then
+                obj.remove()
+            elseif obj and obj.delete then
+                obj.delete()
+            end
+        end)
+    end
+
+    boxes3d = {}
+
+    -- Some canvas3d implementations support clear; use it if available.
+    pcall(function()
+        if canvas3d and canvas3d.clear then
+            canvas3d.clear()
+        end
+    end)
+
+    pcall(function()
+        if canvas3d and canvas3d.create then
+            boxGroup = canvas3d.create()
+        end
+    end)
+end
+
+local function add3DBoxForPlayer(index, e)
+    if not canvas3d then
+        return false
+    end
+
+    local target = boxGroup or canvas3d
+    if not target then
+        return false
+    end
+
+    local x = tonumber(e.x) or 0
+    local y = tonumber(e.y) or 0
+    local z = tonumber(e.z) or 0
+    local dist = e._dist or distanceOf(e)
+    local color = colorForDistance(dist)
+    local half = BOX_SIZE / 2
+
+    -- Try common Plethora/Core canvas3d signatures.
+    local attempts = {
+        function()
+            return target.addBox({x - half, y - half, z - half}, {BOX_SIZE, BOX_SIZE, BOX_SIZE}, color)
+        end,
+        function()
+            return target.addBox(x - half, y - half, z - half, BOX_SIZE, BOX_SIZE, BOX_SIZE, color)
+        end,
+        function()
+            return target.addBox({x - half, y - half, z - half}, BOX_SIZE, BOX_SIZE, BOX_SIZE, color)
+        end,
+        function()
+            return canvas3d.addBox({x - half, y - half, z - half}, {BOX_SIZE, BOX_SIZE, BOX_SIZE}, color)
+        end,
+        function()
+            return canvas3d.addBox(x - half, y - half, z - half, BOX_SIZE, BOX_SIZE, BOX_SIZE, color)
+        end,
+    }
+
+    for _, attempt in ipairs(attempts) do
+        local ok, obj = pcall(attempt)
+        if ok then
+            boxes3d[index] = obj
+            return true
+        end
+    end
+
+    return false
+end
+
+local function update3DBoxes()
+    if not USE_3D_BOXES or not canvas3d then
+        return false
+    end
+
+    clear3DBoxes()
+
+    local addedAny = false
+
+    for i, e in ipairs(lastPlayers) do
+        if add3DBoxForPlayer(i, e) then
+            addedAny = true
+        end
+    end
+
+    return addedAny
+end
+
+-- === 2D Fallback Dot Handling ===
+local function update2DDots(enabled)
+    if not enabled or not SHOW_2D_FALLBACK_DOTS then
+        for _, dot in ipairs(dotLabels) do
+            dot.setText("")
+        end
+        return
+    end
+
+    local centerX, centerY = 250, 135
+    local scale = 4.0
+
+    for i = 1, MAX_TRACKED do
+        local dot = dotLabels[i]
+        local e = lastPlayers[i]
+
+        if e then
+            local x = tonumber(e.x) or 0
+            local z = tonumber(e.z) or 0
+            local dist = e._dist or distanceOf(e)
+
+            local sx = clamp(centerX + x * scale, centerX - 95, centerX + 95)
+            local sy = clamp(centerY - z * scale, centerY - 70, centerY + 70)
+
+            dot.setPosition({sx, sy})
+            dot.setText(tostring(i))
+            dot.setColor(colorForDistance(dist))
+        else
+            dot.setText("")
+        end
+    end
+end
+
+-- === Loops ===
+local function scanLoop()
+    while true do
+        taskHeartbeat.scan = os.clock()
+
+        local ok, entities = pcall(function()
+            return ni.sense(SENSE_RANGE)
+        end)
+
+        if ok and type(entities) == "table" then
+            local found = {}
+
+            for _, e in ipairs(entities) do
+                if isLikelyPlayer(e) then
+                    e._dist = distanceOf(e)
+                    table.insert(found, e)
+                end
+            end
+
+            table.sort(found, function(a, b)
+                return (a._dist or 999999) < (b._dist or 999999)
+            end)
+
+            while #found > MAX_TRACKED do
+                table.remove(found)
+            end
+
+            lastPlayers = found
+            lastSenseAt = os.clock()
+        else
+            lastPlayers = {}
+            statusText.setText("sense() failed")
+        end
+
+        sleep(SCAN_SECONDS)
+    end
+end
+
+local function buildHudKey()
+    local parts = {
+        tostring(#lastPlayers),
+        tostring(math.floor(os.clock() - lastSenseAt))
+    }
+
+    for i, e in ipairs(lastPlayers) do
+        parts[#parts + 1] = tostring(i)
+        parts[#parts + 1] = entityDisplayName(e)
+        parts[#parts + 1] = tostring(math.floor((e._dist or 0) * 10) / 10)
+        parts[#parts + 1] = tostring(math.floor((tonumber(e.x) or 0) * 10) / 10)
+        parts[#parts + 1] = tostring(math.floor((tonumber(e.y) or 0) * 10) / 10)
+        parts[#parts + 1] = tostring(math.floor((tonumber(e.z) or 0) * 10) / 10)
+    end
+
+    return table.concat(parts, "|")
+end
+
+local function hudLoop()
+    while true do
+        taskHeartbeat.hud = os.clock()
+
+        local key = buildHudKey()
+
+        if key ~= lastHudKey then
+            lastHudKey = key
+
+            local age = os.clock() - lastSenseAt
+            local has3D = canvas3d ~= nil
+
+            statusText.setText(
+                "Players " .. #lastPlayers
+                .. " | Range " .. SENSE_RANGE
+                .. " | 3D " .. (has3D and "ON" or "OFF")
+                .. " | Age " .. string.format("%.1fs", age)
+            )
+
+            local lines = {}
+
+            for i, e in ipairs(lastPlayers) do
+                local name = shortName(entityDisplayName(e), 16)
+                local dist = e._dist or distanceOf(e)
+                lines[#lines + 1] = i .. ") " .. name .. " " .. string.format("%.1fm", dist)
+            end
+
+            if #lines == 0 then
+                playerText.setText("Players nearby: none")
+            else
+                playerText.setText("Players nearby:\n" .. table.concat(lines, "\n"))
+            end
+
+            local drew3D = update3DBoxes()
+            update2DDots(not drew3D)
+        end
+
+        sleep(HUD_REFRESH_SECONDS)
+    end
+end
+
+local function watchdogLoop()
+    while true do
+        local now = os.clock()
+
+        for name, t in pairs(taskHeartbeat) do
+            if now - t > WATCHDOG_SECONDS then
+                print("WATCHDOG: " .. name .. " stalled, rebooting.")
+                sleep(0.5)
+                os.reboot()
+            end
+        end
+
+        sleep(WATCHDOG_CHECK_SECONDS)
+    end
+end
+
+local function runTask(name, fn, delay)
+    return function()
+        if delay and delay > 0 then
+            sleep(delay)
+        end
+
+        while true do
+            local ok, err = pcall(fn)
+
+            if not ok then
+                print("Task error in " .. tostring(name) .. ": " .. tostring(err))
+                sleep(1)
+            else
+                print("Task returned: " .. tostring(name) .. ", restarting.")
+                sleep(1)
+            end
+        end
+    end
+end
+
+-- === Run ===
+print("Lightweight NI Player Finder starting.")
+print("Players only. Mobs/commonfolk/items ignored.")
+print("No keyboard readers. No scanners. No shooters.")
+print("Sense range:", SENSE_RANGE)
+print("Scan seconds:", SCAN_SECONDS)
+
+parallel.waitForAny(
+    runTask("scan", scanLoop, 0.1),
+    runTask("hud", hudLoop, 0.2),
+    runTask("watchdog", watchdogLoop, 0.3)
+)
