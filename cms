@@ -1,0 +1,67 @@
+local PERIPHERAL_NAME = "advanced_cipher_0"
+local OUT_FILE = "advanced_cipher_docs.txt"
+
+local function safeSerialize(value)
+    local ok, result = pcall(textutils.serialize, value)
+    if ok then return result end
+    return tostring(value)
+end
+
+local function writeLine(file, text)
+    file.writeLine(tostring(text or ""))
+end
+
+local p = peripheral.wrap(PERIPHERAL_NAME)
+
+if not p then
+    error("Could not find peripheral: " .. PERIPHERAL_NAME)
+end
+
+local methods = peripheral.getMethods(PERIPHERAL_NAME)
+
+if not methods then
+    error("Could not get methods for: " .. PERIPHERAL_NAME)
+end
+
+table.sort(methods)
+
+local f = fs.open(OUT_FILE, "w")
+if not f then
+    error("Could not open output file: " .. OUT_FILE)
+end
+
+writeLine(f, "Peripheral: " .. PERIPHERAL_NAME)
+writeLine(f, "Type: " .. tostring(peripheral.getType(PERIPHERAL_NAME)))
+writeLine(f, "Method count: " .. tostring(#methods))
+writeLine(f, string.rep("=", 50))
+writeLine(f, "")
+
+for _, method in ipairs(methods) do
+    writeLine(f, "METHOD: " .. method)
+    writeLine(f, string.rep("-", 50))
+
+    -- Some peripherals expose docs as getDocs(method)
+    if type(p.getDocs) == "function" then
+        local ok, docs = pcall(function()
+            return p.getDocs(method)
+        end)
+
+        if ok then
+            writeLine(f, "getDocs result:")
+            writeLine(f, safeSerialize(docs))
+        else
+            writeLine(f, "getDocs failed:")
+            writeLine(f, tostring(docs))
+        end
+    else
+        writeLine(f, "No getDocs() method available on wrapped peripheral.")
+    end
+
+    writeLine(f, "")
+end
+
+f.close()
+
+print("Wrote docs to " .. OUT_FILE)
+print("Open with:")
+print("edit " .. OUT_FILE)
