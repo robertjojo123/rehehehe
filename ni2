@@ -1,0 +1,336 @@
+-- =========================================================
+-- Lightweight Neural Interface Player Finder / HUD
+-- Revamped from old NI code:
+--   - NO keyboard readers
+--   - NO char readers
+--   - NO block scanners
+--   - NO laser/shooter/fire logic
+--   - NO cassette controls
+--   - NO account balance/reset controls
+--   - Only nearby player/entity finder + simple canvas direction HUD
+-- =========================================================
+
+-- === Config ===
+local MODEM_SIDE = "front"
+
+-- Sense range can be high, but smaller is much lighter on CC/server thread.
+local SENSE_RANGE = 80
+local SCAN_SECONDS = 1.50
+local HUD_REFRESH_SECONDS = 0.25
+
+-- Draw up to this many tracked players/entities on the HUD.
+local MAX_TRACKED = 8
+
+-- If true, show only likely players / named entities and filter out obvious junk.
+local FILTER_NOISE = true
+
+-- If true, the HUD will show arrows/dots around center screen pointing toward entities.
+local SHOW_DIRECTION_DOTS = true
+
+local prefixBlacklist = {
+    "Bug", "Rab", "Crab", "Squid", "Zombie", "Skeleton", "Husk", "Parrot",
+    "Spider", "Creeper", "Glass", "Item", "item", "Painting", "painting",
+    "Flag", "gcflag", "flag", "quark", "Armor", "armor",
+    "quark:glass_item_frame"
+}
+
+local function isBlacklistedByPrefix(name)
+    name = tostring(name or "")
+
+    for _, prefix in ipairs(prefixBlacklist) do
+        if name:sub(1, #prefix) == prefix then
+            return true
+        end
+    end
+
+    return false
+end
+
+-- === Setup ===
+pcall(function()
+    rednet.open(MODEM_SIDE)
+end)
+
+local ni = peripheral.find("neuralInterface")
+if not ni then
+    error("Neural Interface not found")
+end
+
+local canvas = ni.canvas()
+canvas.clear()
+
+-- === Canvas Elements ===
+local titleText = canvas.addText({10, 10}, "NI Player Finder")
+titleText.setScale(1.4)
+titleText.setColor(0x80DFFF)
+
+local statusText = canvas.addText({10, 28}, "Starting...")
+statusText.setScale(1)
+statusText.setColor(0xFFFFFF)
+
+local entityText = canvas.addText({10, 45}, "")
+entityText.setScale(1)
+entityText.setColor(0xFFAAFF)
+
+local detailText = canvas.addText({10, 62}, "")
+detailText.setScale(1)
+detailText.setColor(0xAAFFAA)
+
+local centerText = canvas.addText({245, 128}, "+")
+centerText.setScale(1.5)
+centerText.setColor(0xFFFFFF)
+
+-- Pre-create dot labels so we do not constantly create/delete canvas objects.
+local dotLabels = {}
+for i = 1, MAX_TRACKED do
+    local dot = canvas.addText({245, 128}, "")
+    dot.setScale(1)
+    dot.setColor(0x55FF55)
+    dotLabels[i] = dot
+end
+
+-- === State ===
+local lastEntities = {}
+local lastSenseAt = 0
+local lastHudKey = ""
+
+local taskHeartbeat = {
+    scan = os.clock(),
+    hud = os.clock(),
+}
+
+local WATCHDOG_SECONDS = 20
+local WATCHDOG_CHECK_SECONDS = 5
+
+local function shortName(name, maxLen)
+    name = tostring(name or "Unknown")
+    maxLen = maxLen or 18
+
+    if #name > maxLen then
+        return name:sub(1, maxLen - 3) .. "..."
+    end
+
+    return name
+end
+
+local function distanceOf(e)
+    local x = tonumber(e.x) or 0
+    local y = tonumber(e.y) or 0
+    local z = tonumber(e.z) or 0
+    return math.sqrt(x * x + y * y + z * z)
+end
+
+local function entityName(e)
+    return tostring(e.displayName or e.name or "Unknown")
+end
+
+local function shouldShowEntity(e)
+    local name = entityName(e)
+
+    if FILTER_NOISE and isBlacklistedByPrefix(name) then
+        return false
+    end
+
+    if not e.x or not e.y or not e.z then
+        return false
+    end
+
+    return true
+end
+
+local function scanLoop()
+    while true do
+        taskHeartbeat.scan = os.clock()
+
+        local ok, entities = pcall(function()
+            return ni.sense(SENSE_RANGE)
+        end)
+
+        if ok and type(entities) == "table" then
+            local found = {}
+
+            for _, e in ipairs(entities) do
+                if shouldShowEntity(e) then
+                    e._dist = distanceOf(e)
+                    table.insert(found, e)
+                end
+            end
+
+            table.sort(found, function(a, b)
+                return (a._dist or 999999) < (b._dist or 999999)
+            end)
+
+            while #found > MAX_TRACKED do
+                table.remove(found)
+            end
+
+            lastEntities = found
+            lastSenseAt = os.clock()
+        else
+            lastEntities = {}
+            statusText.setText("sense() failed")
+        end
+
+        sleep(SCAN_SECONDS)
+    end
+end
+
+local function buildHudKey()
+    local parts = {
+        tostring(#lastEntities),
+        tostring(math.floor(os.clock() - lastSenseAt))
+    }
+
+    for i, e in ipairs(lastEntities) do
+        parts[#parts + 1] = tostring(i)
+        parts[#parts + 1] = entityName(e)
+        parts[#parts + 1] = tostring(math.floor((e._dist or 0) * 10) / 10)
+        parts[#parts + 1] = tostring(math.floor((tonumber(e.x) or 0) * 10) / 10)
+        parts[#parts + 1] = tostring(math.floor((tonumber(e.y) or 0) * 10) / 10)
+        parts[#parts + 1] = tostring(math.floor((tonumber(e.z) or 0) * 10) / 10)
+    end
+
+    return table.concat(parts, "|")
+end
+
+local function clamp(v, lo, hi)
+    if v < lo then return lo end
+    if v > hi then return hi end
+    return v
+end
+
+local function updateDirectionDots()
+    if not SHOW_DIRECTION_DOTS then
+        for _, dot in ipairs(dotLabels) do
+            dot.setText("")
+        end
+        return
+    end
+
+    -- Simple 2D radar projection:
+    -- x maps left/right, z maps forward/back.
+    -- y/dist shown in text list. This avoids expensive 3D object drawing.
+    local centerX, centerY = 250, 135
+    local scale = 4.0
+
+    for i = 1, MAX_TRACKED do
+        local dot = dotLabels[i]
+        local e = lastEntities[i]
+
+        if e then
+            local x = tonumber(e.x) or 0
+            local z = tonumber(e.z) or 0
+            local dist = e._dist or distanceOf(e)
+
+            local sx = clamp(centerX + x * scale, centerX - 95, centerX + 95)
+            local sy = clamp(centerY - z * scale, centerY - 70, centerY + 70)
+
+            dot.setPosition({sx, sy})
+            dot.setText(tostring(i))
+
+            if dist <= 10 then
+                dot.setColor(0xFF5555)
+            elseif dist <= 25 then
+                dot.setColor(0xFFFF55)
+            else
+                dot.setColor(0x55FF55)
+            end
+        else
+            dot.setText("")
+        end
+    end
+end
+
+local function hudLoop()
+    while true do
+        taskHeartbeat.hud = os.clock()
+
+        local key = buildHudKey()
+
+        if key ~= lastHudKey then
+            lastHudKey = key
+
+            local age = os.clock() - lastSenseAt
+            statusText.setText("Range " .. SENSE_RANGE .. " | Seen " .. #lastEntities .. " | Age " .. string.format("%.1fs", age))
+
+            local names = {}
+            local details = {}
+
+            for i, e in ipairs(lastEntities) do
+                local name = shortName(entityName(e), 16)
+                local dist = e._dist or distanceOf(e)
+                local x = tonumber(e.x) or 0
+                local y = tonumber(e.y) or 0
+                local z = tonumber(e.z) or 0
+
+                names[#names + 1] = i .. ") " .. name .. " " .. string.format("%.1fm", dist)
+
+                details[#details + 1] =
+                    i .. ") " .. name
+                    .. "  x:" .. string.format("%.1f", x)
+                    .. " y:" .. string.format("%.1f", y)
+                    .. " z:" .. string.format("%.1f", z)
+            end
+
+            if #names == 0 then
+                entityText.setText("Nearby: none")
+                detailText.setText("")
+            else
+                entityText.setText("Nearby:\n" .. table.concat(names, "\n"))
+                detailText.setText("Relative positions:\n" .. table.concat(details, "\n"))
+            end
+
+            updateDirectionDots()
+        end
+
+        sleep(HUD_REFRESH_SECONDS)
+    end
+end
+
+local function watchdogLoop()
+    while true do
+        local now = os.clock()
+
+        for name, t in pairs(taskHeartbeat) do
+            if now - t > WATCHDOG_SECONDS then
+                print("WATCHDOG: " .. name .. " stalled, rebooting.")
+                sleep(0.5)
+                os.reboot()
+            end
+        end
+
+        sleep(WATCHDOG_CHECK_SECONDS)
+    end
+end
+
+local function runTask(name, fn, delay)
+    return function()
+        if delay and delay > 0 then
+            sleep(delay)
+        end
+
+        while true do
+            local ok, err = pcall(fn)
+
+            if not ok then
+                print("Task error in " .. tostring(name) .. ": " .. tostring(err))
+                sleep(1)
+            else
+                print("Task returned: " .. tostring(name) .. ", restarting.")
+                sleep(1)
+            end
+        end
+    end
+end
+
+-- === Run ===
+print("Lightweight NI Player Finder starting.")
+print("No keyboard readers. No scanners. No shooters.")
+print("Sense range:", SENSE_RANGE)
+print("Scan seconds:", SCAN_SECONDS)
+
+parallel.waitForAny(
+    runTask("scan", scanLoop, 0.1),
+    runTask("hud", hudLoop, 0.2),
+    runTask("watchdog", watchdogLoop, 0.3)
+)
