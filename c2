@@ -1,0 +1,94 @@
+local cipher = peripheral.wrap("advanced_cipher_0")
+if not cipher then error("No advanced_cipher_0") end
+
+local function try(label, fn)
+    print("")
+    print("TRY: " .. label)
+    local ok, a, b, c, d = pcall(fn)
+    print("OK:", ok)
+    if ok then
+        print("RET1:", tostring(a), type(a))
+        print("RET2:", tostring(b), type(b))
+        print("RET3:", tostring(c), type(c))
+        print("RET4:", tostring(d), type(d))
+        return a, b, c, d
+    else
+        print("ERR:", tostring(a))
+    end
+end
+
+local keyset = try("createRandomKeySet()", function()
+    return cipher.createRandomKeySet()
+end)
+
+if type(keyset) ~= "function" then
+    error("Expected keyset function/object, got " .. type(keyset))
+end
+
+-- Probe the keyset object/function.
+local candidates = {}
+
+local function addCandidate(label, value)
+    if type(value) == "string" then
+        print("CANDIDATE " .. label .. ": " .. value)
+        candidates[#candidates + 1] = {label = label, value = value}
+    end
+end
+
+addCandidate("keyset()", try("keyset()", function()
+    return keyset()
+end))
+
+addCandidate("keyset('public')", try("keyset('public')", function()
+    return keyset("public")
+end))
+
+addCandidate("keyset('private')", try("keyset('private')", function()
+    return keyset("private")
+end))
+
+addCandidate("keyset('encrypt')", try("keyset('encrypt')", function()
+    return keyset("encrypt")
+end))
+
+addCandidate("keyset('decrypt')", try("keyset('decrypt')", function()
+    return keyset("decrypt")
+end))
+
+addCandidate("keyset('e')", try("keyset('e')", function()
+    return keyset("e")
+end))
+
+addCandidate("keyset('d')", try("keyset('d')", function()
+    return keyset("d")
+end))
+
+addCandidate("keyset('n')", try("keyset('n')", function()
+    return keyset("n")
+end))
+
+-- Try numeric indexes too.
+for i = 1, 6 do
+    addCandidate("keyset(" .. i .. ")", try("keyset(" .. i .. ")", function()
+        return keyset(i)
+    end))
+end
+
+print("")
+print("Testing string candidates as RSA keys...")
+
+local msg = "hello casino"
+
+for _, cand in ipairs(candidates) do
+    local enc = try("encrypt(msg, " .. cand.label .. ")", function()
+        return cipher.encrypt(msg, cand.value)
+    end)
+
+    if type(enc) == "string" then
+        for _, decCand in ipairs(candidates) do
+            try("decrypt(enc, " .. decCand.label .. ")", function()
+                return cipher.decrypt(enc, decCand.value)
+            end)
+        end
+    end
+end
