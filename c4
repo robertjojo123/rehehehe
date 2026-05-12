@@ -1,0 +1,265 @@
+local CIPHER_NAME = "advanced_cipher_0"
+local OUT_FILE = "cipher_test.txt"
+
+local cipher = peripheral.wrap(CIPHER_NAME)
+if not cipher then error("No " .. CIPHER_NAME) end
+
+local f = fs.open(OUT_FILE, "w")
+if not f then error("Could not open " .. OUT_FILE) end
+
+local function w(s)
+    f.writeLine(tostring(s or ""))
+end
+
+local function ser(v)
+    local ok, out = pcall(textutils.serialize, v)
+    if ok then return out end
+    return tostring(v)
+end
+
+local function safeValue(v)
+    if type(v) == "string" then
+        if #v > 300 then
+            return v:sub(1, 300) .. "... [len=" .. #v .. "]"
+        end
+        return v
+    elseif type(v) == "table" then
+        return ser(v)
+    end
+
+    return tostring(v)
+end
+
+local function try(label, fn)
+    w("")
+    w("TRY: " .. label)
+
+    local ok, a, b, c, d = pcall(fn)
+
+    w("OK: " .. tostring(ok))
+
+    if ok then
+        w("RET1 TYPE: " .. type(a))
+        w("RET1 VALUE: " .. safeValue(a))
+        w("RET2 TYPE: " .. type(b))
+        w("RET2 VALUE: " .. safeValue(b))
+        w("RET3 TYPE: " .. type(c))
+        w("RET3 VALUE: " .. safeValue(c))
+        w("RET4 TYPE: " .. type(d))
+        w("RET4 VALUE: " .. safeValue(d))
+        return a, b, c, d
+    else
+        w("ERR: " .. tostring(a))
+        return nil
+    end
+end
+
+w("Peripheral: " .. CIPHER_NAME)
+w("Type: " .. tostring(peripheral.getType(CIPHER_NAME)))
+w("")
+w("Methods:")
+for _, m in ipairs(peripheral.getMethods(CIPHER_NAME) or {}) do
+    w(" - " .. tostring(m))
+end
+
+w("")
+w("======================================")
+w("CREATE RANDOM KEYSET")
+w("======================================")
+
+local keyset = try("createRandomKeySet()", function()
+    return cipher.createRandomKeySet()
+end)
+
+w("")
+w("KEYSET TOP TYPE: " .. type(keyset))
+w("KEYSET TOP VALUE: " .. tostring(keyset))
+
+local candidates = {}
+
+local function addCandidate(label, value)
+    if type(value) == "string" then
+        w("CANDIDATE FOUND: " .. label .. " = " .. safeValue(value))
+        table.insert(candidates, {
+            label = label,
+            value = value
+        })
+    end
+end
+
+local function inspectTable(tbl, prefix, depth)
+    depth = depth or 0
+    if type(tbl) ~= "table" then return end
+    if depth > 4 then return end
+
+    for k, v in pairs(tbl) do
+        local label = prefix .. "[" .. tostring(k) .. "]"
+
+        w("")
+        w("FIELD: " .. label)
+        w("FIELD KEY TYPE: " .. type(k))
+        w("FIELD VALUE TYPE: " .. type(v))
+        w("FIELD VALUE: " .. safeValue(v))
+
+        addCandidate(label, v)
+
+        if type(v) == "table" then
+            inspectTable(v, label, depth + 1)
+
+        elseif type(v) == "function" then
+            local r1, r2, r3, r4 = try(label .. "()", function()
+                return v()
+            end)
+
+            addCandidate(label .. "()", r1)
+            addCandidate(label .. "() RET2", r2)
+            addCandidate(label .. "() RET3", r3)
+            addCandidate(label .. "() RET4", r4)
+
+            local names = {
+                "public", "private", "pub", "priv",
+                "publicKey", "privateKey",
+                "encrypt", "decrypt",
+                "e", "d", "n",
+                "getPublic", "getPrivate"
+            }
+
+            for _, name in ipairs(names) do
+                local a, b, c, d = try(label .. "('" .. name .. "')", function()
+                    return v(name)
+                end)
+
+                addCandidate(label .. "('" .. name .. "')", a)
+                addCandidate(label .. "('" .. name .. "') RET2", b)
+                addCandidate(label .. "('" .. name .. "') RET3", c)
+                addCandidate(label .. "('" .. name .. "') RET4", d)
+            end
+
+            for i = 1, 6 do
+                local a, b, c, d = try(label .. "(" .. i .. ")", function()
+                    return v(i)
+                end)
+
+                addCandidate(label .. "(" .. i .. ")", a)
+                addCandidate(label .. "(" .. i .. ") RET2", b)
+                addCandidate(label .. "(" .. i .. ") RET3", c)
+                addCandidate(label .. "(" .. i .. ") RET4", d)
+            end
+        end
+    end
+end
+
+w("")
+w("======================================")
+w("KEYSET TABLE FIELD INSPECTION")
+w("======================================")
+
+if type(keyset) == "table" then
+    inspectTable(keyset, "keyset", 0)
+end
+
+w("")
+w("======================================")
+w("COMMON FIELD CHECKS")
+w("======================================")
+
+local common = {
+    "public", "private",
+    "pub", "priv",
+    "publicKey", "privateKey",
+    "encrypt", "decrypt",
+    "e", "d", "n",
+    "getPublic", "getPrivate",
+    1, 2, 3, 4, 5, 6
+}
+
+if type(keyset) == "table" then
+    for _, k in ipairs(common) do
+        local v = keyset[k]
+        w("")
+        w("COMMON FIELD: keyset[" .. tostring(k) .. "]")
+        w("TYPE: " .. type(v))
+        w("VALUE: " .. safeValue(v))
+        addCandidate("keyset[" .. tostring(k) .. "]", v)
+    end
+end
+
+w("")
+w("======================================")
+w("CREATEKEYSET PROBES")
+w("======================================")
+
+local createKeySetCandidates = {
+    {"createKeySet(61, 53)", function() return cipher.createKeySet(61, 53) end},
+    {"createKeySet('61', '53')", function() return cipher.createKeySet("61", "53") end},
+    {"createKeySet(61, 53, 17)", function() return cipher.createKeySet(61, 53, 17) end},
+    {"createKeySet('casino-secret')", function() return cipher.createKeySet("casino-secret") end},
+    {"createKeySet('casino', 'secret')", function() return cipher.createKeySet("casino", "secret") end},
+}
+
+for _, t in ipairs(createKeySetCandidates) do
+    local result = try(t[1], t[2])
+    addCandidate(t[1], result)
+
+    if type(result) == "table" then
+        inspectTable(result, t[1], 0)
+    end
+end
+
+w("")
+w("======================================")
+w("CANDIDATE STRING KEYS")
+w("======================================")
+w("COUNT: " .. tostring(#candidates))
+
+for i, cand in ipairs(candidates) do
+    w(i .. ") " .. cand.label .. " = " .. safeValue(cand.value))
+end
+
+w("")
+w("======================================")
+w("ENCRYPT / DECRYPT TESTS")
+w("======================================")
+
+local msg = "hello casino"
+local found = false
+
+for i, encKey in ipairs(candidates) do
+    local encrypted = try("encrypt(msg, candidate " .. i .. " " .. encKey.label .. ")", function()
+        return cipher.encrypt(msg, encKey.value)
+    end)
+
+    if type(encrypted) == "string" then
+        w("ENCRYPT SUCCESS USING CANDIDATE " .. i .. ": " .. encKey.label)
+
+        for j, decKey in ipairs(candidates) do
+            local plain = try("decrypt(encrypted, candidate " .. j .. " " .. decKey.label .. ")", function()
+                return cipher.decrypt(encrypted, decKey.value)
+            end)
+
+            if plain == msg then
+                found = true
+                w("")
+                w("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+                w("WORKING RSA PAIR FOUND")
+                w("ENCRYPT KEY CANDIDATE " .. i .. ": " .. encKey.label)
+                w("ENCRYPT KEY VALUE: " .. safeValue(encKey.value))
+                w("DECRYPT KEY CANDIDATE " .. j .. ": " .. decKey.label)
+                w("DECRYPT KEY VALUE: " .. safeValue(decKey.value))
+                w("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+            end
+        end
+    end
+end
+
+if not found then
+    w("")
+    w("NO WORKING PAIR FOUND.")
+    w("This means key strings may be hidden behind methods we have not called yet,")
+    w("or createKeySet/createRandomKeySet returns an internal key object that encrypt() cannot use directly.")
+end
+
+f.close()
+
+print("Done. Wrote " .. OUT_FILE)
+print("Upload/send that file.")
