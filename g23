@@ -1,0 +1,506 @@
+-- guardian_player_only.lua
+-- Plethora/Neural Interface guardian.
+--
+-- Changes from old version:
+--   - Admin/player whitelist is all at the top.
+--   - Laser power/range/delay are adjustable up top.
+--   - Tries to shoot ONLY non-whitelisted players, not mobs/items.
+--   - Prints nearby non-whitelisted entities it sees, with TARGET / ignored reason.
+--   - Uses pcall around sense/fire/walk so one bad entity does not crash the program.
+
+-- =========================================================
+-- === CONFIGURATION
+-- =========================================================
+
+local ownerName = "HughJaynis1234"
+
+-- Set this to the closest sensible range. Smaller = less lag.
+local senseRange = 24
+
+-- Laser settings.
+local attackRange = 15
+local laserPotency = 0.5
+local attackDelay = 0.20
+
+-- Owner follow settings.
+local followOwner = true
+local followDistance = 6
+
+-- Print nearby non-whitelisted entities every X seconds.
+local printSeenEntities = true
+local printEverySeconds = 2.0
+
+-- If true, it will shoot likely-player names even if the sensor does not provide
+-- an explicit player/entity type. This helps older Plethora versions where players
+-- may only show as name/displayName.
+--
+-- If you want the safest "only confirmed players" behavior, set this false.
+local allowNameHeuristicPlayerTargeting = true
+
+-- If true, it will never shoot unless the entity is inside attackRange AND looks
+-- like a player. Keep true.
+local playerOnlyTargeting = true
+
+-- =========================================================
+-- === WHITELIST
+-- =========================================================
+-- Add admins/friends here. Any matching name/displayName is ignored.
+
+local whitelist = {
+    [ownerName] = true,
+
+    -- Owner / admins
+    ["HughJaynis124"] = true,     -- keeping your old typo-safe owner entry
+    ["HughJaynis1234"] = true,
+    ["RadoslawGuzior"] = true,
+    ["RadoSlawGuzior"] = true,
+    ["EmTheTurtle03"] = true,
+    ["pugzma"] = true,
+
+    -- Friendly / known non-player names
+    ["Mista Fista"] = true,
+    ["Mr Fister"] = true,
+    ["Flag"] = true,
+    ["Iron Golem"] = true,
+    ["Glass Item Frame"] = true,
+
+    -- Passive/common mobs
+    ["Allay"] = true,
+    ["Armadillo"] = true,
+    ["Axolotl"] = true,
+    ["Bat"] = true,
+    ["Bee"] = true,
+    ["Camel"] = true,
+    ["Cat"] = true,
+    ["Chicken"] = true,
+    ["Cod"] = true,
+    ["Cow"] = true,
+    ["Dolphin"] = true,
+    ["Donkey"] = true,
+    ["Fox"] = true,
+    ["Frog"] = true,
+    ["Glow Squid"] = true,
+    ["Goat"] = true,
+    ["Horse"] = true,
+    ["Llama"] = true,
+    ["Mooshroom"] = true,
+    ["Mule"] = true,
+    ["Ocelot"] = true,
+    ["Panda"] = true,
+    ["Parrot"] = true,
+    ["Pig"] = true,
+    ["Polar Bear"] = true,
+    ["Pufferfish"] = true,
+    ["Rabbit"] = true,
+    ["Salmon"] = true,
+    ["Sheep"] = true,
+    ["Sniffer"] = true,
+    ["Squid"] = true,
+    ["Strider"] = true,
+    ["Tadpole"] = true,
+    ["Trader Llama"] = true,
+    ["Tropical Fish"] = true,
+    ["Turtle"] = true,
+    ["Villager"] = true,
+    ["Wandering Trader"] = true,
+    ["Wolf"] = true,
+}
+
+-- Prefixes that should always be ignored.
+local whitelistPrefixes = {
+    "item",
+    "Item",
+    "item.",
+    "ItemFrame",
+    "Shop_",
+    "Bot_",
+    "XPO",
+    "XP",
+    "Painting",
+    "painting",
+    "Armor",
+    "armor",
+    "Glass",
+    "glass",
+    "Flag",
+    "flag",
+    "gcflag",
+    "quark",
+}
+
+-- Extra known non-player names/prefixes. These are not printed as targets.
+local commonNonPlayerNames = {
+    ["Zombie"] = true,
+    ["Skeleton"] = true,
+    ["Creeper"] = true,
+    ["Spider"] = true,
+    ["Cave Spider"] = true,
+    ["Enderman"] = true,
+    ["Witch"] = true,
+    ["Slime"] = true,
+    ["Magma Cube"] = true,
+    ["Blaze"] = true,
+    ["Ghast"] = true,
+    ["Wither Skeleton"] = true,
+    ["Zombie Pigman"] = true,
+    ["Zombified Piglin"] = true,
+    ["Piglin"] = true,
+    ["Piglin Brute"] = true,
+    ["Husk"] = true,
+    ["Drowned"] = true,
+    ["Stray"] = true,
+    ["Phantom"] = true,
+    ["Silverfish"] = true,
+    ["Endermite"] = true,
+    ["Vindicator"] = true,
+    ["Evoker"] = true,
+    ["Pillager"] = true,
+    ["Ravager"] = true,
+    ["Shulker"] = true,
+    ["Guardian"] = true,
+    ["Elder Guardian"] = true,
+    ["Vex"] = true,
+
+    -- Common entities/objects
+    ["Item"] = true,
+    ["Experience Orb"] = true,
+    ["Arrow"] = true,
+    ["Spectral Arrow"] = true,
+    ["Trident"] = true,
+    ["Thrown Potion"] = true,
+    ["Fireball"] = true,
+    ["Small Fireball"] = true,
+    ["Falling Block"] = true,
+    ["Minecart"] = true,
+    ["Boat"] = true,
+}
+
+local nonPlayerPrefixes = {
+    "Zombie",
+    "Skeleton",
+    "Creeper",
+    "Spider",
+    "Husk",
+    "Drowned",
+    "Stray",
+    "Ender",
+    "Armor",
+    "Minecart",
+    "Boat",
+    "Arrow",
+    "Thrown",
+    "Falling",
+    "XP",
+    "item",
+    "Item",
+    "quark:",
+    "minecraft:",
+}
+
+-- =========================================================
+-- === MODULE WRAP
+-- =========================================================
+
+local ni = peripheral.find("neuralInterface")
+if not ni then error("Neural Interface not found!") end
+
+-- Optional:
+-- pcall(function() ni.disableAI() end)
+
+-- =========================================================
+-- === HELPERS
+-- =========================================================
+
+local function getEntityName(entity)
+    if not entity then return "Unknown" end
+
+    local displayName = entity.displayName
+    local name = entity.name
+
+    if type(displayName) == "string" and displayName ~= "" then
+        return displayName
+    end
+
+    if type(name) == "string" and name ~= "" then
+        return name
+    end
+
+    return "Unknown"
+end
+
+local function getEntityRawName(entity)
+    if not entity then return "" end
+
+    if type(entity.name) == "string" then
+        return entity.name
+    end
+
+    return ""
+end
+
+local function startsWith(text, prefix)
+    text = tostring(text or "")
+    prefix = tostring(prefix or "")
+    return text:sub(1, #prefix) == prefix
+end
+
+local function isWhitelistedByPrefix(name)
+    for _, prefix in ipairs(whitelistPrefixes) do
+        if startsWith(name, prefix) then
+            return true
+        end
+    end
+
+    return false
+end
+
+local function isWhitelistedEntity(entity)
+    local displayName = getEntityName(entity)
+    local rawName = getEntityRawName(entity)
+
+    if whitelist[displayName] or whitelist[rawName] then
+        return true
+    end
+
+    if isWhitelistedByPrefix(displayName) or isWhitelistedByPrefix(rawName) then
+        return true
+    end
+
+    return false
+end
+
+local function isKnownNonPlayerName(name)
+    if commonNonPlayerNames[name] then
+        return true
+    end
+
+    for _, prefix in ipairs(nonPlayerPrefixes) do
+        if startsWith(name, prefix) then
+            return true
+        end
+    end
+
+    return false
+end
+
+local function distanceOf(entity)
+    local dx = tonumber(entity.x) or 0
+    local dy = tonumber(entity.y) or 0
+    local dz = tonumber(entity.z) or 0
+
+    return math.sqrt(dx * dx + dy * dy + dz * dz)
+end
+
+local function getYawPitch(dx, dy, dz)
+    local yaw = math.deg(math.atan2(-dx, dz))
+    local pitch = math.deg(math.atan2(dy, math.sqrt(dx * dx + dz * dz)))
+    return yaw, pitch
+end
+
+local function looksLikeMinecraftUsername(name)
+    name = tostring(name or "")
+
+    -- Java usernames are usually 3-16 chars, letters/numbers/underscore.
+    -- Some mods/nicknames can differ, but this filters most mobs/items.
+    if #name < 3 or #name > 16 then
+        return false
+    end
+
+    if name:match("^[A-Za-z0-9_]+$") then
+        return true
+    end
+
+    return false
+end
+
+local function entityTypeLooksPlayer(entity)
+    if not entity then return false end
+
+    local fields = {
+        entity.type,
+        entity.entityType,
+        entity.id,
+        entity.key,
+        entity.name,
+    }
+
+    for _, value in ipairs(fields) do
+        if type(value) == "string" then
+            local lower = value:lower()
+
+            if lower == "player"
+                or lower == "minecraft:player"
+                or lower:find("player", 1, true) then
+                return true
+            end
+        end
+    end
+
+    return false
+end
+
+local function isPlayerTarget(entity)
+    if not entity then return false, "nil entity" end
+
+    local displayName = getEntityName(entity)
+    local rawName = getEntityRawName(entity)
+
+    if isWhitelistedEntity(entity) then
+        return false, "whitelisted"
+    end
+
+    if commonNonPlayerNames[displayName] or commonNonPlayerNames[rawName] then
+        return false, "known mob/object"
+    end
+
+    if isKnownNonPlayerName(displayName) or isKnownNonPlayerName(rawName) then
+        return false, "non-player prefix"
+    end
+
+    if entityTypeLooksPlayer(entity) then
+        return true, "confirmed player"
+    end
+
+    if playerOnlyTargeting and allowNameHeuristicPlayerTargeting then
+        if looksLikeMinecraftUsername(displayName) or looksLikeMinecraftUsername(rawName) then
+            return true, "username-like"
+        end
+    end
+
+    if playerOnlyTargeting then
+        return false, "not confirmed player"
+    end
+
+    return true, "non-whitelisted entity"
+end
+
+local function senseEntities()
+    local ok, entities = pcall(function()
+        return ni.sense(senseRange)
+    end)
+
+    if ok and type(entities) == "table" then
+        return entities
+    end
+
+    ok, entities = pcall(function()
+        return ni.sense()
+    end)
+
+    if ok and type(entities) == "table" then
+        return entities
+    end
+
+    print("sense() failed:", tostring(entities))
+    return {}
+end
+
+local function printVisibleEntities(rows)
+    if not printSeenEntities then return end
+
+    term.clear()
+    term.setCursorPos(1, 1)
+
+    print("Guardian running. Player-only targeting:", tostring(playerOnlyTargeting))
+    print("Range:", attackRange, "Power:", laserPotency, "Delay:", attackDelay)
+    print("Owner:", ownerName, "Follow:", tostring(followOwner))
+    print("Non-whitelisted seen entities:")
+    print("--------------------------------")
+
+    if #rows == 0 then
+        print("None.")
+        return
+    end
+
+    for i = 1, math.min(#rows, 16) do
+        local r = rows[i]
+        print(string.format(
+            "%s | %.1fm | %s | %s",
+            r.target and "TARGET" or "ignore",
+            r.dist or 0,
+            r.name or "?",
+            r.reason or "?"
+        ))
+    end
+
+    if #rows > 16 then
+        print("...+" .. tostring(#rows - 16) .. " more")
+    end
+end
+
+-- =========================================================
+-- === MAIN LOOP
+-- =========================================================
+
+local lastPrintAt = 0
+
+while true do
+    local entities = senseEntities()
+    local owner = nil
+    local seenRows = {}
+
+    for _, entity in ipairs(entities) do
+        local name = getEntityName(entity)
+        local rawName = getEntityRawName(entity)
+        local dist = distanceOf(entity)
+
+        if name == ownerName or rawName == ownerName then
+            owner = entity
+
+        elseif not isWhitelistedEntity(entity) then
+            local target, reason = isPlayerTarget(entity)
+
+            table.insert(seenRows, {
+                name = name,
+                dist = dist,
+                target = target and dist <= attackRange,
+                reason = reason
+            })
+
+            if target and dist <= attackRange then
+                local dx = tonumber(entity.x) or 0
+                local dy = tonumber(entity.y) or 0
+                local dz = tonumber(entity.z) or 0
+
+                local yaw, pitch = getYawPitch(dx, 0.5 - dy, dz)
+
+                local ok, err = pcall(function()
+                    ni.fire(yaw, pitch, laserPotency)
+                end)
+
+                if not ok then
+                    print("fire failed:", tostring(err))
+                    sleep(0.5)
+                end
+            end
+        end
+    end
+
+    if followOwner and owner then
+        local dx = tonumber(owner.x) or 0
+        local dy = tonumber(owner.y) or 0
+        local dz = tonumber(owner.z) or 0
+        local dist = math.sqrt(dx * dx + dy * dy + dz * dz)
+
+        if dist > followDistance then
+            pcall(function()
+                ni.walk(dx, dy, dz)
+            end)
+        end
+    end
+
+    if printSeenEntities and os.clock() - lastPrintAt >= printEverySeconds then
+        table.sort(seenRows, function(a, b)
+            if a.target ~= b.target then
+                return a.target and not b.target
+            end
+
+            return (a.dist or 999) < (b.dist or 999)
+        end)
+
+        printVisibleEntities(seenRows)
+        lastPrintAt = os.clock()
+    end
+
+    sleep(attackDelay)
+end
