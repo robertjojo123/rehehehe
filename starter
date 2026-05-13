@@ -1,0 +1,190 @@
+-- startup_protected_runtime_goodCC.lua
+-- Copy this file to /startup on each casino computer.
+--
+-- What this does:
+--   1. Your real casino program starts automatically with NO password needed.
+--   2. Normal players do NOT get shell/file access.
+--   3. If the casino program crashes, exits, or someone Ctrl+T's it,
+--      the computer drops to a password wall.
+--   4. Failed passwords do NOT lock you out forever and do NOT delete anything.
+--      It just waits and asks again.
+--   5. Correct password gives you a normal shell for editing/maintenance.
+--
+-- Password is: goodCC
+
+local REAL_PROGRAM = "/CHANGE_ME.lua"
+-- Examples:
+-- local REAL_PROGRAM = "/account_computer_secure_chunked.lua"
+-- local REAL_PROGRAM = "/roulette_secure_chunked_smooth.lua"
+-- local REAL_PROGRAM = "/blackjack_table_secure_chunked.lua"
+
+local PASSWORD_HASH = "161274240"
+local SALT = "casino_lock_v1"
+
+-- Disable disk startup bypass if this CC version supports settings.
+pcall(function()
+    settings.set("shell.allow_disk_startup", false)
+    settings.save(".settings")
+end)
+
+local function hashPassword(s)
+    -- Old-CC-safe hash: no bitwise operators required.
+    s = tostring(SALT) .. tostring(s or "")
+
+    local h = 5381
+
+    for i = 1, #s do
+        h = ((h * 33) + s:byte(i)) % 2147483647
+    end
+
+    return tostring(h)
+end
+
+local function safeColor(color)
+    if term.isColor and not term.isColor() then return end
+    if term.setTextColor and color then
+        term.setTextColor(color)
+    end
+end
+
+local function clearScreen()
+    if term.setBackgroundColor then
+        term.setBackgroundColor(colors.black)
+    end
+
+    safeColor(colors.white)
+    term.clear()
+    term.setCursorPos(1, 1)
+end
+
+local function centerWrite(y, text, color)
+    local w, h = term.getSize()
+    safeColor(color or colors.white)
+    term.setCursorPos(math.max(1, math.floor((w - #text) / 2) + 1), y)
+    term.write(text)
+end
+
+local function drawPasswordScreen(message, messageColor)
+    clearScreen()
+
+    centerWrite(3, "CASINO COMPUTER PROTECTED", colors.red)
+    centerWrite(5, "Password required for shell access.", colors.yellow)
+
+    if message and message ~= "" then
+        centerWrite(7, tostring(message), messageColor or colors.white)
+    end
+
+    safeColor(colors.white)
+    term.setCursorPos(1, 10)
+    term.write("Password: ")
+end
+
+local function readPasswordMasked()
+    local password = ""
+
+    while true do
+        local event, a = os.pullEventRaw()
+
+        if event == "char" then
+            password = password .. a
+            term.write("*")
+
+        elseif event == "paste" then
+            -- Paste blocked intentionally.
+
+        elseif event == "key" then
+            if a == keys.enter then
+                print("")
+                return password
+
+            elseif a == keys.backspace then
+                if #password > 0 then
+                    password = password:sub(1, -2)
+
+                    local x, y = term.getCursorPos()
+                    if x > 1 then
+                        term.setCursorPos(x - 1, y)
+                        term.write(" ")
+                        term.setCursorPos(x - 1, y)
+                    end
+                end
+            end
+
+        elseif event == "terminate" then
+            -- Eat Ctrl+T while at password wall.
+            drawPasswordScreen("Terminate blocked.", colors.red)
+        end
+    end
+end
+
+local function passwordGate()
+    local attempts = 0
+
+    while true do
+        drawPasswordScreen()
+
+        local input = readPasswordMasked()
+
+        if hashPassword(input) == PASSWORD_HASH then
+            clearScreen()
+            centerWrite(6, "Access granted. Shell unlocked.", colors.lime)
+            sleep(0.5)
+            clearScreen()
+            return true
+        end
+
+        attempts = attempts + 1
+
+        drawPasswordScreen("Access denied. Attempts: " .. tostring(attempts), colors.red)
+        sleep(1.5)
+        -- No permanent lockout, no reboot, no deletion.
+        -- It just keeps asking until the right password is entered.
+    end
+end
+
+local function runCasinoProgram()
+    if not fs.exists(REAL_PROGRAM) then
+        clearScreen()
+        safeColor(colors.red)
+        print("Configured program not found:")
+        safeColor(colors.yellow)
+        print(REAL_PROGRAM)
+        safeColor(colors.white)
+        print("")
+        print("Password required to access shell and fix /startup.")
+        passwordGate()
+        return
+    end
+
+    clearScreen()
+    print("Starting protected casino program:")
+    print(REAL_PROGRAM)
+    sleep(0.5)
+
+    -- If the real program is terminated/crashes/returns, do NOT expose shell.
+    -- Go to password wall first.
+    local ok, err = pcall(function()
+        shell.run(REAL_PROGRAM)
+    end)
+
+    clearScreen()
+
+    if not ok then
+        safeColor(colors.red)
+        print("Protected program stopped/crashed:")
+        safeColor(colors.white)
+        print(tostring(err))
+    else
+        safeColor(colors.yellow)
+        print("Protected program exited.")
+        safeColor(colors.white)
+    end
+
+    print("")
+    print("Shell remains locked until password is entered.")
+    sleep(2)
+
+    passwordGate()
+end
+
+runCasinoProgram()
