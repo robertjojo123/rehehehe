@@ -1,0 +1,39 @@
+local function dumpMethods(name)
+    print("Peripheral: " .. tostring(name))
+    print("Type: " .. tostring(peripheral.getType(name)))
+    local ok, methods = pcall(peripheral.getMethods, name)
+    if not ok then
+        print("Could not get methods.")
+        return
+    end
+
+    table.sort(methods)
+    for _, m in ipairs(methods) do
+        print("  " .. m)
+    end
+end
+
+term.clear()
+term.setCursorPos(1,1)
+print("Tape/peripheral method probe")
+print("----------------------------")
+print("")
+
+local names = peripheral.getNames()
+if #names == 0 then
+    print("No peripherals attached.")
+    return
+end
+
+for _, name in ipairs(names) do
+    local typ = tostring(peripheral.getType(name) or "")
+    local methods = peripheral.getMethods(name) or {}
+    local joined = table.concat(methods, " "):lower()
+
+    if typ:lower():find("tape") or joined:find("play") or joined:find("write") or joined:find("seek") then
+        dumpMethods(name)
+        print("")
+    end
+end
+
+print("Done. Send these method names if tape writing fails.")
