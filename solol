@@ -1,0 +1,284 @@
+local BASE = "PASTE_CLOUDFLARE_TUNNEL_URL_HERE"
+
+local MONITOR_NAME = nil
+local DEFAULT_FPS = 10
+local DEFAULT_MAX_SECONDS = 60
+
+local COLOR_SLOTS = {
+    colors.white, colors.orange, colors.magenta, colors.lightBlue,
+    colors.yellow, colors.lime, colors.pink, colors.gray,
+    colors.lightGray, colors.cyan, colors.purple, colors.blue,
+    colors.brown, colors.green, colors.red, colors.black,
+}
+
+local HEX_TO_SLOT_INDEX = {
+    ["0"] = 1, ["1"] = 2, ["2"] = 3, ["3"] = 4,
+    ["4"] = 5, ["5"] = 6, ["6"] = 7, ["7"] = 8,
+    ["8"] = 9, ["9"] = 10, ["a"] = 11, ["b"] = 12,
+    ["c"] = 13, ["d"] = 14, ["e"] = 15, ["f"] = 16,
+}
+
+local function urlEncode(s)
+    return tostring(s):gsub("([^%w%-_%.~])", function(c)
+        return string.format("%%%02X", string.byte(c))
+    end)
+end
+
+local function get(url)
+    local res, err = http.get(url)
+    if not res then return nil, err end
+    local body = res.readAll()
+    res.close()
+    return body, nil
+end
+
+local function getJson(url)
+    local body, err = get(url)
+    if not body then return nil, err end
+    local data = textutils.unserializeJSON(body)
+    if not data then return nil, "Bad JSON: " .. tostring(body) end
+    return data, nil
+end
+
+local function clearScreen()
+    term.setBackgroundColor(colors.black)
+    term.setTextColor(colors.white)
+    term.clear()
+    term.setCursorPos(1, 1)
+end
+
+local function waitKey()
+    print("")
+    print("Press any key...")
+    os.pullEvent("key")
+end
+
+local function trim(s, n)
+    s = tostring(s or "")
+    if #s <= n then return s end
+    return s:sub(1, n - 3) .. "..."
+end
+
+local function getDisplay()
+    local mon = nil
+    if MONITOR_NAME then
+        mon = peripheral.wrap(MONITOR_NAME)
+    else
+        mon = peripheral.find("monitor")
+    end
+
+    if not mon then mon = term.current() end
+    if mon.setTextScale then mon.setTextScale(0.5) end
+    return mon
+end
+
+local function hexToBytesString(hex)
+    local out = {}
+    for i = 1, #hex, 2 do
+        out[#out + 1] = string.char(tonumber(hex:sub(i, i + 1), 16))
+    end
+    return table.concat(out)
+end
+
+local function newFrame()
+    return {
+        palette = {},
+        rows = {},
+    }
+end
+
+local function applyPalette(mon, palette)
+    for i = 1, 16 do
+        local p = palette[i]
+        if p then
+            mon.setPaletteColor(COLOR_SLOTS[i], p[1], p[2], p[3])
+        end
+    end
+end
+
+local function renderFrame(mon, frame)
+    applyPalette(mon, frame.palette)
+
+    for y = 1, #frame.rows do
+        local row = frame.rows[y]
+        if row then
+            mon.setCursorPos(1, y)
+            mon.blit(row.chars, row.fg, row.bg)
+        end
+    end
+end
+
+local function chooseVideo()
+    local data, err = getJson(BASE .. "/list")
+    if not data then
+        print("List failed: " .. tostring(err))
+        return nil
+    end
+
+    local vids = data.videos or {}
+    if #vids == 0 then
+        print("No videos found.")
+        print("Put video files in the server's videos folder.")
+        return nil
+    end
+
+    while true do
+        clearScreen()
+        print("Local videos")
+        print("------------")
+        for i, v in ipairs(vids) do
+            print(i .. ". " .. trim(v.name, 44))
+        end
+        print("")
+        print("[1-" .. #vids .. "] pick")
+        print("[q] quit")
+        write("> ")
+
+        local c = tostring(read() or ""):lower()
+        if c == "q" then return nil end
+
+        local n = tonumber(c)
+        if n and vids[n] then
+            return vids[n].name
+        end
+    end
+end
+
+local function streamVideo(name)
+    local url = BASE
+        .. "/stream?name=" .. urlEncode(name)
+        .. "&fps=" .. tostring(DEFAULT_FPS)
+        .. "&max_seconds=" .. tostring(DEFAULT_MAX_SECONDS)
+
+    clearScreen()
+    print("Opening live stream...")
+    print("This uses no CC disk files.")
+    print("")
+
+    local res, err = http.get(url)
+    if not res then
+        print("Stream open failed:")
+        print(tostring(err))
+        waitKey()
+        return
+    end
+
+    local mon = getDisplay()
+    if mon.setTextScale then mon.setTextScale(0.5) end
+    mon.setBackgroundColor(colors.black)
+    mon.clear()
+
+    local section = "header"
+    local frame = nil
+    local framesPlayed = 0
+    local fps = DEFAULT_FPS
+    local startClock = os.clock()
+
+    local function presentFrame()
+        if not frame then return end
+
+        framesPlayed = framesPlayed + 1
+        renderFrame(mon, frame)
+
+        local target = startClock + (framesPlayed / fps)
+        local now = os.clock()
+        local delay = target - now
+
+        if delay > 0 then
+            sleep(delay)
+        else
+            sleep(0)
+        end
+
+        frame = nil
+        section = "header"
+    end
+
+    while true do
+        local line = res.readLine()
+        if not line then break end
+
+        if line:sub(1, 6) == "FRAME " then
+            frame = newFrame()
+            section = "frame"
+
+        elseif line == "PALETTE" then
+            section = "palette"
+
+        elseif line == "ROWS" then
+            section = "rows"
+
+        elseif line == "END_FRAME" then
+            presentFrame()
+
+        elseif line == "END" then
+            break
+
+        elseif section == "palette" and frame and line:sub(1, 2) == "P " then
+            local slot, rgb = line:match("^P%s+([0-9a-f])%s+([0-9a-fA-F]+)")
+            if slot and rgb and #rgb >= 6 then
+                local idx = HEX_TO_SLOT_INDEX[slot]
+                if idx then
+                    local r = tonumber(rgb:sub(1, 2), 16) or 0
+                    local g = tonumber(rgb:sub(3, 4), 16) or 0
+                    local b = tonumber(rgb:sub(5, 6), 16) or 0
+                    frame.palette[idx] = {r / 255, g / 255, b / 255}
+                end
+            end
+
+        elseif section == "rows" and frame and line:sub(1, 2) == "R " then
+            local y, charHex, fg, bg = line:match("^R%s+(%d+)%s+([0-9a-fA-F]+)%s+([0-9a-f]+)%s+([0-9a-f]+)")
+            y = tonumber(y)
+            if y and charHex and fg and bg then
+                frame.rows[y] = {
+                    chars = hexToBytesString(charHex),
+                    fg = fg,
+                    bg = bg,
+                }
+            end
+
+        else
+            local k, v = line:match("^([%w_]+)=(.*)$")
+            if k and k == "fps" then
+                fps = tonumber(v) or DEFAULT_FPS
+            end
+        end
+    end
+
+    res.close()
+
+    clearScreen()
+    print("Stream ended.")
+    print("Frames played: " .. tostring(framesPlayed))
+    waitKey()
+end
+
+clearScreen()
+print("Testing live stream server...")
+local pong, pingErr = get(BASE .. "/ping")
+if not pong then
+    print("Ping failed:")
+    print(tostring(pingErr))
+    print("")
+    print("Check BASE in this Lua file.")
+    waitKey()
+    return
+end
+
+local chosen = chooseVideo()
+if not chosen then return end
+
+clearScreen()
+print("Selected:")
+print(chosen)
+print("")
+print("Mode: single live HTTP stream")
+print("No CC files, no chunk boundaries.")
+print("")
+print("Start stream?")
+print("[y] yes")
+write("> ")
+
+if tostring(read() or ""):lower() == "y" then
+    streamVideo(chosen)
+end
