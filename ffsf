@@ -1,0 +1,315 @@
+local BASE = "https://warm-told-cooperation-equivalent.trycloudflare.com"
+
+local DEFAULT_FPS = 10
+local TOTAL_SECONDS = 60
+local SEGMENT_SECONDS = 60
+
+local COLOR_SLOTS = {
+    colors.white, colors.orange, colors.magenta, colors.lightBlue,
+    colors.yellow, colors.lime, colors.pink, colors.gray,
+    colors.lightGray, colors.cyan, colors.purple, colors.blue,
+    colors.brown, colors.green, colors.red, colors.black,
+}
+
+local HEX_TO_SLOT_INDEX = {
+    ["0"] = 1, ["1"] = 2, ["2"] = 3, ["3"] = 4,
+    ["4"] = 5, ["5"] = 6, ["6"] = 7, ["7"] = 8,
+    ["8"] = 9, ["9"] = 10, ["a"] = 11, ["b"] = 12,
+    ["c"] = 13, ["d"] = 14, ["e"] = 15, ["f"] = 16,
+}
+
+local function urlEncode(s)
+    return tostring(s):gsub("([^%w%-_%.~])", function(c)
+        return string.format("%%%02X", string.byte(c))
+    end)
+end
+
+local function clear()
+    term.setBackgroundColor(colors.black)
+    term.setTextColor(colors.white)
+    term.clear()
+    term.setCursorPos(1,1)
+end
+
+local function get(url)
+    local h, err = http.get(url)
+    if not h then return nil, err end
+    local b = h.readAll()
+    h.close()
+    return b
+end
+
+local function getJson(url)
+    local b, err = get(url)
+    if not b then return nil, err end
+    local j = textutils.unserializeJSON(b)
+    if not j then return nil, "bad json: "..tostring(b) end
+    return j
+end
+
+local function waitKey()
+    print("")
+    print("Press any key...")
+    os.pullEvent("key")
+end
+
+local function trim(s,n)
+    s = tostring(s or "")
+    if #s <= n then return s end
+    return s:sub(1,n-3).."..."
+end
+
+local function hexByte(h)
+    return string.char(tonumber(h, 16))
+end
+
+local function getDisplay()
+    local mon = peripheral.find("monitor") or term.current()
+    if mon.setTextScale then mon.setTextScale(0.5) end
+    mon.setBackgroundColor(colors.black)
+    mon.clear()
+    return mon
+end
+
+local function findTapeDrive()
+    for _, name in ipairs(peripheral.getNames()) do
+        local typ = tostring(peripheral.getType(name) or "")
+        local ok, methods = pcall(peripheral.getMethods, name)
+        methods = ok and methods or {}
+        local joined = table.concat(methods, " "):lower()
+        if typ:lower():find("tape") or (joined:find("write") and joined:find("play") and joined:find("seek")) then
+            return peripheral.wrap(name)
+        end
+    end
+    return nil
+end
+
+local function rewindTape(tape)
+    pcall(function() tape.stop() end)
+    sleep(0.1)
+    pcall(function() tape.seek(-999999999) end)
+    sleep(0.1)
+end
+
+local function writeAudioToTape(audioUrl, speed)
+    local tape = findTapeDrive()
+    if not tape then
+        print("No tape drive found.")
+        return nil
+    end
+    rewindTape(tape)
+    pcall(function() tape.setSpeed(speed or 2.0) end)
+
+    local res = http.get(audioUrl, nil, true) or http.get(audioUrl)
+    if not res then
+        print("Failed to open audio URL")
+        return nil
+    end
+
+    local written = 0
+    while true do
+        local chunk = nil
+        local ok, data = pcall(function() return res.read(8192) end)
+        if ok then chunk = data else chunk = res.readAll() end
+        if not chunk or #chunk == 0 then break end
+        local wok, werr = pcall(function() tape.write(chunk) end)
+        if not wok then
+            print("Tape write failed: "..tostring(werr))
+            res.close()
+            return nil
+        end
+        written = written + #chunk
+        if written % 65536 < 8192 then
+            clear()
+            print("Writing audio to tape...")
+            print("Bytes: "..written)
+        end
+    end
+    res.close()
+    rewindTape(tape)
+    pcall(function() tape.setSpeed(speed or 2.0) end)
+    return tape
+end
+
+local function startTape(tape, speed)
+    rewindTape(tape)
+    pcall(function() tape.setSpeed(speed or 2.0) end)
+    sleep(0.1)
+    pcall(function() tape.play() end)
+end
+
+local function applyPalette(mon, pal)
+    for i=1,16 do
+        local p = pal[i]
+        if p then mon.setPaletteColor(COLOR_SLOTS[i], p[1], p[2], p[3]) end
+    end
+end
+
+local function decodeRLE(s)
+    local chars, fg, bg = {}, {}, {}
+    for token in string.gmatch(s, "([^,]+)") do
+        local count, cell = token:match("^(%d+)%*(%x%x%x%x)$")
+        if not count then
+            count = 1
+            cell = token
+        else
+            count = tonumber(count)
+        end
+        if cell and #cell == 4 then
+            local ch = hexByte(cell:sub(1,2))
+            local f = cell:sub(3,3)
+            local b = cell:sub(4,4)
+            for i=1,count do
+                chars[#chars+1] = ch
+                fg[#fg+1] = f
+                bg[#bg+1] = b
+            end
+        end
+    end
+    return table.concat(chars), table.concat(fg), table.concat(bg)
+end
+
+local function drawSpan(mon, y, x, rle)
+    local chars, fg, bg = decodeRLE(rle)
+    mon.setCursorPos(x, y)
+    mon.blit(chars, fg, bg)
+end
+
+local function playCVD2(url, mon, playback)
+    local res, err = http.get(url)
+    if not res then return false, err end
+    local pal = {}
+    local inPalette = false
+    while true do
+        local line = res.readLine()
+        if not line then break end
+
+        if line == "PALETTE" then
+            inPalette = true
+        elseif line:sub(1,2) == "P " then
+            local slot, rgb = line:match("^P%s+([0-9a-f])%s+([0-9a-fA-F]+)")
+            if slot and rgb then
+                local idx = HEX_TO_SLOT_INDEX[slot]
+                pal[idx] = {
+                    tonumber(rgb:sub(1,2),16)/255,
+                    tonumber(rgb:sub(3,4),16)/255,
+                    tonumber(rgb:sub(5,6),16)/255
+                }
+            end
+        elseif line:sub(1,2) == "F " then
+            playback.currentFrame = tonumber(line:match("^F%s+(%d+)")) or (playback.currentFrame + 1)
+        elseif line:sub(1,2) == "S " then
+            local y,x,rle = line:match("^S%s+(%d+)%s+(%d+)%s+(.+)$")
+            if y and x and rle then
+                drawSpan(mon, tonumber(y), tonumber(x), rle)
+            end
+        elseif line == "E" then
+            playback.frames = playback.frames + 1
+            local target = playback.start + ((playback.currentFrame - 1) / playback.fps)
+            local delay = target - os.clock()
+            if delay > 0 then sleep(delay) else sleep(0) end
+        elseif line == "END" then
+            break
+        elseif line:match("^fps=") then
+            playback.fps = tonumber(line:match("^fps=(.+)$")) or playback.fps
+        end
+    end
+    res.close()
+    applyPalette(mon, pal)
+    return true
+end
+
+local function search()
+    clear()
+    print("YouTube search or URL:")
+    write("> ")
+    local q = read()
+    clear()
+    print("Searching...")
+    local data, err = getJson(BASE.."/yt_search?q="..urlEncode(q).."&max_results=5")
+    if not data then print(err) waitKey() return nil end
+    local r = data.results or {}
+    for i,v in ipairs(r) do
+        print(i..". "..trim(v.title,42))
+        print("   "..trim(v.channel,34))
+    end
+    print("")
+    write("Pick: ")
+    local n = tonumber(read())
+    if n and r[n] then return r[n] end
+    return nil
+end
+
+local function waitReady(job)
+    while true do
+        local st = getJson(BASE.."/status?job="..urlEncode(job))
+        clear()
+        print("Preparing YouTube job...")
+        if st then
+            print("Status: "..tostring(st.status))
+            print("Audio: "..tostring(st.audio_ready).." bytes "..tostring(st.audio_bytes or 0))
+            print("Segments: "..tostring(st.segments_ready or 0).."/"..tostring(st.segment_count or 0))
+            print(tostring(st.message or ""))
+            if st.status == "error" then print(st.error) waitKey() return nil end
+            if st.audio_ready and tonumber(st.segments_ready or 0) >= 1 then return st end
+        end
+        sleep(1)
+    end
+end
+
+clear()
+print("Testing server...")
+local pong, err = get(BASE.."/ping")
+if not pong then print("Ping failed: "..tostring(err)) waitKey() return end
+
+local picked = search()
+if not picked then return end
+
+clear()
+print("Picked:")
+print(trim(picked.title,50))
+print("")
+print("Total seconds: "..TOTAL_SECONDS)
+print("Continue? y")
+if tostring(read()):lower() ~= "y" then return end
+
+local prep = getJson(BASE.."/yt_prepare?id="..urlEncode(picked.id).."&total_seconds="..TOTAL_SECONDS.."&segment_seconds="..SEGMENT_SECONDS.."&fps="..DEFAULT_FPS)
+if not prep then print("prepare failed") waitKey() return end
+
+local st = waitReady(prep.job)
+if not st then return end
+
+local man = getJson(BASE.."/manifest?job="..urlEncode(prep.job))
+if not man then print("No manifest") waitKey() return end
+
+local audioUrl = man.audio_url
+if audioUrl:sub(1,1) == "/" then audioUrl = BASE..audioUrl end
+
+local tape = writeAudioToTape(audioUrl, man.tape_speed or 2.0)
+if not tape then waitKey() return end
+
+local mon = getDisplay()
+startTape(tape, man.tape_speed or 2.0)
+
+local playback = {fps=man.fps or DEFAULT_FPS, start=os.clock(), frames=0, currentFrame=1}
+for i,seg in ipairs(man.segments or {}) do
+    clear()
+    print("Playing segment "..i)
+    print("Frames: "..playback.frames)
+    local url = seg.url
+    if url:sub(1,1) == "/" then url = BASE..url end
+    local ok, e = playCVD2(url, mon, playback)
+    if not ok then
+        term.redirect(term.native())
+        clear()
+        print("Video segment failed: "..tostring(e))
+        waitKey()
+        return
+    end
+end
+
+term.redirect(term.native())
+clear()
+print("Done.")
+print("Frames: "..playback.frames)
+waitKey()
