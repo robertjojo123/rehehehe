@@ -1,0 +1,328 @@
+local BASE = "https://cc-yt-bridge.onrender.com"
+
+local MONITOR_NAME = nil
+
+local COLOR_SLOTS = {
+    colors.white, colors.orange, colors.magenta, colors.lightBlue,
+    colors.yellow, colors.lime, colors.pink, colors.gray,
+    colors.lightGray, colors.cyan, colors.purple, colors.blue,
+    colors.brown, colors.green, colors.red, colors.black,
+}
+
+local HEX_TO_SLOT_INDEX = {
+    ["0"] = 1, ["1"] = 2, ["2"] = 3, ["3"] = 4,
+    ["4"] = 5, ["5"] = 6, ["6"] = 7, ["7"] = 8,
+    ["8"] = 9, ["9"] = 10, ["a"] = 11, ["b"] = 12,
+    ["c"] = 13, ["d"] = 14, ["e"] = 15, ["f"] = 16,
+}
+
+local function urlEncode(s)
+    return tostring(s):gsub("([^%w%-_%.~])", function(c)
+        return string.format("%%%02X", string.byte(c))
+    end)
+end
+
+local function get(url)
+    local res, err = http.get(url)
+    if not res then return nil, err end
+    local body = res.readAll()
+    res.close()
+    return body, nil
+end
+
+local function getJson(url)
+    local body, err = get(url)
+    if not body then return nil, err end
+    local data = textutils.unserializeJSON(body)
+    if not data then return nil, "Bad JSON: " .. tostring(body) end
+    return data, nil
+end
+
+local function clearScreen()
+    term.setBackgroundColor(colors.black)
+    term.setTextColor(colors.white)
+    term.clear()
+    term.setCursorPos(1, 1)
+end
+
+local function waitKey()
+    print("")
+    print("Press any key...")
+    os.pullEvent("key")
+end
+
+local function trim(s, n)
+    s = tostring(s or "")
+    if #s <= n then return s end
+    return s:sub(1, n - 3) .. "..."
+end
+
+local function downloadFile(url, path)
+    local body, err = get(url)
+    if not body then return false, err end
+    local f, ferr = fs.open(path, "w")
+    if not f then return false, ferr end
+    f.write(body)
+    f.close()
+    return true, nil
+end
+
+local function readAll(path)
+    local f = fs.open(path, "r")
+    if not f then return nil end
+    local s = f.readAll()
+    f.close()
+    return s
+end
+
+local function getDisplay()
+    local mon = nil
+    if MONITOR_NAME then mon = peripheral.wrap(MONITOR_NAME) else mon = peripheral.find("monitor") end
+    if not mon then mon = term.current() end
+    if mon.setTextScale then mon.setTextScale(0.5) end
+    return mon
+end
+
+local function hexToBytesString(hex)
+    local out = {}
+    for i = 1, #hex, 2 do
+        out[#out + 1] = string.char(tonumber(hex:sub(i, i + 1), 16))
+    end
+    return table.concat(out)
+end
+
+local function parseCCV(text)
+    local frame = {meta = {}, palette = {}, rows = {}}
+    local section = "header"
+
+    for line in string.gmatch(text, "[^\r\n]+") do
+        if line == "PALETTE" then
+            section = "palette"
+        elseif line == "ROWS" then
+            section = "rows"
+        elseif line == "END_FRAME" then
+            section = "done_frame"
+        elseif line == "END" then
+            section = "done"
+        elseif line:sub(1, 6) == "FRAME " then
+            section = "frame"
+            frame.meta.frame = tonumber(line:match("^FRAME%s+(%d+)")) or 1
+        elseif section == "palette" and line:sub(1, 2) == "P " then
+            local slot, rgb = line:match("^P%s+([0-9a-f])%s+([0-9a-fA-F]+)")
+            if slot and rgb and #rgb >= 6 then
+                local idx = HEX_TO_SLOT_INDEX[slot]
+                if idx then
+                    local r = tonumber(rgb:sub(1, 2), 16) or 0
+                    local g = tonumber(rgb:sub(3, 4), 16) or 0
+                    local b = tonumber(rgb:sub(5, 6), 16) or 0
+                    frame.palette[idx] = {r / 255, g / 255, b / 255}
+                end
+            end
+        elseif section == "rows" and line:sub(1, 2) == "R " then
+            local y, charHex, fg, bg = line:match("^R%s+(%d+)%s+([0-9a-fA-F]+)%s+([0-9a-f]+)%s+([0-9a-f]+)")
+            y = tonumber(y)
+            if y and charHex and fg and bg then
+                frame.rows[y] = {chars = hexToBytesString(charHex), fg = fg, bg = bg}
+            end
+        else
+            local k, v = line:match("^([%w_]+)=(.*)$")
+            if k then frame.meta[k] = v end
+        end
+    end
+
+    return frame
+end
+
+local function renderFrame(mon, frame)
+    if mon.setTextScale then mon.setTextScale(0.5) end
+
+    for i = 1, 16 do
+        local p = frame.palette[i]
+        if p then mon.setPaletteColor(COLOR_SLOTS[i], p[1], p[2], p[3]) end
+    end
+
+    mon.setBackgroundColor(colors.black)
+    mon.clear()
+
+    for y = 1, #frame.rows do
+        local row = frame.rows[y]
+        if row then
+            mon.setCursorPos(1, y)
+            mon.blit(row.chars, row.fg, row.bg)
+        end
+    end
+end
+
+local pageTokens = {""}
+local page = 1
+local lastQuery = nil
+
+while true do
+    clearScreen()
+    print("CC Fast Thumbnail Frame")
+    print("-----------------------")
+    print("Search terms OR paste YouTube URL.")
+    print("")
+    write("Search/URL: ")
+
+    local q = read()
+
+    if not q or q == "" then
+        print("No input.")
+        waitKey()
+    else
+        lastQuery = q
+        pageTokens = {""}
+        page = 1
+
+        while true do
+            clearScreen()
+            print("Searching page " .. tostring(page) .. "...")
+
+            local token = pageTokens[page] or ""
+            local url = BASE .. "/search?q=" .. urlEncode(lastQuery) .. "&max_results=5"
+            if token ~= "" then url = url .. "&page_token=" .. urlEncode(token) end
+
+            local data, err = getJson(url)
+            if not data then
+                print("Search failed:")
+                print(tostring(err))
+                waitKey()
+                break
+            end
+
+            local results = data.results or {}
+            local nextToken = data.nextPageToken or ""
+            if nextToken ~= "" and not pageTokens[page + 1] then pageTokens[page + 1] = nextToken end
+
+            clearScreen()
+            print("Results page " .. tostring(page))
+            if data.mode == "direct_url" then print("Mode: direct URL") end
+            print("----------------")
+            print("")
+
+            if #results == 0 then
+                print("No results.")
+                waitKey()
+                break
+            end
+
+            for i, v in ipairs(results) do
+                print(i .. ". " .. trim(v.title, 42))
+                print("   " .. trim(v.channel, 36))
+                if v.duration and v.duration ~= "" then print("   " .. tostring(v.duration)) end
+                print("")
+            end
+
+            print("[1-" .. tostring(#results) .. "] pick")
+            if nextToken ~= "" then print("[n] next page") end
+            if page > 1 then print("[p] previous page") end
+            print("[s] new search")
+            print("[q] quit")
+            write("> ")
+
+            local choice = tostring(read() or ""):lower()
+
+            if choice == "q" then
+                return
+            elseif choice == "s" then
+                break
+            elseif choice == "n" and nextToken ~= "" then
+                page = page + 1
+            elseif choice == "p" and page > 1 then
+                page = page - 1
+            else
+                local idx = tonumber(choice)
+
+                if idx and results[idx] then
+                    local picked = results[idx]
+
+                    clearScreen()
+                    print("Picked:")
+                    print(trim(picked.title, 50))
+                    print(trim(picked.channel, 50))
+                    print("ID: " .. tostring(picked.id))
+                    print("")
+                    print("Prepare fast thumbnail frame?")
+                    print("[y] yes")
+                    print("[anything else] back")
+                    write("> ")
+
+                    local yes = tostring(read() or ""):lower()
+
+                    if yes == "y" or yes == "yes" then
+                        clearScreen()
+                        print("Preparing fast thumbnail...")
+                        print("This should be much quicker.")
+
+                        local prepUrl = BASE
+                            .. "/prepare?id=" .. urlEncode(picked.id)
+                            .. "&title=" .. urlEncode(picked.title or "")
+
+                        if picked.thumbnail and picked.thumbnail ~= "" then
+                            prepUrl = prepUrl .. "&thumbnail=" .. urlEncode(picked.thumbnail)
+                        end
+
+                        local prep, prepErr = getJson(prepUrl)
+
+                        if not prep then
+                            print("Prepare failed:")
+                            print(tostring(prepErr))
+                            waitKey()
+                        else
+                            print("OK: " .. tostring(prep.ok))
+                            print("Job: " .. tostring(prep.job))
+                            print("Status: " .. tostring(prep.status))
+                            print("")
+
+                            local manifestUrl = prep.manifest_url or (BASE .. "/manifest")
+                            print("Downloading manifest...")
+                            local manifest, manErr = getJson(manifestUrl)
+
+                            if not manifest then
+                                print("Manifest failed:")
+                                print(tostring(manErr))
+                                waitKey()
+                            else
+                                print("Source: " .. tostring(manifest.source))
+                                print("Debug preview:")
+                                print(tostring(manifest.debug_preview_url))
+                                print("")
+                                local first = manifest.chunks and manifest.chunks[1]
+                                if first and first.url then
+                                    print("Downloading chunk...")
+                                    local ok, derr = downloadFile(first.url, "/chunk_0001.ccv")
+
+                                    if not ok then
+                                        print("Chunk download failed:")
+                                        print(tostring(derr))
+                                        waitKey()
+                                    else
+                                        print("Parsing/rendering...")
+                                        local ccv = readAll("/chunk_0001.ccv")
+                                        if not ccv then
+                                            print("Could not read local chunk.")
+                                            waitKey()
+                                        else
+                                            local frame = parseCCV(ccv)
+                                            local mon = getDisplay()
+                                            renderFrame(mon, frame)
+                                            print("Rendered.")
+                                            waitKey()
+                                        end
+                                    end
+                                else
+                                    print("No chunk URL in manifest.")
+                                    waitKey()
+                                end
+                            end
+                        end
+                    end
+                else
+                    print("Bad choice.")
+                    sleep(0.8)
+                end
+            end
+        end
+    end
+end
