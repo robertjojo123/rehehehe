@@ -1,0 +1,219 @@
+local BASE = "https://cc-yt-bridge.onrender.com"
+
+local function urlEncode(s)
+    return tostring(s):gsub("([^%w%-_%.~])", function(c)
+        return string.format("%%%02X", string.byte(c))
+    end)
+end
+
+local function get(url)
+    local res, err = http.get(url)
+    if not res then
+        return nil, err
+    end
+
+    local body = res.readAll()
+    res.close()
+    return body, nil
+end
+
+local function getJson(url)
+    local body, err = get(url)
+    if not body then
+        return nil, err
+    end
+
+    local data = textutils.unserializeJSON(body)
+    if not data then
+        return nil, "Bad JSON: " .. tostring(body)
+    end
+
+    return data, nil
+end
+
+local function clearScreen()
+    term.setBackgroundColor(colors.black)
+    term.setTextColor(colors.white)
+    term.clear()
+    term.setCursorPos(1, 1)
+end
+
+local function waitKey()
+    print("")
+    print("Press any key...")
+    os.pullEvent("key")
+end
+
+local function trim(s, n)
+    s = tostring(s or "")
+    if #s <= n then
+        return s
+    end
+    return s:sub(1, n - 3) .. "..."
+end
+
+local pageTokens = {""}
+local page = 1
+local lastQuery = nil
+
+while true do
+    clearScreen()
+    print("CC YouTube Bridge")
+    print("-----------------")
+    print("Type search terms OR paste a YouTube URL.")
+    print("")
+    print("Examples:")
+    print("  shrek trailer")
+    print("  https://youtu.be/VIDEOID")
+    print("  https://www.youtube.com/watch?v=VIDEOID")
+    print("")
+    write("Search/URL: ")
+
+    local q = read()
+
+    if not q or q == "" then
+        print("No input.")
+        waitKey()
+    else
+        lastQuery = q
+        pageTokens = {""}
+        page = 1
+
+        while true do
+            clearScreen()
+            print("Searching page " .. tostring(page) .. "...")
+
+            local token = pageTokens[page] or ""
+            local url = BASE .. "/search?q=" .. urlEncode(lastQuery) .. "&max_results=5"
+
+            if token ~= "" then
+                url = url .. "&page_token=" .. urlEncode(token)
+            end
+
+            local data, err = getJson(url)
+
+            if not data then
+                print("Search failed:")
+                print(tostring(err))
+                waitKey()
+                break
+            end
+
+            local results = data.results or {}
+            local nextToken = data.nextPageToken or ""
+
+            if nextToken ~= "" and not pageTokens[page + 1] then
+                pageTokens[page + 1] = nextToken
+            end
+
+            clearScreen()
+            print("Results page " .. tostring(page))
+
+            if data.mode == "direct_url" then
+                print("Mode: direct URL")
+            elseif data.mode == "demo_no_api_key" then
+                print("Mode: demo/no API key")
+            end
+
+            print("----------------")
+            print("")
+
+            if #results == 0 then
+                print("No results.")
+                waitKey()
+                break
+            end
+
+            for i, v in ipairs(results) do
+                print(i .. ". " .. trim(v.title, 42))
+                print("   " .. trim(v.channel, 36))
+
+                if v.duration and v.duration ~= "" then
+                    print("   " .. tostring(v.duration))
+                end
+
+                print("")
+            end
+
+            print("[1-" .. tostring(#results) .. "] pick")
+
+            if nextToken ~= "" then
+                print("[n] next page")
+            end
+
+            if page > 1 then
+                print("[p] previous page")
+            end
+
+            print("[s] new search")
+            print("[q] quit")
+            write("> ")
+
+            local choice = read()
+            choice = tostring(choice or ""):lower()
+
+            if choice == "q" then
+                return
+
+            elseif choice == "s" then
+                break
+
+            elseif choice == "n" and nextToken ~= "" then
+                page = page + 1
+
+            elseif choice == "p" and page > 1 then
+                page = page - 1
+
+            else
+                local idx = tonumber(choice)
+
+                if idx and results[idx] then
+                    local picked = results[idx]
+
+                    clearScreen()
+                    print("Picked:")
+                    print(trim(picked.title, 50))
+                    print(trim(picked.channel, 50))
+                    print("ID: " .. tostring(picked.id))
+                    print("")
+                    print("Prepare this video?")
+                    print("[y] yes")
+                    print("[anything else] back")
+                    write("> ")
+
+                    local yes = tostring(read() or ""):lower()
+
+                    if yes == "y" or yes == "yes" then
+                        clearScreen()
+                        print("Preparing job...")
+
+                        local prepUrl = BASE
+                            .. "/prepare?id=" .. urlEncode(picked.id)
+                            .. "&title=" .. urlEncode(picked.title or "")
+
+                        local prep, prepErr = getJson(prepUrl)
+
+                        if not prep then
+                            print("Prepare failed:")
+                            print(tostring(prepErr))
+                            waitKey()
+                        else
+                            print("OK: " .. tostring(prep.ok))
+                            print("Job: " .. tostring(prep.job))
+                            print("Video: " .. tostring(prep.video_id))
+                            print("Status: " .. tostring(prep.status))
+                            print("")
+                            print(tostring(prep.message or ""))
+                            print("")
+                            print("Next step: server job makes chunks/audio.")
+                            waitKey()
+                        end
+                    end
+                else
+                    print("Bad choice.")
+                    sleep(0.8)
+                end
+            end
+        end
+    end
+end
