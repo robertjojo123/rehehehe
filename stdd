@@ -1,0 +1,610 @@
+local BASE = "PASTE_CLOUDFLARE_TUNNEL_URL_HERE"
+
+local DEFAULT_FPS = 10
+local TOTAL_SECONDS = 0 -- 0 = whole detected YouTube video
+local SEGMENT_SECONDS = 60
+local START_BUFFER_SEGMENTS = 2
+
+-- If video decoding/rendering falls behind the tape, skip late frames instead of stretching playback.
+local DROP_LATE_FRAMES = true
+local DROP_THRESHOLD_SECONDS = 0.20
+
+-- Sync mode:
+-- Wait for all video segments before starting tape.
+-- This prevents the tape/audio from running ahead while CC waits for video encoding.
+local WAIT_FOR_ALL_SEGMENTS = false
+
+local COLOR_SLOTS = {
+    colors.white, colors.orange, colors.magenta, colors.lightBlue,
+    colors.yellow, colors.lime, colors.pink, colors.gray,
+    colors.lightGray, colors.cyan, colors.purple, colors.blue,
+    colors.brown, colors.green, colors.red, colors.black,
+}
+
+local HEX_TO_SLOT_INDEX = {
+    ["0"] = 1, ["1"] = 2, ["2"] = 3, ["3"] = 4,
+    ["4"] = 5, ["5"] = 6, ["6"] = 7, ["7"] = 8,
+    ["8"] = 9, ["9"] = 10, ["a"] = 11, ["b"] = 12,
+    ["c"] = 13, ["d"] = 14, ["e"] = 15, ["f"] = 16,
+}
+
+local function urlEncode(s)
+    return tostring(s):gsub("([^%w%-_%.~])", function(c)
+        return string.format("%%%02X", string.byte(c))
+    end)
+end
+
+local function clear()
+    term.setBackgroundColor(colors.black)
+    term.setTextColor(colors.white)
+    term.clear()
+    term.setCursorPos(1, 1)
+end
+
+local function get(url)
+    local h, err = http.get(url)
+    if not h then return nil, err end
+    local b = h.readAll()
+    h.close()
+    return b, nil
+end
+
+local function getJson(url)
+    local b, err = get(url)
+    if not b then return nil, err end
+    local j = textutils.unserializeJSON(b)
+    if not j then return nil, "bad json: " .. tostring(b) end
+    return j, nil
+end
+
+local function waitKey()
+    print("")
+    print("Press any key...")
+    os.pullEvent("key")
+end
+
+local function trim(s, n)
+    s = tostring(s or "")
+    if #s <= n then return s end
+    return s:sub(1, n - 3) .. "..."
+end
+
+local function hexByte(h)
+    return string.char(tonumber(h, 16))
+end
+
+local function getDisplay()
+    local mon = peripheral.find("monitor") or term.current()
+    if mon.setTextScale then mon.setTextScale(0.5) end
+    mon.setBackgroundColor(colors.black)
+    mon.clear()
+    return mon
+end
+
+local function findTapeDrive()
+    for _, name in ipairs(peripheral.getNames()) do
+        local typ = tostring(peripheral.getType(name) or "")
+        local ok, methods = pcall(peripheral.getMethods, name)
+        methods = ok and methods or {}
+        local joined = table.concat(methods, " "):lower()
+        if typ:lower():find("tape") or (joined:find("write") and joined:find("play") and joined:find("seek")) then
+            return peripheral.wrap(name), name
+        end
+    end
+    return nil, nil
+end
+
+local function rewindTape(tape)
+    pcall(function() tape.stop() end)
+    sleep(0.1)
+    pcall(function() tape.seek(-999999999) end)
+    sleep(0.1)
+end
+
+local function writeAudioToTape(audioUrl, speed)
+    clear()
+    print("Finding tape drive...")
+
+    local tape, tapeName = findTapeDrive()
+    if not tape then
+        print("No tape drive found.")
+        return nil
+    end
+
+    print("Tape: " .. tostring(tapeName))
+    print("Rewinding...")
+    rewindTape(tape)
+    pcall(function() tape.setSpeed(speed or 2.0) end)
+
+    print("Opening audio...")
+    local res = http.get(audioUrl, nil, true) or http.get(audioUrl)
+    if not res then
+        print("Failed to open audio URL")
+        return nil
+    end
+
+    local written = 0
+    local lastPrint = os.clock()
+
+    while true do
+        local chunk = nil
+        local ok, data = pcall(function() return res.read(8192) end)
+        if ok then
+            chunk = data
+        else
+            chunk = res.readAll()
+        end
+
+        if not chunk or #chunk == 0 then break end
+
+        local wok, werr = pcall(function() tape.write(chunk) end)
+        if not wok then
+            print("Tape write failed: " .. tostring(werr))
+            res.close()
+            return nil
+        end
+
+        written = written + #chunk
+
+        if os.clock() - lastPrint > 0.5 then
+            clear()
+            print("Writing audio to tape...")
+            print("Bytes: " .. tostring(written))
+            lastPrint = os.clock()
+        end
+    end
+
+    res.close()
+
+    local silence = string.rep(string.char(0), 8192)
+    for _ = 1, 8 do pcall(function() tape.write(silence) end) end
+
+    rewindTape(tape)
+    pcall(function() tape.setSpeed(speed or 2.0) end)
+
+    clear()
+    print("Audio written.")
+    print("Bytes: " .. tostring(written))
+    sleep(0.5)
+
+    return tape
+end
+
+local function startTape(tape, speed)
+    rewindTape(tape)
+    pcall(function() tape.setSpeed(speed or 2.0) end)
+    sleep(0.1)
+    pcall(function() tape.play() end)
+end
+
+local function applyPalette(mon, pal)
+    for i = 1, 16 do
+        local p = pal[i]
+        if p then
+            mon.setPaletteColor(COLOR_SLOTS[i], p[1], p[2], p[3])
+        end
+    end
+end
+
+local function decodeRLE(s)
+    local chars, fg, bg = {}, {}, {}
+
+    for token in string.gmatch(s, "([^,]+)") do
+        local count, cell = token:match("^(%d+)%*(%x%x%x%x)$")
+        if not count then
+            count = 1
+            cell = token
+        else
+            count = tonumber(count)
+        end
+
+        if cell and #cell == 4 then
+            local ch = hexByte(cell:sub(1, 2))
+            local f = cell:sub(3, 3)
+            local b = cell:sub(4, 4)
+
+            for _ = 1, count do
+                chars[#chars + 1] = ch
+                fg[#fg + 1] = f
+                bg[#bg + 1] = b
+            end
+        end
+    end
+
+    return table.concat(chars), table.concat(fg), table.concat(bg)
+end
+
+local function drawSpan(mon, y, x, rle)
+    local chars, fg, bg = decodeRLE(rle)
+    if #chars > 0 then
+        mon.setCursorPos(x, y)
+        mon.blit(chars, fg, bg)
+    end
+end
+
+local function drawFrame(mon, frame)
+    for _, sp in ipairs(frame.spans) do
+        drawSpan(mon, sp.y, sp.x, sp.rle)
+    end
+end
+
+local function parsePaletteLine(pal, line)
+    local slot, rgb = line:match("^P%s+([0-9a-f])%s+([0-9a-fA-F]+)")
+    if slot and rgb then
+        local idx = HEX_TO_SLOT_INDEX[slot]
+        if idx then
+            pal[idx] = {
+                tonumber(rgb:sub(1, 2), 16) / 255,
+                tonumber(rgb:sub(3, 4), 16) / 255,
+                tonumber(rgb:sub(5, 6), 16) / 255,
+            }
+        end
+    end
+end
+
+local function readNextFrame(res, state)
+    local frame = nil
+
+    while true do
+        local line = res.readLine()
+        if not line then return nil, "eof" end
+
+        if line == "PALETTE" then
+            state.readingPalette = true
+
+        elseif line:sub(1, 2) == "P " then
+            parsePaletteLine(state.palette, line)
+
+        elseif line:match("^fps=") then
+            state.fps = tonumber(line:match("^fps=(.+)$")) or state.fps
+
+        elseif line:sub(1, 2) == "F " then
+            if not state.paletteApplied then
+                applyPalette(state.mon, state.palette)
+                state.paletteApplied = true
+            end
+
+            local n = tonumber(line:match("^F%s+(%d+)")) or ((state.lastFrame or 0) + 1)
+            frame = { number = n, spans = {} }
+            state.lastFrame = n
+
+        elseif line:sub(1, 2) == "S " and frame then
+            local y, x, rle = line:match("^S%s+(%d+)%s+(%d+)%s+(.+)$")
+            if y and x and rle then
+                frame.spans[#frame.spans + 1] = {
+                    y = tonumber(y),
+                    x = tonumber(x),
+                    rle = rle,
+                }
+            end
+
+        elseif line == "E" and frame then
+            return frame, nil
+
+        elseif line == "END" then
+            return nil, "end"
+        end
+    end
+end
+
+local function openSegment(url)
+    return http.get(url)
+end
+
+local function waitUntilTarget(playback, frameNumber)
+    local target = playback.start + ((frameNumber - 1) / playback.fps)
+    local delay = target - os.clock()
+    if delay > 0 then
+        sleep(delay)
+    else
+        sleep(0)
+    end
+end
+
+local function playSegmentFromCurrent(res, state, playback, firstFrame)
+    local framesThisSegment = 0
+    local spansThisSegment = 0
+
+    local function present(frame)
+        if not frame then return end
+
+        local target = playback.start + ((frame.number - 1) / playback.fps)
+        local lateBy = os.clock() - target
+
+        if DROP_LATE_FRAMES and lateBy > DROP_THRESHOLD_SECONDS then
+            -- Keep the video clock locked to the tape/audio.
+            -- We still consumed the frame from the stream, but do not waste time drawing old frames.
+            playback.dropped = (playback.dropped or 0) + 1
+            playback.frames = playback.frames + 1
+            framesThisSegment = framesThisSegment + 1
+            sleep(0)
+            return
+        end
+
+        if lateBy < 0 then
+            sleep(-lateBy)
+        end
+
+        drawFrame(state.mon, frame)
+        playback.frames = playback.frames + 1
+        playback.rendered = (playback.rendered or 0) + 1
+        framesThisSegment = framesThisSegment + 1
+        spansThisSegment = spansThisSegment + #frame.spans
+    end
+
+    if firstFrame then
+        present(firstFrame)
+    end
+
+    while true do
+        local frame, reason = readNextFrame(res, state)
+        if not frame then
+            return {
+                reason = reason,
+                frames = framesThisSegment,
+                spans = spansThisSegment,
+            }
+        end
+        present(frame)
+    end
+end
+
+local function search()
+    clear()
+    print("YouTube search or URL:")
+    write("> ")
+    local q = read()
+
+    clear()
+    print("Searching...")
+    local data, err = getJson(BASE .. "/yt_search?q=" .. urlEncode(q) .. "&max_results=5")
+    if not data then
+        print(err)
+        waitKey()
+        return nil
+    end
+
+    local r = data.results or {}
+    for i, v in ipairs(r) do
+        print(i .. ". " .. trim(v.title, 42))
+        print("   " .. trim(v.channel, 34))
+    end
+
+    print("")
+    write("Pick: ")
+    local n = tonumber(read())
+    if n and r[n] then return r[n] end
+    return nil
+end
+
+local function waitForPrepared(job)
+    while true do
+        local st = getJson(BASE .. "/status?job=" .. urlEncode(job))
+        clear()
+        print("Preparing YouTube job...")
+        if st then
+            print("Status: " .. tostring(st.status))
+            print("Audio: " .. tostring(st.audio_ready) .. " bytes " .. tostring(st.audio_bytes or 0))
+            print("Segments: " .. tostring(st.segments_ready or 0) .. "/" .. tostring(st.segment_count or 0))
+            print(tostring(st.message or ""))
+
+            if st.status == "error" then
+                print(st.error)
+                waitKey()
+                return nil
+            end
+
+            if WAIT_FOR_ALL_SEGMENTS then
+                if st.ready then return st end
+            else
+                if st.audio_ready and tonumber(st.segments_ready or 0) >= START_BUFFER_SEGMENTS then return st end
+            end
+        end
+        sleep(1)
+    end
+end
+
+local function getManifest(job)
+    return getJson(BASE .. "/manifest?job=" .. urlEncode(job))
+end
+
+clear()
+print("Testing server...")
+local pong, pingErr = get(BASE .. "/ping")
+if not pong then
+    print("Ping failed: " .. tostring(pingErr))
+    waitKey()
+    return
+end
+
+local picked = search()
+if not picked then return end
+
+clear()
+print("Picked:")
+print(trim(picked.title, 50))
+print("")
+print("Total seconds: " .. TOTAL_SECONDS)
+print("Segment seconds: " .. SEGMENT_SECONDS)
+print("Whole video mode: " .. tostring(TOTAL_SECONDS == 0))
+print("Start buffer segments: " .. tostring(START_BUFFER_SEGMENTS))
+print("")
+print("Continue? y")
+if tostring(read()):lower() ~= "y" then return end
+
+local prep, prepErr = getJson(
+    BASE
+    .. "/yt_prepare?id=" .. urlEncode(picked.id)
+    .. "&total_seconds=" .. tostring(TOTAL_SECONDS)
+    .. "&segment_seconds=" .. tostring(SEGMENT_SECONDS)
+    .. "&fps=" .. tostring(DEFAULT_FPS)
+)
+
+if not prep then
+    print("prepare failed: " .. tostring(prepErr))
+    waitKey()
+    return
+end
+
+local st = waitForPrepared(prep.job)
+if not st then return end
+
+local man = getManifest(prep.job)
+if not man then
+    print("No manifest")
+    waitKey()
+    return
+end
+
+local audioUrl = man.audio_url
+if audioUrl:sub(1, 1) == "/" then audioUrl = BASE .. audioUrl end
+
+local tape = writeAudioToTape(audioUrl, man.tape_speed or 2.0)
+if not tape then
+    waitKey()
+    return
+end
+
+local mon = getDisplay()
+
+-- Pre-open first segment and parse first frame BEFORE starting tape.
+-- This removes the startup delay where audio used to begin before video was ready.
+local firstSeg = man.segments and man.segments[1]
+if not firstSeg then
+    clear()
+    print("No first segment in manifest.")
+    waitKey()
+    return
+end
+
+local firstUrl = firstSeg.url
+if firstUrl:sub(1, 1) == "/" then firstUrl = BASE .. firstUrl end
+
+clear()
+print("Preloading first video frame...")
+local firstRes, openErr = openSegment(firstUrl)
+if not firstRes then
+    print("Failed to open first segment:")
+    print(tostring(openErr))
+    waitKey()
+    return
+end
+
+local firstState = {
+    mon = mon,
+    palette = {},
+    paletteApplied = false,
+    fps = man.fps or DEFAULT_FPS,
+    lastFrame = 0,
+}
+
+local firstFrame, firstReason = readNextFrame(firstRes, firstState)
+if not firstFrame then
+    firstRes.close()
+    clear()
+    print("Could not preload first frame:")
+    print(tostring(firstReason))
+    waitKey()
+    return
+end
+
+clear()
+print("First frame ready.")
+print("Starting tape and video together...")
+sleep(0.3)
+
+startTape(tape, man.tape_speed or 2.0)
+
+local playback = {
+    fps = man.fps or DEFAULT_FPS,
+    start = os.clock(),
+    frames = 0,
+    rendered = 0,
+    dropped = 0,
+}
+
+playSegmentFromCurrent(firstRes, firstState, playback, firstFrame)
+firstRes.close()
+
+local segmentIndex = 2
+
+while true do
+    -- Wait for the next segment if the PC is still encoding it.
+    while true do
+        man = getManifest(prep.job)
+        if man and man.segments and man.segments[segmentIndex] then
+            break
+        end
+
+        local stWait = getJson(BASE .. "/status?job=" .. urlEncode(prep.job))
+        if stWait and stWait.status == "error" then
+            clear()
+            print("Server error while waiting for segment:")
+            print(tostring(stWait.error))
+            waitKey()
+            return
+        end
+
+        if stWait and stWait.ready and (not man or not man.segments or not man.segments[segmentIndex]) then
+            goto playback_done
+        end
+
+        clear()
+        print("Waiting for segment " .. tostring(segmentIndex) .. "...")
+        if stWait then
+            print("Ready: " .. tostring(stWait.segments_ready or 0) .. "/" .. tostring(stWait.segment_count or "?"))
+            print(tostring(stWait.message or ""))
+        end
+        sleep(0.5)
+    end
+
+    local seg = man.segments[segmentIndex]
+    clear()
+    print("Playing segment " .. tostring(segmentIndex))
+    print("Frames so far: " .. tostring(playback.frames))
+
+    local url = seg.url
+    if url:sub(1, 1) == "/" then url = BASE .. url end
+
+    local res, err = openSegment(url)
+    if not res then
+        clear()
+        print("Segment open failed:")
+        print(tostring(err))
+        waitKey()
+        return
+    end
+
+    local state = {
+        mon = mon,
+        palette = {},
+        paletteApplied = false,
+        fps = man.fps or DEFAULT_FPS,
+        lastFrame = 0,
+    }
+
+    local info = playSegmentFromCurrent(res, state, playback, nil)
+    res.close()
+
+    clear()
+    print("Segment " .. tostring(segmentIndex) .. " done")
+    print("Frames: " .. tostring(info.frames))
+    print("Spans: " .. tostring(info.spans))
+    print("Total frames: " .. tostring(playback.frames))
+    print("Rendered: " .. tostring(playback.rendered or 0))
+    print("Dropped: " .. tostring(playback.dropped or 0))
+    sleep(0.15)
+
+    segmentIndex = segmentIndex + 1
+    if man.ready and segmentIndex > tonumber(man.segment_count or 0) then
+        break
+    end
+end
+
+::playback_done::
+clear()
+print("Done.")
+print("Frames consumed: " .. tostring(playback.frames))
+print("Frames rendered: " .. tostring(playback.rendered or 0))
+print("Frames dropped: " .. tostring(playback.dropped or 0))
+waitKey()
