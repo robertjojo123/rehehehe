@@ -1,0 +1,1435 @@
+-- V24 tape-byte-locked full-frame player: full redraw, no skips, 2x tape byte clock pacing.
+local BASE = "https://unpledged-reactive-grieving.ngrok-free.dev"
+
+-- Required by ngrok free tunnels so CC does not get the browser-warning/403 path.
+local WS_HEADERS = {
+    ["ngrok-skip-browser-warning"] = "true",
+    ["User-Agent"] = "ComputerCraft-WebSocket"
+}
+
+local HTTP_HEADERS = {
+    ["ngrok-skip-browser-warning"] = "true",
+    ["User-Agent"] = "ComputerCraft-HTTP"
+}
+
+local DEFAULT_FPS = 10
+local TOTAL_SECONDS = 0 -- 0 = detected full video
+
+local AUDIO_VIDEO_OFFSET_MS = 0
+local USE_TAPE_BYTE_CLOCK = true
+local TAPE_BPS_1X_OVERRIDE = 0 -- try 5800 if 2x tape audio is slightly fast
+local TAPE_BYTES_PER_SECOND_1X = 6000
+
+-- V24 tape clock tuning. In 2x mode, expected byte clock is 6000*2 = 12000 B/s.
+-- If your tape position method reports bytes a little too fast/slow, tune this.
+-- Larger value = video believes audio is farther along = video waits less.
+-- Smaller value = video believes audio is less far along = video waits more.
+local TAPE_POSITION_SCALE = 1.0
+local TAPE_CLOCK_DEBUG = true
+
+-- V24: tape-byte clock fix. The previous wall/audio-length pacing could play
+-- too fast if the byte/frame alignment estimate was wrong. Now the frame
+-- timeline stays nominal 10 FPS, while the current audio time comes from the
+-- actual tape byte position at 2x: deltaBytes / 12000 B/s.
+local VIDEO_CLOCK_MODE = "tape_bytes" -- V24 default: use actual tape byte position, not wall/audio length
+local AUDIO_LENGTH_TUNE = 1.000 -- only used if VIDEO_CLOCK_MODE = "audio_length_wall"
+local FORCE_AUDIO_LOCKED_FRAME_TIME = false -- V24: keep nominal 10fps frame targets; tape byte clock decides waits
+
+-- Video starts after this many frames are decoded into memory.
+-- At 10 FPS, 20 frames = ~2 seconds of startup buffer.
+-- If the start still stutters, try 30. If memory is tight, try 10.
+local VIDEO_PREBUFFER_FRAMES = 30
+
+-- Queue render mode:
+-- Reader keeps pulling WebSocket frames into memory.
+-- Renderer draws every frame in order and adjusts delay based on audio clock.
+local FORCE_ALL_FRAMES = true
+local FRAME_QUEUE_TARGET = 240
+local FRAME_QUEUE_MAX = 600
+local QUEUE_START_FRAMES = 120
+
+-- V21: do not preload whole videos into CC RAM. The server-side cache/runway
+-- handles readiness; CC keeps only a small local queue and streams frames.
+local SHORT_FULL_PRELOAD_SECONDS = 0
+local SHORT_PRELOAD_ALL_FRAMES = false
+
+-- V21: old CC-side giant preload is disabled; keep these at 0.
+local PRELOAD_ALL_IF_FRAMES_UNDER = 0
+local LONG_START_RUNWAY_SECONDS = 45
+
+
+-- V21: full-cache wait is disabled; the new dynamic server runway wait below
+-- starts earlier when the encoder is far enough ahead.
+local REQUIRE_SERVER_FRAME_CACHE_DONE_BEFORE_TAPE = false
+
+-- V21: do not load half the movie into CC memory. Wait for the Python server
+-- to have a safe websocket-ready runway on disk, then CC streams through it.
+local REQUIRE_SAFE_SERVER_RUNWAY_BEFORE_TAPE = true
+local SHORT_REQUIRE_SERVER_DONE_SECONDS = 60
+local MIN_SERVER_RUNWAY_SECONDS = 90
+local TARGET_SERVER_RUNWAY_FRACTION = 0.50
+local RUNWAY_SAFETY_FRAMES = 180
+
+-- Never skip timeline slots. If the stream ever jumps from frame N to N+2,
+-- hold the previous picture for the missing frame slot so audio/video duration stays aligned.
+local FILL_MISSING_FRAMES_WITH_HOLD = false
+local FILL_TAIL_TO_AUDIO_WITH_HOLD = false
+
+-- Smooth every-frame timing.
+-- The player draws every frame, then adjusts the NEXT frame delay.
+-- If behind, delay shrinks. If ahead, delay grows.
+local BASE_FRAME_SLEEP = 1 / DEFAULT_FPS
+local MIN_FRAME_SLEEP = 0.05
+local MAX_FRAME_SLEEP = 0.15
+local CATCHUP_LATE_FRAMES_FAST = 12
+local CATCHUP_LATE_FRAMES_MED = 6
+local CATCHUP_LATE_FRAMES_SMALL = 3
+local SMOOTH_DRIFT_GAIN = 0.015
+
+-- Tape wipe settings:
+-- V12 only wipes bytes from the PREVIOUS audio write record.
+-- If the tape was empty / no previous record exists, it skips wipe.
+-- Set TAPE_WIPE_BYTES_OVERRIDE once if you want a manual emergency wipe.
+local WIPE_TAPE_BEFORE_WRITE = true
+local TAPE_WIPE_ONLY_PREVIOUS_WRITE = true
+local TAPE_LAST_WRITE_RECORD = "yt_ws_last_tape_write_bytes.txt"
+local TAPE_WIPE_BYTES_OVERRIDE = 0
+local TAPE_WIPE_EXTRA_BYTES = 131072
+
+local AUDIO_CHUNK_SIZE = 262144
+local AUDIO_MIN_RATIO_OK = 0.98
+
+local COLOR_SLOTS = {
+    colors.white, colors.orange, colors.magenta, colors.lightBlue,
+    colors.yellow, colors.lime, colors.pink, colors.gray,
+    colors.lightGray, colors.cyan, colors.purple, colors.blue,
+    colors.brown, colors.green, colors.red, colors.black,
+}
+
+local HEX_BYTE = {}
+for i = 0, 255 do
+    HEX_BYTE[string.format("%02x", i)] = string.char(i)
+    HEX_BYTE[string.format("%02X", i)] = string.char(i)
+end
+
+local function clearTerm()
+    term.setBackgroundColor(colors.black)
+    term.setTextColor(colors.white)
+    term.clear()
+    term.setCursorPos(1, 1)
+end
+
+local function urlEncode(s)
+    return tostring(s):gsub("([^%w%-_%.~])", function(c)
+        return string.format("%%%02X", string.byte(c))
+    end)
+end
+
+local function trim(s, n)
+    s = tostring(s or "")
+    if #s <= n then return s end
+    return s:sub(1, n - 3) .. "..."
+end
+
+local function get(url)
+    local h, err = http.get(url, HTTP_HEADERS)
+    if not h then return nil, err end
+    local b = h.readAll()
+    h.close()
+    return b, nil
+end
+
+local function getJson(url)
+    local b, err = get(url)
+    if not b then return nil, err end
+    local j = textutils.unserializeJSON(b)
+    if not j then return nil, "bad json: " .. tostring(b) end
+    return j, nil
+end
+
+local function waitKey()
+    print("")
+    print("Press any key...")
+    os.pullEvent("key")
+end
+
+local function wall_ms()
+    if os.epoch then return os.epoch("utc") end
+    return math.floor(os.clock() * 1000 + 0.5)
+end
+
+local function hexStringToCharsFast(h)
+    local out = {}
+    local n = 1
+    for i = 1, #h, 2 do
+        out[n] = HEX_BYTE[h:sub(i, i + 1)] or " "
+        n = n + 1
+    end
+    return table.concat(out)
+end
+
+local function getDisplay()
+    local mon = peripheral.find("monitor") or term.current()
+    if mon.setTextScale then mon.setTextScale(0.5) end
+    mon.setBackgroundColor(colors.black)
+    mon.clear()
+    return mon
+end
+
+local function findTapeDrive()
+    for _, name in ipairs(peripheral.getNames()) do
+        local typ = tostring(peripheral.getType(name) or "")
+        local ok, methods = pcall(peripheral.getMethods, name)
+        methods = ok and methods or {}
+        local joined = table.concat(methods, " "):lower()
+        if typ:lower():find("tape") or (joined:find("write") and joined:find("play") and joined:find("seek")) then
+            return peripheral.wrap(name), name
+        end
+    end
+    return nil, nil
+end
+
+local function rewindTape(tape)
+    pcall(function() tape.stop() end)
+    sleep(0.05)
+    pcall(function() tape.seek(-999999999) end)
+    sleep(0.05)
+end
+
+local function getTapeCapacity(tape)
+    if not tape then return nil end
+    local names = {
+        "getSize", "getLength", "getCapacity", "getLimit",
+        "size", "length", "capacity"
+    }
+
+    for _, name in ipairs(names) do
+        if tape[name] then
+            local ok, value = pcall(function() return tape[name]() end)
+            if ok and type(value) == "number" and value > 0 then
+                return math.floor(value)
+            end
+        end
+    end
+
+    return nil
+end
+
+local function readLastTapeWriteBytes()
+    if not fs or not fs.exists or not fs.open then return 0 end
+    if not fs.exists(TAPE_LAST_WRITE_RECORD) then return 0 end
+
+    local h = fs.open(TAPE_LAST_WRITE_RECORD, "r")
+    if not h then return 0 end
+    local s = h.readAll()
+    h.close()
+
+    local n = tonumber(s or "0") or 0
+    if n < 0 then n = 0 end
+    return math.floor(n)
+end
+
+local function saveLastTapeWriteBytes(n)
+    if not fs or not fs.open then return end
+    n = math.max(0, math.floor(tonumber(n or 0) or 0))
+
+    local h = fs.open(TAPE_LAST_WRITE_RECORD, "w")
+    if not h then return end
+    h.write(tostring(n))
+    h.close()
+end
+
+local function wipeTape(tape, expectedBytes)
+    if not WIPE_TAPE_BEFORE_WRITE then return true end
+
+    rewindTape(tape)
+    pcall(function() tape.setSpeed(1.0) end)
+
+    local wipeBytes = tonumber(TAPE_WIPE_BYTES_OVERRIDE or 0) or 0
+
+    if wipeBytes <= 0 then
+        if TAPE_WIPE_ONLY_PREVIOUS_WRITE then
+            local previous = readLastTapeWriteBytes()
+            if previous > 0 then
+                wipeBytes = previous + TAPE_WIPE_EXTRA_BYTES
+            else
+                wipeBytes = 0
+            end
+        else
+            local cap = getTapeCapacity(tape)
+            if cap and cap > 0 then
+                wipeBytes = cap
+            else
+                wipeBytes = (tonumber(expectedBytes or 0) or 0) + TAPE_WIPE_EXTRA_BYTES
+            end
+        end
+    end
+
+    clearTerm()
+    print("Tape wipe check...")
+    print("Previous bytes: " .. tostring(readLastTapeWriteBytes()))
+    print("Wipe bytes: " .. tostring(wipeBytes))
+
+    if wipeBytes <= 0 then
+        print("Tape considered empty. Skipping wipe.")
+        sleep(0.35)
+        rewindTape(tape)
+        return true
+    end
+
+    print("Wiping previous audio area...")
+    local zeroChunk = string.rep(string.char(0), AUDIO_CHUNK_SIZE)
+    local written = 0
+    local lastPrint = os.clock()
+
+    while written < wipeBytes do
+        local n = math.min(AUDIO_CHUNK_SIZE, wipeBytes - written)
+        local chunk = zeroChunk
+        if n < #zeroChunk then chunk = zeroChunk:sub(1, n) end
+
+        local ok, err = pcall(function() tape.write(chunk) end)
+        if not ok then
+            print("Tape wipe failed:")
+            print(tostring(err))
+            return false
+        end
+
+        written = written + n
+
+        if os.clock() - lastPrint > 0.5 then
+            clearTerm()
+            print("Wiping previous audio area...")
+            print("Bytes: " .. tostring(written) .. "/" .. tostring(wipeBytes))
+            lastPrint = os.clock()
+        end
+
+        sleep(0)
+    end
+
+    rewindTape(tape)
+    print("Previous audio area wiped.")
+    sleep(0.25)
+    return true
+end
+
+local function writeAudioToTape(audioUrl, speed, expectedBytes)
+    clearTerm()
+    print("Finding tape drive...")
+    local tape, tapeName = findTapeDrive()
+    if not tape then print("No tape drive found.") return nil end
+
+    print("Tape: " .. tostring(tapeName))
+    print("Rewinding...")
+    rewindTape(tape)
+
+    if not wipeTape(tape, expectedBytes) then
+        return nil
+    end
+
+    pcall(function() tape.setSpeed(speed or 1.0) end)
+
+    print("Opening audio...")
+    local res = http.get(audioUrl, HTTP_HEADERS, true) or http.get(audioUrl, HTTP_HEADERS)
+    if not res then print("Failed to open audio URL") return nil end
+
+    local written = 0
+    local lastPrint = os.clock()
+
+    while true do
+        local chunk = res.read(AUDIO_CHUNK_SIZE)
+        if not chunk or #chunk == 0 then break end
+
+        local ok, err = pcall(function() tape.write(chunk) end)
+        if not ok then
+            print("Tape write failed: " .. tostring(err))
+            res.close()
+            return nil
+        end
+
+        written = written + #chunk
+        if os.clock() - lastPrint > 0.5 then
+            clearTerm()
+            print("Writing audio to tape...")
+            print("Bytes: " .. tostring(written))
+            if expectedBytes then print("Expected: " .. tostring(expectedBytes)) end
+            lastPrint = os.clock()
+        end
+        sleep(0)
+    end
+    res.close()
+
+    if expectedBytes and tonumber(expectedBytes) and tonumber(expectedBytes) > 0 then
+        local ratio = written / tonumber(expectedBytes)
+        clearTerm()
+        print("Audio write finished.")
+        print("Expected bytes: " .. tostring(expectedBytes))
+        print("Written bytes:  " .. tostring(written))
+        print("Ratio: " .. tostring(math.floor(ratio * 1000) / 10) .. "%")
+        if ratio < AUDIO_MIN_RATIO_OK then
+            print("")
+            print("WARNING: audio write ended early.")
+            waitKey()
+            return nil
+        end
+        sleep(0.3)
+    end
+
+    local silence = string.rep(string.char(0), AUDIO_CHUNK_SIZE)
+    local silenceBytes = 0
+    for _ = 1, 2 do
+        local ok = pcall(function() tape.write(silence) end)
+        if ok then silenceBytes = silenceBytes + #silence end
+    end
+
+    -- Record exactly how much of the tape we intentionally used.
+    -- Next run only wipes this region plus a small safety tail.
+    saveLastTapeWriteBytes(written + silenceBytes)
+
+    rewindTape(tape)
+    pcall(function() tape.setSpeed(speed or 1.0) end)
+    return tape
+end
+
+local function startTape(tape, speed)
+    rewindTape(tape)
+    pcall(function() tape.setSpeed(speed or 1.0) end)
+    sleep(0.05)
+    pcall(function() tape.play() end)
+end
+
+local LAST_PALETTE = {}
+
+local function applyPalette(mon, pal)
+    for i = 1, 16 do
+        local p = pal[i]
+        if p then
+            local old = LAST_PALETTE[i]
+            if not old or old[1] ~= p[1] or old[2] ~= p[2] or old[3] ~= p[3] then
+                mon.setPaletteColor(COLOR_SLOTS[i], p[1], p[2], p[3])
+                LAST_PALETTE[i] = {p[1], p[2], p[3]}
+            end
+        end
+    end
+end
+
+local function parsePal(line)
+    local pal = {}
+    local idx = 1
+    for rgb in string.gmatch(line:sub(5), "([0-9a-fA-F]+)") do
+        if #rgb >= 6 and idx <= 16 then
+            pal[idx] = {
+                tonumber(rgb:sub(1, 2), 16) / 255,
+                tonumber(rgb:sub(3, 4), 16) / 255,
+                tonumber(rgb:sub(5, 6), 16) / 255,
+            }
+            idx = idx + 1
+        end
+    end
+    return pal
+end
+
+local function parsePalettePatch(line)
+    -- Compact server protocol: PC <slot_1_to_16> <rrggbb>
+    local idx, rgb = line:match("^PC%s+(%d+)%s+([0-9a-fA-F]+)$")
+    idx = tonumber(idx or "0") or 0
+    if idx < 1 or idx > 16 or not rgb or #rgb < 6 then return nil, nil end
+    return idx, {
+        tonumber(rgb:sub(1, 2), 16) / 255,
+        tonumber(rgb:sub(3, 4), 16) / 255,
+        tonumber(rgb:sub(5, 6), 16) / 255,
+    }
+end
+
+
+local HEX_NIBBLE = {}
+for i = 0, 9 do HEX_NIBBLE[string.byte("0") + i] = i end
+for i = 0, 5 do
+    HEX_NIBBLE[string.byte("a") + i] = 10 + i
+    HEX_NIBBLE[string.byte("A") + i] = 10 + i
+end
+
+local function hexByteAt(s, pos)
+    local a = HEX_NIBBLE[string.byte(s, pos) or 0] or 0
+    local b = HEX_NIBBLE[string.byte(s, pos + 1) or 0] or 0
+    return a * 16 + b
+end
+
+local function parseCompactPalette(line)
+    -- V18 server-side-light protocol: C<slothex><rrggbb>
+    if #line < 8 then return nil, nil end
+    local slot = HEX_NIBBLE[string.byte(line, 2) or 0]
+    if slot == nil then return nil, nil end
+    return slot + 1, {
+        hexByteAt(line, 3) / 255,
+        hexByteAt(line, 5) / 255,
+        hexByteAt(line, 7) / 255,
+    }
+end
+
+local function splitLines(s)
+    local t = {}
+    if not s then return t end
+    s = tostring(s):gsub("\r\n", "\n"):gsub("\r", "\n")
+    for line in (s .. "\n"):gmatch("(.-)\n") do
+        if line ~= "" then t[#t + 1] = line end
+    end
+    return t
+end
+
+local function parseFrameLines(lines)
+    local frame = nil
+
+    for _, msg in ipairs(lines) do
+        local tag = msg:sub(1, 1)
+
+        if msg:sub(1, 5) == "ERROR" then
+            return nil, msg
+        elseif msg == "STREAM_END" then
+            return nil, "end"
+        elseif tag == "M" or msg == "WS_VIDEO_OK" then
+            -- META / hello ignored
+        elseif tag == "F" then
+            -- Supports old "F 123" and compact V18 "F123".
+            local n = tonumber(msg:match("^F%s*(%d+)")) or 1
+            frame = { number = n, palette = {}, rows = {} }
+        elseif tag == "C" and frame then
+            -- Compact palette patch: C<slothex><rrggbb>
+            local idx, color = parseCompactPalette(msg)
+            if idx and color then frame.palette[idx] = color end
+        elseif msg:sub(1, 4) == "PAL " and frame then
+            -- Legacy fallback
+            frame.palette = parsePal(msg)
+        elseif msg:sub(1, 3) == "PC " and frame then
+            -- Legacy fallback
+            local idx, color = parsePalettePatch(msg)
+            if idx and color then frame.palette[idx] = color end
+        elseif tag == "B" and frame then
+            -- Full binary row:
+            -- B<yy><164 raw chars><164 fg><164 bg>
+            local y = tonumber(msg:sub(2, 3))
+            if y then
+                local c0 = 4
+                local c1 = c0 + 164 - 1
+                local f0 = c1 + 1
+                local f1 = f0 + 164 - 1
+                local b0 = f1 + 1
+                local b1 = b0 + 164 - 1
+                frame.rows[#frame.rows + 1] = {
+                    y = y,
+                    x = 1,
+                    chars = msg:sub(c0, c1),
+                    fg = msg:sub(f0, f1),
+                    bg = msg:sub(b0, b1),
+                }
+            end
+        elseif tag == "S" and frame then
+            -- Span row, lighter than full-row blit:
+            -- S<yy><xxx><lll><raw chars><fg><bg>
+            local y = tonumber(msg:sub(2, 3))
+            local x = tonumber(msg:sub(4, 6))
+            local ln = tonumber(msg:sub(7, 9))
+            if y and x and ln and ln > 0 then
+                local c0 = 10
+                local c1 = c0 + ln - 1
+                local f0 = c1 + 1
+                local f1 = f0 + ln - 1
+                local b0 = f1 + 1
+                local b1 = b0 + ln - 1
+                frame.rows[#frame.rows + 1] = {
+                    y = y,
+                    x = x,
+                    chars = msg:sub(c0, c1),
+                    fg = msg:sub(f0, f1),
+                    bg = msg:sub(b0, b1),
+                }
+            end
+        elseif msg:sub(1, 2) == "R " and frame then
+            -- Legacy row fallback: R <y> <charhex> <fg> <bg>
+            local y, chHex, fg, bg = msg:match("^R%s+(%d+)%s+([0-9a-fA-F]+)%s+([0-9a-fA-F]+)%s+([0-9a-fA-F]+)$")
+            if y then
+                frame.rows[#frame.rows + 1] = {
+                    y = tonumber(y),
+                    chars = hexStringToCharsFast(chHex),
+                    fg = fg,
+                    bg = bg,
+                }
+            end
+        elseif tag == "E" and frame then
+            return frame, nil
+        end
+    end
+
+    return frame, nil
+end
+
+
+local function parseFramePacket(packet)
+    -- Same protocol as parseFrameLines(), but without building a split-lines table.
+    -- This matters because at 10 FPS, thousands of tiny Lua allocations add up.
+    packet = tostring(packet or "")
+    local frame = nil
+    local pos = 1
+    local len = #packet
+
+    while pos <= len do
+        local nl = packet:find("\n", pos, true)
+        local msg
+        if nl then
+            msg = packet:sub(pos, nl - 1)
+            pos = nl + 1
+        else
+            msg = packet:sub(pos)
+            pos = len + 1
+        end
+
+        if msg ~= "" then
+            local tag = msg:sub(1, 1)
+
+            if msg:sub(1, 5) == "ERROR" then
+                return nil, msg
+            elseif msg == "STREAM_END" then
+                return nil, "end"
+            elseif tag == "M" or msg == "WS_VIDEO_OK" then
+                -- META / hello ignored
+            elseif tag == "F" then
+                local n = tonumber(msg:match("^F%s*(%d+)")) or 1
+                frame = { number = n, palette = {}, rows = {} }
+            elseif tag == "C" and frame then
+                local idx, color = parseCompactPalette(msg)
+                if idx and color then frame.palette[idx] = color end
+            elseif msg:sub(1, 4) == "PAL " and frame then
+                frame.palette = parsePal(msg)
+            elseif msg:sub(1, 3) == "PC " and frame then
+                local idx, color = parsePalettePatch(msg)
+                if idx and color then frame.palette[idx] = color end
+            elseif tag == "B" and frame then
+                local y = tonumber(msg:sub(2, 3))
+                if y then
+                    local c0 = 4
+                    local c1 = c0 + 164 - 1
+                    local f0 = c1 + 1
+                    local f1 = f0 + 164 - 1
+                    local b0 = f1 + 1
+                    local b1 = b0 + 164 - 1
+                    frame.rows[#frame.rows + 1] = {
+                        y = y,
+                        x = 1,
+                        chars = msg:sub(c0, c1),
+                        fg = msg:sub(f0, f1),
+                        bg = msg:sub(b0, b1),
+                    }
+                end
+            elseif tag == "S" and frame then
+                local y = tonumber(msg:sub(2, 3))
+                local x = tonumber(msg:sub(4, 6))
+                local ln = tonumber(msg:sub(7, 9))
+                if y and x and ln and ln > 0 then
+                    local c0 = 10
+                    local c1 = c0 + ln - 1
+                    local f0 = c1 + 1
+                    local f1 = f0 + ln - 1
+                    local b0 = f1 + 1
+                    local b1 = b0 + ln - 1
+                    frame.rows[#frame.rows + 1] = {
+                        y = y,
+                        x = x,
+                        chars = msg:sub(c0, c1),
+                        fg = msg:sub(f0, f1),
+                        bg = msg:sub(b0, b1),
+                    }
+                end
+            elseif msg:sub(1, 2) == "R " and frame then
+                local y, chHex, fg, bg = msg:match("^R%s+(%d+)%s+([0-9a-fA-F]+)%s+([0-9a-fA-F]+)%s+([0-9a-fA-F]+)$")
+                if y then
+                    frame.rows[#frame.rows + 1] = {
+                        y = tonumber(y),
+                        x = 1,
+                        chars = hexStringToCharsFast(chHex),
+                        fg = fg,
+                        bg = bg,
+                    }
+                end
+            elseif tag == "E" and frame then
+                return frame, nil
+            end
+        end
+    end
+
+    return frame, nil
+end
+
+local function safeWsReceive(ws)
+    local ok, packet = pcall(function() return ws.receive() end)
+    if not ok then
+        return nil, "ws_receive_error: " .. tostring(packet)
+    end
+    if not packet then
+        return nil, "ws_closed_or_eof"
+    end
+    return packet, nil
+end
+
+local function readWsFrame(ws)
+    while true do
+        local packet, recvErr = safeWsReceive(ws)
+        if not packet then return nil, recvErr or "eof" end
+
+        if packet:sub(1, 5) == "ERROR" then
+            return nil, packet
+        elseif packet == "STREAM_END" then
+            return nil, "end"
+        elseif packet:sub(1, 4) == "META" then
+            -- ignore metadata packet and continue
+        elseif packet == "WS_VIDEO_OK" then
+            -- ignore hello packet and continue
+        elseif packet:sub(1, 10) == "WAIT_FRAME" then
+            sleep(0.02)
+        else
+            local ok, frameOrErr, parseErr = pcall(function()
+                local frame, err = parseFramePacket(packet)
+                return frame, err
+            end)
+
+            if not ok then
+                return nil, "frame_parse_error: " .. tostring(frameOrErr)
+            end
+
+            if frameOrErr or parseErr then
+                return frameOrErr, parseErr
+            end
+        end
+    end
+end
+
+
+local function drawFrame(mon, frame)
+    -- V21 expects every packet to be a complete 81-row redraw.
+    -- If a bad/old server sends fewer rows, clear first so old-frame streaks cannot leak.
+    local rows = frame.rows or {}
+    if #rows < 81 then
+        mon.setBackgroundColor(colors.black)
+        mon.clear()
+    end
+    applyPalette(mon, frame.palette)
+    for _, row in ipairs(rows) do
+        mon.setCursorPos(row.x or 1, row.y)
+        mon.blit(row.chars, row.fg, row.bg)
+    end
+end
+
+
+local function getTapePosition(tape)
+    if not tape then return nil end
+
+    -- Computronics/TapeDrive builds have used different method names.
+    -- Try every likely position/tell method, without crashing on missing APIs.
+    local names = {
+        "getPosition", "getPos", "getBytePosition", "getByte", "tell",
+        "position", "pos"
+    }
+
+    for _, name in ipairs(names) do
+        if tape[name] then
+            local ok, value = pcall(function() return tape[name]() end)
+            if ok and type(value) == "number" then
+                return math.floor(value)
+            end
+        end
+    end
+
+    return nil
+end
+
+local function makePlaybackClock(tape, speed, fps, audioBytes, totalFrames)
+    speed = tonumber(speed or 1.0) or 1.0
+    fps = tonumber(fps or DEFAULT_FPS) or DEFAULT_FPS
+
+    local bps1x = tonumber(TAPE_BPS_1X_OVERRIDE or 0) or 0
+    if bps1x <= 0 then bps1x = tonumber(TAPE_BYTES_PER_SECOND_1X or 6000) or 6000 end
+
+    audioBytes = tonumber(audioBytes or 0) or 0
+    totalFrames = tonumber(totalFrames or 0) or 0
+
+    local nominalMsPer = 1000 / fps
+    local audioHeardSeconds = 0
+    if audioBytes > 0 and bps1x > 0 and speed > 0 then
+        audioHeardSeconds = (audioBytes / (bps1x * speed)) * (tonumber(AUDIO_LENGTH_TUNE or 1.0) or 1.0)
+    end
+
+    local msPer = nominalMsPer
+    if VIDEO_CLOCK_MODE == "audio_length_wall" and FORCE_AUDIO_LOCKED_FRAME_TIME and audioHeardSeconds > 0 and totalFrames > 0 then
+        -- This is the drift fix: spread the actual number of video frames across
+        -- the actual heard duration of the tape audio, instead of assuming that
+        -- metadata_seconds * fps and the tape are perfectly identical.
+        msPer = (audioHeardSeconds * 1000) / totalFrames
+    end
+
+    local startByte = nil
+    local usingTapeClock = false
+    if VIDEO_CLOCK_MODE == "tape_bytes" and USE_TAPE_BYTE_CLOCK then
+        startByte = getTapePosition(tape)
+        if type(startByte) == "number" then usingTapeClock = true end
+    end
+
+    return {
+        tape = tape,
+        speed = speed,
+        fps = fps,
+        msPer = msPer,
+        nominalMsPer = nominalMsPer,
+        audioHeardSeconds = audioHeardSeconds,
+        totalFrames = totalFrames,
+        startByte = startByte,
+        clockStartMs = wall_ms(),
+        bytesPerSecond = bps1x * speed,
+        tapePositionScale = tonumber(TAPE_POSITION_SCALE or 1.0) or 1.0,
+        bps1x = bps1x,
+        useTapeClock = usingTapeClock,
+        clockMode = VIDEO_CLOCK_MODE,
+        frames = 0,
+        rendered = 0,
+    }
+end
+
+local function playbackAudioMs(playback)
+    if not playback then return 0 end
+
+    if playback.useTapeClock then
+        local pos = getTapePosition(playback.tape)
+        if pos and playback.startByte then
+            local deltaBytes = pos - playback.startByte
+            if deltaBytes < 0 then deltaBytes = 0 end
+            local scale = tonumber(playback.tapePositionScale or 1.0) or 1.0
+            if scale <= 0 then scale = 1.0 end
+            deltaBytes = deltaBytes * scale
+            playback.lastTapePos = pos
+            playback.lastDeltaBytes = deltaBytes
+
+            local byteRate = tonumber(playback.bytesPerSecond or 0) or 0
+            if byteRate <= 0 then byteRate = 6000 * (tonumber(playback.speed or 1.0) or 1.0) end
+
+            return (deltaBytes / byteRate) * 1000
+        else
+            -- Method disappeared or errored; drop back to wall clock instead of breaking playback.
+            playback.useTapeClock = false
+        end
+    end
+
+    local elapsed = wall_ms() - (playback.clockStartMs or wall_ms())
+    if elapsed < 0 then elapsed = 0 end
+    return elapsed
+end
+
+
+local function frameTargetMs(playback, frameNumber)
+    return ((frameNumber - 1) * playback.msPer) + AUDIO_VIDEO_OFFSET_MS
+end
+
+local function currentTargetFrame(playback)
+    local ms = playbackAudioMs(playback) - AUDIO_VIDEO_OFFSET_MS
+    if ms < 0 then return 1 end
+    return math.max(1, math.floor(ms / playback.msPer) + 1)
+end
+
+local function waitForFrame(playback, frameNumber)
+    while true do
+        local earlyBy = frameTargetMs(playback, frameNumber) - playbackAudioMs(playback)
+        if earlyBy <= 0 then return end
+        sleep(math.min(0.03, earlyBy / 1000))
+    end
+end
+
+local function search()
+    clearTerm()
+    print("YouTube search or URL:")
+    write("> ")
+    local q = read()
+    clearTerm()
+    print("Searching...")
+    local data, err = getJson(BASE .. "/yt_search?q=" .. urlEncode(q) .. "&max_results=5")
+    if not data then print(err) waitKey() return nil end
+    if data.ok == false then
+        print("Search failed:")
+        print(tostring(data.error or "unknown"))
+        waitKey()
+        return nil
+    end
+    local r = data.results or {}
+    for i, v in ipairs(r) do
+        print(i .. ". " .. trim(v.title, 42))
+        print("   " .. trim(v.channel, 34))
+    end
+    print("")
+    write("Pick: ")
+    local n = tonumber(read())
+    if n and r[n] then return r[n] end
+    return nil
+end
+
+local function waitForPrepared(job)
+    while true do
+        local st = getJson(BASE .. "/status?job=" .. urlEncode(job))
+        clearTerm()
+        print("Preparing audio/job...")
+        if st then
+            print("Status: " .. tostring(st.status))
+            print("Audio: " .. tostring(st.audio_ready) .. " bytes " .. tostring(st.audio_bytes or 0))
+            print("Mode: " .. tostring(st.audio_mode or "?") .. " tape=" .. tostring(st.tape_speed or "?"))
+            print("Video cache: " .. tostring(st.ws_frames_ready or 0) .. " frames")
+            print("Avg delta rows: " .. tostring(st.ws_avg_changed_rows or "?"))
+            print(tostring(st.message or ""))
+            if st.status == "error" then print(st.error) waitKey() return nil end
+            if st.audio_ready then return st end
+        end
+        sleep(1)
+    end
+end
+
+local function getManifest(job)
+    return getJson(BASE .. "/manifest?job=" .. urlEncode(job))
+end
+
+local function waitForVideoCacheRunwayBeforeTape(job, expectedFrames, totalSeconds)
+    if not REQUIRE_SAFE_SERVER_RUNWAY_BEFORE_TAPE then return true end
+
+    clearTerm()
+    print("Waiting for safe server frame runway...")
+    print("CC will stream; Python keeps preparing ahead.")
+    sleep(0.25)
+
+    expectedFrames = tonumber(expectedFrames or 0) or 0
+    totalSeconds = tonumber(totalSeconds or 0) or 0
+    local fps = tonumber(DEFAULT_FPS or 10) or 10
+    local shortNeedsDone = totalSeconds > 0 and totalSeconds <= (SHORT_REQUIRE_SERVER_DONE_SECONDS or 60)
+
+    local lastReady = -1
+    local stallStart = os.clock()
+
+    while true do
+        local st = getJson(BASE .. "/status?job=" .. urlEncode(job))
+        clearTerm()
+        print("Waiting for safe server frame runway...")
+        if st then
+            local ready = tonumber(st.ws_frames_ready or 0) or 0
+            local done = st.ws_frames_done == true
+            local genFps = tonumber(st.ws_frame_gen_fps or 0) or 0
+            local totalEst = tonumber(st.ws_total_frames_est or expectedFrames or 0) or 0
+            if expectedFrames <= 0 and totalEst > 0 then expectedFrames = totalEst end
+            if totalEst <= 0 then totalEst = expectedFrames end
+
+            local required = math.floor((MIN_SERVER_RUNWAY_SECONDS or 45) * fps + 0.5)
+            if totalEst > 0 then
+                -- If the server is slower than playback, wait for enough cached frames
+                -- that playback should not catch the encoder before the end.
+                if genFps > 0 and genFps < fps then
+                    local need = math.ceil(totalEst * (1 - (genFps / fps)) + (RUNWAY_SAFETY_FRAMES or 90))
+                    if need > required then required = need end
+                else
+                    local half = math.ceil(totalEst * (TARGET_SERVER_RUNWAY_FRACTION or 0.50))
+                    if half > required then required = half end
+                end
+                if required > totalEst then required = totalEst end
+            end
+
+            print("Ready frames: " .. tostring(ready) .. (totalEst > 0 and ("/" .. tostring(totalEst)) or ""))
+            print("Required runway: " .. tostring(required))
+            print("Gen FPS: " .. tostring(genFps) .. "   Play FPS: " .. tostring(fps))
+            print("Done: " .. tostring(done))
+            print("Mode: " .. tostring(st.ws_video_mode or "?"))
+            print(tostring(st.message or ""))
+
+            if st.status == "error" then
+                print(tostring(st.error or "unknown error"))
+                waitKey()
+                return false
+            end
+
+            if done then
+                sleep(0.15)
+                return true
+            end
+
+            if shortNeedsDone then
+                print("Short clip: waiting for full server cache for perfect playback.")
+            elseif ready >= required and ready > 0 then
+                sleep(0.15)
+                return true
+            end
+
+            if ready ~= lastReady then
+                lastReady = ready
+                stallStart = os.clock()
+            elseif os.clock() - stallStart > 60 then
+                print("")
+                print("Cache has not advanced for 60s.")
+                print("Press any key to continue anyway, or terminate to wait/fix server.")
+                waitKey()
+                return true
+            end
+        else
+            print("No status yet.")
+        end
+        sleep(0.5)
+    end
+end
+
+clearTerm()
+print("Testing server...")
+local pong, pingErr = get(BASE .. "/ping")
+if not pong then print("Ping failed: " .. tostring(pingErr)) waitKey() return end
+if not http.websocket then print("No http.websocket.") waitKey() return end
+
+local picked = search()
+if not picked then return end
+
+clearTerm()
+print("Picked:")
+print(trim(picked.title, 50))
+print("")
+print("WebSocket v23 audio-locked full-redraw per-frame palette mode")
+print("Audio writes first; tape starts when server has a safe frame runway")
+print("Offset ms: " .. tostring(AUDIO_VIDEO_OFFSET_MS))
+print("")
+print("Continue? y")
+if tostring(read()):lower() ~= "y" then return end
+
+local prep, prepErr = getJson(
+    BASE .. "/yt_prepare?id=" .. urlEncode(picked.id)
+    .. "&total_seconds=" .. tostring(TOTAL_SECONDS)
+    .. "&segment_seconds=120"
+    .. "&fps=" .. tostring(DEFAULT_FPS)
+)
+
+if not prep then print("prepare failed: " .. tostring(prepErr)) waitKey() return end
+
+local st = waitForPrepared(prep.job)
+if not st then return end
+
+local man = getManifest(prep.job)
+if not man then print("No manifest") waitKey() return end
+
+local totalSeconds = tonumber(man.total_seconds or st.total_seconds or TOTAL_SECONDS or 0) or 0
+local expectedTotalFrames = 0
+if totalSeconds > 0 then expectedTotalFrames = math.floor(totalSeconds * DEFAULT_FPS + 0.5) end
+local shortFullPreload = SHORT_PRELOAD_ALL_FRAMES and totalSeconds > 0 and totalSeconds <= SHORT_FULL_PRELOAD_SECONDS
+
+local audioUrl = man.audio_url
+if audioUrl:sub(1, 1) == "/" then audioUrl = BASE .. audioUrl end
+
+clearTerm()
+print("Audio mode:")
+print("Tape speed: " .. tostring(man.tape_speed or 1.0))
+print("Slow factor: " .. tostring(man.audio_slow_factor or "?"))
+print("Mode: " .. tostring(man.audio_mode or "?"))
+print("Bytes: " .. tostring(man.audio_bytes or 0))
+if man.audio_expected_bytes then print("Expected: " .. tostring(man.audio_expected_bytes)) end
+sleep(1)
+
+local tape = writeAudioToTape(audioUrl, man.tape_speed or 1.0, man.audio_bytes)
+if not tape then waitKey() return end
+
+if not waitForVideoCacheRunwayBeforeTape(prep.job, expectedTotalFrames, totalSeconds) then return end
+
+-- V23: after the runway/full-cache wait, refresh the actual ffmpeg-produced
+-- frame count if the server knows it. This prevents tiny metadata/fps drift
+-- from accumulating across the whole clip.
+local stAfterRunway = getJson(BASE .. "/status?job=" .. urlEncode(prep.job))
+if stAfterRunway then
+    local actualFrames = tonumber(stAfterRunway.ws_total_frames_est or stAfterRunway.ws_frames_ready or 0) or 0
+    if actualFrames > 0 then expectedTotalFrames = actualFrames end
+end
+
+local mon = getDisplay()
+local wsUrl = BASE:gsub("^http", "ws") .. "/ws_video?job=" .. urlEncode(prep.job)
+    .. "&fps=" .. tostring(DEFAULT_FPS)
+    .. "&total_seconds=" .. tostring(TOTAL_SECONDS)
+
+clearTerm()
+print("Checking FRESH server identity...")
+local ver, verErr = getJson(BASE .. "/fresh_version")
+if not ver or not ver.ok then
+    print("/fresh_version failed.")
+    print("You are not running yt_ws_fresh_server_v23_audio_locked_fullframe.py.")
+    print(tostring(verErr))
+    waitKey()
+    return
+end
+print("Server:")
+print(tostring(ver.server_id or "?"))
+sleep(0.5)
+
+clearTerm()
+print("Checking websocket server route...")
+local probe, probeErr = getJson(BASE .. "/ws_probe")
+if not probe or not probe.ok then
+    print("/ws_probe failed.")
+    print("This usually means the Python server was not restarted")
+    print("or the new yt_ws_fresh_server_v21_fullframe_runway.py is not running.")
+    print(tostring(probeErr))
+    waitKey()
+    return
+end
+
+local wsPingUrl = BASE:gsub("^http", "ws") .. "/ws_ping"
+print("Testing websocket ping...")
+local pingWs, pingErr = http.websocket(wsPingUrl, WS_HEADERS)
+if not pingWs then
+    print("WebSocket ping failed:")
+    print(tostring(pingErr))
+    print("")
+    print("If /ws_probe worked but this fails, the tunnel")
+    print("is rejecting websockets. Check ngrok URL/headers.")
+    waitKey()
+    return
+end
+
+local pong = pingWs.receive()
+pcall(function() pingWs.close() end)
+if pong ~= "WS_OK" then
+    print("Bad websocket ping response:")
+    print(tostring(pong))
+    waitKey()
+    return
+end
+
+clearTerm()
+print("Opening WebSocket video...")
+print(trim(wsUrl, 50))
+local ws, wsErr = http.websocket(wsUrl, WS_HEADERS)
+if not ws then
+    print("WebSocket failed:")
+    print(tostring(wsErr))
+    waitKey()
+    return
+end
+
+-- First message should be WS_VIDEO_OK because the server accepts immediately.
+local hello = ws.receive()
+if hello ~= "WS_VIDEO_OK" then
+    print("Unexpected WS hello:")
+    print(tostring(hello))
+    waitKey()
+    return
+end
+
+clearTerm()
+local frameBuffer = {}
+local streamEndedEarly = false
+local streamEndReason = nil
+
+if shortFullPreload then
+    print("Short video: preloading ALL frames before tape starts...")
+    if expectedTotalFrames > 0 then print("Expected frames: " .. tostring(expectedTotalFrames)) end
+
+    while true do
+        local frame, reason = readWsFrame(ws)
+        if not frame then
+            streamEndedEarly = true
+            streamEndReason = reason
+            break
+        end
+
+        frameBuffer[#frameBuffer + 1] = frame
+
+        if #frameBuffer % 10 == 0 then
+            clearTerm()
+            print("Short video: preloading ALL frames...")
+            print("Frames loaded: " .. tostring(#frameBuffer) .. (expectedTotalFrames > 0 and ("/" .. tostring(expectedTotalFrames)) or ""))
+            print("Tape has NOT started yet.")
+        end
+
+        sleep(0)
+    end
+else
+    print("Prebuffering WebSocket video...")
+    print("Target frames: " .. tostring(VIDEO_PREBUFFER_FRAMES))
+
+    while #frameBuffer < VIDEO_PREBUFFER_FRAMES do
+        local frame, reason = readWsFrame(ws)
+        if not frame then
+            streamEndedEarly = true
+            streamEndReason = reason
+            break
+        end
+
+        frameBuffer[#frameBuffer + 1] = frame
+
+        if #frameBuffer % 5 == 0 then
+            clearTerm()
+            print("Prebuffering WebSocket video...")
+            print("Frames: " .. tostring(#frameBuffer) .. "/" .. tostring(VIDEO_PREBUFFER_FRAMES))
+        end
+
+        sleep(0)
+    end
+end
+
+if #frameBuffer == 0 then
+    print("No frames buffered: " .. tostring(streamEndReason))
+    waitKey()
+    return
+end
+
+clearTerm()
+print("Buffered " .. tostring(#frameBuffer) .. " frame(s).")
+print("Starting queued WebSocket player...")
+sleep(0.05)
+
+local playback = nil
+
+local function presentFrame(frame)
+    if not frame then return end
+    waitForFrame(playback, frame.number)
+    drawFrame(mon, frame)
+    playback.frames = frame.number
+    playback.rendered = playback.rendered + 1
+end
+
+local function drawNow(frame)
+    if not frame then return end
+    drawFrame(mon, frame)
+    playback.frames = frame.number
+    playback.rendered = playback.rendered + 1
+end
+
+local function nextBufferedOrWs()
+    if frameBuffer and #frameBuffer > 0 then
+        return table.remove(frameBuffer, 1), nil
+    end
+    if streamEndedEarly then
+        return nil, streamEndReason
+    end
+    return readWsFrame(ws)
+end
+
+-- V11 queue architecture:
+-- One coroutine reads WebSocket frames continuously.
+-- Another coroutine renders every frame in order.
+local queue = {}
+local queueFirst = 1
+local queueLast = 0
+local readerDone = false
+local readerErr = nil
+local lastRenderedFrame = 0
+
+local function queueLen()
+    return queueLast - queueFirst + 1
+end
+
+local function pushFrame(frame)
+    queueLast = queueLast + 1
+    queue[queueLast] = frame
+end
+
+local function popFrame()
+    if queueFirst > queueLast then return nil end
+    local frame = queue[queueFirst]
+    queue[queueFirst] = nil
+    queueFirst = queueFirst + 1
+
+    if queueFirst > 1000 then
+        local n = 0
+        for i = queueFirst, queueLast do
+            n = n + 1
+            queue[n] = queue[i]
+            queue[i] = nil
+        end
+        queueFirst = 1
+        queueLast = n
+    end
+
+    return frame
+end
+
+if frameBuffer then
+    for i = 1, #frameBuffer do
+        pushFrame(frameBuffer[i])
+    end
+end
+frameBuffer = nil
+
+local function readerLoop()
+    local ok, errOuter = pcall(function()
+        while not streamEndedEarly do
+            while queueLen() >= FRAME_QUEUE_MAX do
+                sleep(0.05)
+            end
+
+            local frame, err = readWsFrame(ws)
+            if not frame then
+                readerDone = true
+                readerErr = err
+                return
+            end
+
+            pushFrame(frame)
+            sleep(0)
+        end
+
+        readerDone = true
+        readerErr = streamEndReason
+    end)
+
+    if not ok then
+        readerDone = true
+        readerErr = "reader_crash: " .. tostring(errOuter)
+    end
+end
+
+local function waitForQueueStart()
+    clearTerm()
+    print("Filling video queue...")
+    local lastPrint = os.clock()
+
+    -- V21: the runway lives on the Python server, not in CC RAM.
+    -- Keep only a small local buffer so memory does not explode with full-redraw packets.
+    local target = QUEUE_START_FRAMES
+    if shortFullPreload then target = 1 end
+
+    while queueLen() < target and not readerDone do
+        if os.clock() - lastPrint > 0.25 then
+            clearTerm()
+            print("Filling video queue...")
+            print("Frames queued: " .. tostring(queueLen()) .. "/" .. tostring(target))
+            print("Reader: active")
+            print("Mode: full redraw every frame; 2x tape-byte locked")
+            lastPrint = os.clock()
+        end
+        sleep(0.05)
+    end
+
+    if readerDone and queueLen() < QUEUE_START_FRAMES then
+        clearTerm()
+        print("Reader ended before target queue.")
+        print("Frames queued: " .. tostring(queueLen()) .. "/" .. tostring(target))
+        print("Reason: " .. tostring(readerErr))
+        print("")
+        print("Continuing with available frames...")
+        sleep(1.25)
+    end
+end
+
+local function adaptiveFrameDelay(playbackState, frame, renderCost)
+    -- Every frame slot is kept. This does not skip frames.
+    -- After drawing/holding the current frame, wait until the next frame
+    -- should appear according to the tape-byte/audio clock.
+    local nextFrameNumber = (tonumber(frame.number or 1) or 1) + 1
+    local targetNextMs = frameTargetMs(playbackState, nextFrameNumber)
+    local nowMs = playbackAudioMs(playbackState)
+    local delay = (targetNextMs - nowMs) / 1000
+
+    -- If rendering the frame itself was expensive, the tape clock already includes
+    -- that time. Do not add a fixed frame sleep; only wait if the video is ahead.
+    -- Never use sleep(0). A tiny real sleep keeps CC's event scheduler,
+    -- WebSocket reader, monitor peripheral, and tape peripheral from starving.
+    -- If we are behind, use exactly MIN_FRAME_SLEEP instead of zero.
+    local slept = MIN_FRAME_SLEEP
+    if delay > MIN_FRAME_SLEEP then
+        slept = math.min(MAX_FRAME_SLEEP, delay)
+    end
+    playbackState.lastDelay = slept
+    playbackState.lastBehindMs = -math.min(0, delay * 1000)
+    playbackState.lastAheadMs = math.max(0, delay * 1000)
+    sleep(slept)
+end
+
+
+local function rendererLoop()
+    waitForQueueStart()
+
+    clearTerm()
+    print("Starting tape + queued video...")
+    print("Initial queue: " .. tostring(queueLen()) .. " frames")
+    if shortFullPreload then print("Short mode: all frames are already loaded.") end
+    sleep(0.05)
+
+    startTape(tape, man.tape_speed or 1.0)
+    playback = makePlaybackClock(tape, man.tape_speed or 1.0, DEFAULT_FPS, man.audio_bytes or 0, expectedTotalFrames)
+
+    local lastFrameObject = nil
+
+    local function holdFrameSlot(frameNumber)
+        -- Do not redraw; just keep the previous picture on screen for this timeline slot.
+        playback.frames = frameNumber
+        playback.held = (playback.held or 0) + 1
+        lastRenderedFrame = frameNumber
+        adaptiveFrameDelay(playback, { number = frameNumber }, 0)
+    end
+
+    local function drawFrameSlot(frame)
+        local t0 = os.clock()
+        drawFrame(mon, frame)
+        local renderCost = os.clock() - t0
+        playback.frames = frame.number
+        playback.rendered = playback.rendered + 1
+        playback.lastRenderCost = renderCost
+        lastRenderedFrame = frame.number
+        lastFrameObject = frame
+        adaptiveFrameDelay(playback, frame, renderCost)
+    end
+
+    while true do
+        local frame = popFrame()
+
+        if frame then
+            local n = tonumber(frame.number or 0) or 0
+
+            -- V22 strict mode: every actual frame packet must be drawn.
+            -- Do not fake missing frames by holding the previous image. If a gap
+            -- ever appears, record it loudly, but still draw the packet we got.
+            if lastRenderedFrame > 0 and n > lastRenderedFrame + 1 then
+                playback.gaps = (playback.gaps or 0) + (n - lastRenderedFrame - 1)
+            end
+
+            if n > lastRenderedFrame then
+                drawFrameSlot(frame)
+            end
+        else
+            if readerDone then
+                -- If ffmpeg/websocket produced fewer frames than the audio duration
+                -- implies, hold the final image until the expected frame count.
+                if FILL_TAIL_TO_AUDIO_WITH_HOLD and expectedTotalFrames > 0 and lastRenderedFrame > 0 and lastRenderedFrame < expectedTotalFrames then
+                    holdFrameSlot(lastRenderedFrame + 1)
+                else
+                    clearTerm()
+                    print("Video stream ended: " .. tostring(readerErr))
+                    print("Rendered frame slots: " .. tostring(playback.rendered))
+                    print("Last timeline frame: " .. tostring(lastRenderedFrame))
+                    if expectedTotalFrames > 0 then print("Expected frames: " .. tostring(expectedTotalFrames)) end
+                    return
+                end
+            else
+                -- Queue underrun. Do not skip; wait for reader to catch up.
+                sleep(0.05)
+            end
+        end
+    end
+end
+
+parallel.waitForAll(readerLoop, rendererLoop)
+
+pcall(function() ws.close() end)
+
+clearTerm()
+print("Done.")
+if playback then
+    print("Actual frames drawn: " .. tostring(playback.rendered))
+    print("Held/fake slots: " .. tostring(playback.held or 0))
+    print("Missing packet gaps: " .. tostring(playback.gaps or 0))
+    print("Last timeline frame: " .. tostring(playback.frames))
+    if expectedTotalFrames > 0 then print("Expected frames: " .. tostring(expectedTotalFrames)) end
+    print("Tape clock: " .. tostring(playback.useTapeClock))
+    print("BPS1x: " .. tostring(playback.bps1x))
+    print("Clock mode: " .. tostring(playback.clockMode))
+    print("ms/frame: " .. tostring(playback.msPer))
+    print("Audio heard seconds est: " .. tostring(playback.audioHeardSeconds))
+    print("Last render cost: " .. tostring(playback.lastRenderCost or 0))
+    print("Last delay: " .. tostring(playback.lastDelay or 0))
+    print("Last tape pos: " .. tostring(playback.lastTapePos or "?"))
+    print("Last delta bytes: " .. tostring(playback.lastDeltaBytes or "?"))
+    print("Tape pos scale: " .. tostring(playback.tapePositionScale or 1.0))
+else
+    print("Playback never started.")
+end
+print("Offset ms: " .. tostring(AUDIO_VIDEO_OFFSET_MS))
+waitKey()
