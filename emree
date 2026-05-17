@@ -1,0 +1,791 @@
+-- shark_emc_generator_rod_sweeper.lua
+-- Faster rod-clearing replacement for Z's Shark Machine / DragonCraft EMC Generator.
+--
+-- Fixes from the lighter version:
+--   1. Powder condensers are detected by blaze_powder OR blaze_rod, not just blaze_rod.
+--      This matters because your first half can be blaze powder while rods appear on the other side.
+--   2. Rod transfer now scans every non-empty slot reported by inv.list().
+--   3. If one RMF condenser rejects rods / is full, it tries multiple RMF destinations instead of giving up.
+--   4. Uses a small number of staggered sweeper lanes instead of 48 hot threads.
+--   5. Monitor animation is still only one display thread, so it does not fight the transfer threads.
+--
+-- Copy to /startup or run directly.
+
+-- =========================================================
+-- === Config
+-- =========================================================
+
+local MONITOR_TEXT_SCALE = 1
+
+local BG_COLOR = colors.blue
+local STAT_COLOR = colors.green
+
+local TRACKED_EMC_PER_RMF = 10059784
+local ROD_EMC = 1536
+local RESERVE_RODS = 64
+
+-- Peripheral rescanning.
+local RESCAN_SECONDS = 25
+
+-- Rod sweeper tuning.
+-- These are the main performance knobs.
+local SWEEPER_LANES = 6                  -- More lanes now, still far safer than 48 hot workers.
+local SWEEPER_PASS_SLEEP = 0.02          -- Short delay after a lane finishes one full pass.
+local SWEEPER_STAGGER_SECONDS = 0.08     -- Spaces lanes apart on boot.
+local MAX_RODS_PER_CONDENSER_PASS = 20000 -- Drain aggressively; stop when source/dest stops accepting.
+local MAX_RODS_PER_PUSH = 512            -- Bigger pushes into RMF condensers.
+local MAX_DEST_TRIES_PER_PUSH = 64       -- Try hard when some RMF condensers are full.
+
+-- Drain/output tuning.
+local DRAIN_TICK_SECONDS = 0.08
+local RMF_DRAIN_CONDENSERS_PER_TICK = 20
+
+local BHU_TO_ENDER_SECONDS = 0.35
+local BHU_SLOTS_PER_TICK = 64
+
+-- Display/animation tuning.
+local ENABLE_ANIMATION = true
+local ANIMATION_TICK_SECONDS = 0.16
+local SHARK_STEP_EVERY_TICKS = 2
+local FISH_STEP_EVERY_TICKS = 1
+local STATS_SECONDS = 5
+
+-- Classification item names.
+local BLAZE_ROD = "minecraft:blaze_rod"
+local BLAZE_POWDER = "minecraft:blaze_powder"
+local RMF_ITEM = "projecte:rm_furnace"
+
+-- Condensers in this list are ALWAYS treated as RMF destination condensers,
+-- even if they temporarily contain blaze rods/powder and would otherwise be
+-- auto-classified as powder-side.
+local FORCE_RMF_CONDENSERS = {
+    ["projecte:condenser_mk2_13821"] = true,
+}
+
+-- =========================================================
+-- === Monitor Setup
+-- =========================================================
+
+local monitor = peripheral.find("monitor")
+if not monitor then error("Monitor not found") end
+
+monitor.setTextScale(MONITOR_TEXT_SCALE)
+local monW, monH = monitor.getSize()
+monitor.setBackgroundColor(BG_COLOR)
+monitor.setTextColor(colors.white)
+monitor.clear()
+
+local function setPixel(x, y, color)
+    if x < 1 or x > monW or y < 1 or y > monH then return end
+    monitor.setCursorPos(x, y)
+    monitor.setBackgroundColor(color)
+    monitor.write(" ")
+end
+
+local function clearLine(y)
+    if y < 1 or y > monH then return end
+    monitor.setCursorPos(1, y)
+    monitor.setBackgroundColor(BG_COLOR)
+    monitor.write(string.rep(" ", monW))
+end
+
+local function clearRows(y1, y2)
+    for y = y1, y2 do
+        clearLine(y)
+    end
+end
+
+local function writeCentered(text, y, color)
+    text = tostring(text or "")
+    clearLine(y)
+    monitor.setTextColor(color or STAT_COLOR)
+    monitor.setBackgroundColor(BG_COLOR)
+    local x = math.max(1, math.floor((monW - #text) / 2) + 1)
+    monitor.setCursorPos(x, y)
+    monitor.write(text:sub(1, monW))
+end
+
+-- =========================================================
+-- === Art
+-- =========================================================
+
+local sharkPixels = {
+    {7, 0, colors.gray}, {5, 1, colors.gray}, {6, 1, colors.gray}, {7, 1, colors.gray}, {8, 1, colors.gray},
+    {12, 1, colors.gray}, {13, 1, colors.gray}, {3, 2, colors.gray}, {4, 2, colors.gray}, {5, 2, colors.gray},
+    {6, 2, colors.gray}, {7, 2, colors.gray}, {8, 2, colors.gray}, {9, 2, colors.gray}, {11, 2, colors.gray},
+    {12, 2, colors.gray}, {2, 3, colors.gray}, {3, 3, colors.gray}, {4, 3, colors.black}, {5, 3, colors.gray},
+    {6, 3, colors.gray}, {7, 3, colors.gray}, {8, 3, colors.gray}, {9, 3, colors.gray}, {10, 3, colors.gray},
+    {11, 3, colors.gray}, {12, 3, colors.gray}, {3, 4, colors.white}, {4, 4, colors.white}, {5, 4, colors.white},
+    {6, 4, colors.gray}, {7, 4, colors.gray}, {8, 4, colors.gray}, {9, 4, colors.white}, {10, 4, colors.white},
+    {11, 4, colors.gray}, {12, 4, colors.gray}, {8, 5, colors.gray}, {12, 5, colors.gray}, {13, 5, colors.gray},
+}
+
+local coralPixels = {
+    {4, monH, colors.pink},
+    {3, monH - 1, colors.magenta},
+    {14, monH - 2, colors.cyan},
+    {15, monH - 1, colors.cyan},
+    {16, monH - 2, colors.cyan},
+    {34, monH - 1, colors.lime},
+    {35, monH, colors.lime},
+    {36, monH - 1, colors.lime},
+    {37, monH - 2, colors.green},
+}
+
+local fishPixels = {
+    {25, 12, colors.cyan},
+    {26, 12, colors.lightBlue},
+    {27, 12, colors.lightBlue},
+    {36, 11, colors.orange},
+    {35, 11, colors.white},
+    {34, 11, colors.orange},
+    {17, 10, colors.red},
+    {18, 10, colors.red},
+    {16, 10, colors.orange}
+}
+
+local sharkWidth = 14
+local sharkOffsetY = monH - 6
+local fishStartX = 16
+local fishWidth = 12
+local fishOffsetY = monH - 9
+
+local ANIM_TOP = math.max(4, fishOffsetY)
+local ANIM_BOTTOM = monH
+
+local sharkX = monW
+local fishX = monW + 1
+local animationTick = 0
+
+local function drawFloorAndCoral()
+    for x = 1, monW do
+        setPixel(x, monH, colors.yellow)
+    end
+
+    for _, px in ipairs(coralPixels) do
+        setPixel(px[1], px[2], px[3])
+    end
+end
+
+local function drawShark()
+    for _, px in ipairs(sharkPixels) do
+        setPixel(sharkX + px[1], sharkOffsetY + px[2], px[3])
+    end
+end
+
+local function drawFish()
+    for _, px in ipairs(fishPixels) do
+        setPixel(fishX + (px[1] - fishStartX), fishOffsetY + (px[2] - 10), px[3])
+    end
+end
+
+local function drawAnimationFrame()
+    if not ENABLE_ANIMATION then return end
+
+    animationTick = animationTick + 1
+
+    if animationTick % SHARK_STEP_EVERY_TICKS == 0 then
+        sharkX = sharkX - 1
+        if sharkX < -sharkWidth then sharkX = monW end
+    end
+
+    if animationTick % FISH_STEP_EVERY_TICKS == 0 then
+        fishX = fishX - 1
+        if fishX < -fishWidth - 8 then fishX = monW + 1 end
+    end
+
+    clearRows(ANIM_TOP, ANIM_BOTTOM)
+    drawFloorAndCoral()
+    drawFish()
+    drawShark()
+end
+
+-- =========================================================
+-- === State / Peripheral Cache
+-- =========================================================
+
+local totalTransferred = 0
+local lastTransferredForRate = 0
+local startTime = os.clock()
+
+local bhuName, bhu
+local enderChestName, enderChest
+
+local allCondensers = {}
+local powderCondensers = {}
+local rmfCondensers = {}
+
+local rmfDestIndex = 1
+local rmfDrainIndex = 1
+local bhuSlotCursor = 1
+
+-- Condensers that recently had many rods get revisited constantly.
+local hotRodCondensers = {}
+local hotRodSet = {}
+
+local lastScanSummary = ""
+
+local function shortNumber(n)
+    n = tonumber(n) or 0
+    local abs = math.abs(n)
+
+    if abs >= 1e12 then return string.format("%.2fT", n / 1e12)
+    elseif abs >= 1e9 then return string.format("%.2fB", n / 1e9)
+    elseif abs >= 1e6 then return string.format("%.2fM", n / 1e6)
+    elseif abs >= 1e3 then return string.format("%.2fK", n / 1e3)
+    else return tostring(math.floor(n)) end
+end
+
+local function wrapSafe(name)
+    if not name then return nil end
+    local ok, p = pcall(peripheral.wrap, name)
+    if ok then return p end
+    return nil
+end
+
+local function getPeripheralName(p)
+    local ok, name = pcall(function()
+        return peripheral.getName(p)
+    end)
+
+    if ok then return name end
+    return nil
+end
+
+local function findPeripheralByPattern(predicate)
+    for _, name in ipairs(peripheral.getNames()) do
+        if predicate(name) then
+            return name, peripheral.wrap(name)
+        end
+    end
+
+    return nil, nil
+end
+
+local function itemSummary(items)
+    local hasRod = false
+    local hasPowder = false
+    local hasRmf = false
+    local rodCount = 0
+
+    if type(items) ~= "table" then
+        return hasRod, hasPowder, hasRmf, rodCount
+    end
+
+    for _, item in pairs(items) do
+        if item and item.name == BLAZE_ROD then
+            hasRod = true
+            rodCount = rodCount + (tonumber(item.count) or 0)
+        elseif item and item.name == BLAZE_POWDER then
+            hasPowder = true
+        elseif item and item.name == RMF_ITEM then
+            hasRmf = true
+        end
+    end
+
+    return hasRod, hasPowder, hasRmf, rodCount
+end
+
+local function classifyCondensers()
+    allCondensers = {}
+    powderCondensers = {}
+    rmfCondensers = {}
+
+    bhuName, bhu = findPeripheralByPattern(function(name)
+        return tostring(name):find("industrialforegoing:black_hole_unit_tile") ~= nil
+    end)
+
+    enderChestName, enderChest = findPeripheralByPattern(function(name)
+        local lower = tostring(name):lower()
+        return lower:find("ender_chest") ~= nil or lower:find("enderchest") ~= nil
+    end)
+
+    local rodTotal = 0
+    local powderMarked = 0
+    local rmfMarked = 0
+
+    for _, name in ipairs(peripheral.getNames()) do
+        if tostring(name):match("^projecte:condenser_mk2_") then
+            local inv = peripheral.wrap(name)
+            local ok, items = pcall(function()
+                return inv.list()
+            end)
+
+            local hasRod, hasPowder, hasRmf, rods = itemSummary(ok and items or {})
+            rodTotal = rodTotal + rods
+
+            local entry = {
+                name = name,
+                inv = inv,
+                hasRod = hasRod,
+                hasPowder = hasPowder,
+                hasRmf = hasRmf,
+                lastRodCount = rods,
+            }
+
+            table.insert(allCondensers, entry)
+
+            if rods > RESERVE_RODS then
+                markHotRodCondenser(entry)
+            end
+
+            -- Manual override first:
+            -- These are destination RMF condensers even if their inventory happens
+            -- to contain blaze rods/powder during a transition.
+            if FORCE_RMF_CONDENSERS[name] then
+                table.insert(rmfCondensers, entry)
+                rmfMarked = rmfMarked + 1
+
+            -- Important fix:
+            -- A powder condenser can be recognized by either blaze powder OR blaze rods.
+            -- Previously, a condenser with powder but temporarily no rods could be treated as RMF-side.
+            elseif hasPowder or hasRod then
+                table.insert(powderCondensers, entry)
+                powderMarked = powderMarked + 1
+            else
+                table.insert(rmfCondensers, entry)
+                rmfMarked = rmfMarked + 1
+            end
+        end
+    end
+
+    rmfDestIndex = 1
+    rmfDrainIndex = 1
+
+    lastScanSummary =
+        "Powder:" .. tostring(#powderCondensers)
+        .. " RMF:" .. tostring(#rmfCondensers)
+        .. " rodsSeen:" .. tostring(rodTotal)
+
+    print("Rescan complete.")
+    print(lastScanSummary)
+    print("BHU: " .. tostring(bhuName or "missing"))
+    print("Ender chest: " .. tostring(enderChestName or "missing"))
+end
+
+local function rescanLoop()
+    while true do
+        classifyCondensers()
+        sleep(RESCAN_SECONDS)
+    end
+end
+
+local function getNextRmfDestination()
+    if #rmfCondensers == 0 then return nil end
+
+    for _ = 1, #rmfCondensers do
+        if rmfDestIndex > #rmfCondensers then
+            rmfDestIndex = 1
+        end
+
+        local entry = rmfCondensers[rmfDestIndex]
+        rmfDestIndex = rmfDestIndex + 1
+
+        if entry and entry.name then
+            return entry.name
+        end
+    end
+
+    return nil
+end
+
+
+local function markHotRodCondenser(entry)
+    if not entry or not entry.name then return end
+    if hotRodSet[entry.name] then return end
+    hotRodSet[entry.name] = true
+    table.insert(hotRodCondensers, entry)
+end
+
+local function popHotRodCondenser()
+    while #hotRodCondensers > 0 do
+        local entry = table.remove(hotRodCondensers, 1)
+        if entry and entry.name and hotRodSet[entry.name] then
+            hotRodSet[entry.name] = nil
+            return entry
+        end
+    end
+
+    return nil
+end
+
+-- =========================================================
+-- === Rod Sweeper Logic
+-- =========================================================
+
+local function tryPushRodSlotToManyRmf(inv, slot, wanted)
+    local remaining = wanted
+    local totalMoved = 0
+    local tries = 0
+    local noMoveStreak = 0
+
+    while remaining > 0 and tries < MAX_DEST_TRIES_PER_PUSH and #rmfCondensers > 0 do
+        tries = tries + 1
+
+        local destName = getNextRmfDestination()
+        if not destName then break end
+
+        local moveAmount = math.min(MAX_RODS_PER_PUSH, remaining)
+
+        local okMove, moved = pcall(function()
+            return inv.pushItems(destName, slot, moveAmount)
+        end)
+
+        moved = (okMove and tonumber(moved)) or 0
+
+        if moved > 0 then
+            totalMoved = totalMoved + moved
+            remaining = remaining - moved
+            totalTransferred = totalTransferred + moved
+            noMoveStreak = 0
+            sleep(0)
+        else
+            noMoveStreak = noMoveStreak + 1
+
+            -- If every known RMF destination has rejected recently, stop this slot for now.
+            -- The drain loop may free room, and hot queue will retry soon.
+            if noMoveStreak >= #rmfCondensers then
+                break
+            end
+
+            sleep(0)
+        end
+    end
+
+    return totalMoved
+end
+
+local function sweepOnePowderCondenser(entry)
+    if not entry or not entry.name then return 0 end
+
+    if not entry.inv then
+        entry.inv = wrapSafe(entry.name)
+        if not entry.inv then return 0 end
+    end
+
+    if #rmfCondensers == 0 then
+        return 0
+    end
+
+    local ok, items = pcall(function()
+        return entry.inv.list()
+    end)
+
+    if not ok or type(items) ~= "table" then
+        entry.inv = wrapSafe(entry.name)
+        return 0
+    end
+
+    -- Re-check contents live. This also handles condensers that were powder-only
+    -- at rescan time and later generated rods.
+    local rodSlots = {}
+    local totalRods = 0
+    local hasPowder = false
+
+    for slot, item in pairs(items) do
+        if item and item.name == BLAZE_ROD then
+            local count = tonumber(item.count) or 0
+            totalRods = totalRods + count
+            table.insert(rodSlots, {slot = slot, count = count})
+        elseif item and item.name == BLAZE_POWDER then
+            hasPowder = true
+        end
+    end
+
+    entry.hasPowder = hasPowder or entry.hasPowder
+    entry.lastRodCount = totalRods
+
+    if totalRods <= RESERVE_RODS then
+        return 0
+    end
+
+    -- Keep this condenser on the hot retry list while it still has excess rods.
+    markHotRodCondenser(entry)
+
+    local toMove = math.min(totalRods - RESERVE_RODS, MAX_RODS_PER_CONDENSER_PASS)
+    local movedTotal = 0
+
+    -- Sort slots descending. In many modded inventories, output slots are later/higher slots.
+    -- This helps attack the "other side" full of rods first.
+    table.sort(rodSlots, function(a, b)
+        return a.slot > b.slot
+    end)
+
+    for _, rodSlot in ipairs(rodSlots) do
+        if toMove <= 0 then break end
+
+        local wantedFromSlot = math.min(rodSlot.count, toMove)
+        local moved = tryPushRodSlotToManyRmf(entry.inv, rodSlot.slot, wantedFromSlot)
+
+        movedTotal = movedTotal + moved
+        toMove = toMove - moved
+
+        if moved <= 0 then
+            -- Could not move from this slot. Keep going; other rod slots might be accessible.
+            sleep(0)
+        end
+    end
+
+    -- If we moved some but probably left excess rods, retry this condenser very soon.
+    if movedTotal > 0 and (totalRods - movedTotal) > RESERVE_RODS then
+        markHotRodCondenser(entry)
+    elseif movedTotal == 0 and totalRods > RESERVE_RODS then
+        -- Destinations were likely full. Retry once drain loop frees space.
+        markHotRodCondenser(entry)
+    end
+
+    return movedTotal
+end
+
+local function sweeperLane(laneId)
+    sleep((laneId - 1) * SWEEPER_STAGGER_SECONDS)
+
+    while true do
+        if #powderCondensers == 0 or #rmfCondensers == 0 then
+            sleep(0.5)
+        else
+            local movedThisPass = 0
+
+            -- Priority pass: immediately revisit condensers known to be rod-heavy.
+            -- Each lane grabs a few hot entries so full rod buffers do not wait for a whole broad scan.
+            for _ = 1, 4 do
+                local hot = popHotRodCondenser()
+                if not hot then break end
+
+                local moved = sweepOnePowderCondenser(hot)
+                movedThisPass = movedThisPass + moved
+                sleep(0)
+            end
+
+            -- Partition the powder condensers between lanes:
+            -- lane 1 scans 1, 1+lanes, ...
+            -- lane 2 scans 2, 2+lanes, ...
+            for i = laneId, #powderCondensers, SWEEPER_LANES do
+                local moved = sweepOnePowderCondenser(powderCondensers[i])
+                movedThisPass = movedThisPass + moved
+
+                -- Important: yield between condenser inventories.
+                sleep(0)
+            end
+
+            if movedThisPass > 0 then
+                sleep(SWEEPER_PASS_SLEEP)
+            else
+                -- If no work happened, back off a little more.
+                sleep(0.20)
+            end
+        end
+    end
+end
+
+-- =========================================================
+-- === RMF Output Drain / BHU Drain
+-- =========================================================
+
+local function drainRmfOutputsOnce()
+    if not bhu or #rmfCondensers == 0 then
+        sleep(DRAIN_TICK_SECONDS)
+        return
+    end
+
+    local bhuDest = getPeripheralName(bhu) or bhuName
+    if not bhuDest then
+        sleep(DRAIN_TICK_SECONDS)
+        return
+    end
+
+    for _ = 1, RMF_DRAIN_CONDENSERS_PER_TICK do
+        if rmfDrainIndex > #rmfCondensers then
+            rmfDrainIndex = 1
+        end
+
+        local entry = rmfCondensers[rmfDrainIndex]
+        rmfDrainIndex = rmfDrainIndex + 1
+
+        if entry and entry.inv then
+            local ok, items = pcall(function()
+                return entry.inv.list()
+            end)
+
+            if ok and type(items) == "table" then
+                for slot, item in pairs(items) do
+                    if item and item.name == RMF_ITEM then
+                        pcall(function()
+                            entry.inv.pushItems(bhuDest, slot, item.count)
+                        end)
+                        sleep(0)
+                    end
+                end
+            else
+                entry.inv = wrapSafe(entry.name)
+            end
+        end
+    end
+
+    sleep(DRAIN_TICK_SECONDS)
+end
+
+local function drainLoop()
+    while true do
+        drainRmfOutputsOnce()
+    end
+end
+
+local function bhuToEnderLoop()
+    while true do
+        if bhu and enderChest then
+            local enderDest = getPeripheralName(enderChest) or enderChestName
+
+            local ok, items = pcall(function()
+                return bhu.list()
+            end)
+
+            if ok and type(items) == "table" and enderDest then
+                local checked = 0
+                local maxSlotSeen = 0
+
+                for slot, item in pairs(items) do
+                    if slot > maxSlotSeen then maxSlotSeen = slot end
+
+                    if slot >= bhuSlotCursor then
+                        checked = checked + 1
+
+                        if item and item.name == RMF_ITEM then
+                            pcall(function()
+                                bhu.pushItems(enderDest, slot, item.count)
+                            end)
+                            sleep(0)
+                        end
+
+                        if checked >= BHU_SLOTS_PER_TICK then
+                            bhuSlotCursor = slot + 1
+                            break
+                        end
+                    end
+                end
+
+                if checked < BHU_SLOTS_PER_TICK or bhuSlotCursor > maxSlotSeen then
+                    bhuSlotCursor = 1
+                end
+            end
+        end
+
+        sleep(BHU_TO_ENDER_SECONDS)
+    end
+end
+
+-- =========================================================
+-- === Display
+-- =========================================================
+
+local lastStatsDrawAt = 0
+
+local function countStoredRmfEmc()
+    if not bhu then return 0 end
+
+    local ok, items = pcall(function()
+        return bhu.list()
+    end)
+
+    if not ok or type(items) ~= "table" then
+        return 0
+    end
+
+    local totalEMC = 0
+
+    for _, item in pairs(items) do
+        if item and item.name == RMF_ITEM then
+            totalEMC = totalEMC + ((tonumber(item.count) or 0) * TRACKED_EMC_PER_RMF)
+        end
+    end
+
+    return totalEMC
+end
+
+local function drawStats()
+    local elapsed = os.clock() - startTime
+    if elapsed <= 0 then elapsed = 1 end
+
+    local totalEMCGenerated = totalTransferred * ROD_EMC
+    local emcPerMinute = totalEMCGenerated / (elapsed / 60)
+    local macerators = #powderCondensers * 3
+    local emcPerMacMin = (macerators > 0) and (emcPerMinute / macerators) or 0
+    local totalStoredEMC = countStoredRmfEmc()
+
+    local rodsSinceLast = totalTransferred - lastTransferredForRate
+    lastTransferredForRate = totalTransferred
+
+    writeCentered("EMC/m: " .. shortNumber(emcPerMinute) .. "  EMC/M: " .. shortNumber(emcPerMacMin), 1, STAT_COLOR)
+    writeCentered("Pow:" .. #powderCondensers .. " RMF:" .. #rmfCondensers .. " Stored:" .. shortNumber(totalStoredEMC), 2, STAT_COLOR)
+    writeCentered("Rod/s:" .. shortNumber(rodsSinceLast / STATS_SECONDS) .. " Hot:" .. #hotRodCondensers .. " " .. lastScanSummary, 3, STAT_COLOR)
+end
+
+local function displayLoop()
+    monitor.setBackgroundColor(BG_COLOR)
+    monitor.clear()
+
+    while true do
+        local now = os.clock()
+
+        if now - lastStatsDrawAt >= STATS_SECONDS then
+            drawStats()
+            lastStatsDrawAt = now
+        end
+
+        drawAnimationFrame()
+        sleep(ANIMATION_TICK_SECONDS)
+    end
+end
+
+-- =========================================================
+-- === Safe Task Runner
+-- =========================================================
+
+local function safeLoop(name, fn, restartDelay)
+    return function()
+        restartDelay = restartDelay or 2
+
+        while true do
+            local ok, err = pcall(fn)
+
+            if not ok then
+                print("[TASK ERROR] " .. tostring(name) .. ": " .. tostring(err))
+            else
+                print("[TASK RETURNED] " .. tostring(name))
+            end
+
+            sleep(restartDelay)
+        end
+    end
+end
+
+-- =========================================================
+-- === Main
+-- =========================================================
+
+print("Starting Shark EMC rod sweeper.")
+print("This version aggressively clears blaze rods from powder condensers.")
+print("Hot-queue enabled: rod-heavy condensers are retried immediately.")
+print("Sweeper lanes: " .. tostring(SWEEPER_LANES))
+print("Max rods per condenser pass: " .. tostring(MAX_RODS_PER_CONDENSER_PASS))
+print("Dest tries per push: " .. tostring(MAX_DEST_TRIES_PER_PUSH))
+print("RMF drain tick: " .. tostring(DRAIN_TICK_SECONDS))
+print("Forced RMF condenser: projecte:condenser_mk2_13820")
+
+classifyCondensers()
+drawStats()
+
+local tasks = {
+    safeLoop("display", displayLoop, 1),
+    safeLoop("rescan", rescanLoop, 3),
+    safeLoop("rmf_drain", drainLoop, 1),
+    safeLoop("bhu_to_ender", bhuToEnderLoop, 1),
+}
+
+for lane = 1, SWEEPER_LANES do
+    table.insert(tasks, safeLoop("rod_sweeper_" .. tostring(lane), function()
+        sweeperLane(lane)
+    end, 1))
+end
+
+parallel.waitForAll(table.unpack(tasks))
