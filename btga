@@ -1,0 +1,918 @@
+local BASE = "https://unlock-deviation-networks-implied.trycloudflare.com"
+
+local DEFAULT_FPS = 10
+local TOTAL_SECONDS = 0 -- 0 = whole detected YouTube video; set 20 for exact 20s tests
+local SEGMENT_SECONDS = 120
+
+-- CVD4 best mode is used automatically by the server for <=60s videos.
+-- It keeps 2x3 subpixel resolution but sends full row blits with a palette per frame.
+
+local AUDIO_CHUNK_SIZE = 262144
+local AUDIO_MIN_RATIO_OK = 0.98
+local START_BUFFER_SEGMENTS = 1
+
+-- Positive values make video wait slightly after tape start. Keep 0 unless visuals seem ahead of audio.
+local VIDEO_SYNC_OFFSET_MS = 0
+
+-- DFPWM is 48000 bits/sec = 6000 bytes/sec at 1x.
+local TAPE_BYTES_PER_SECOND_1X = 6000
+
+-- Audio/video sync tuning:
+-- Positive = video is delayed this many ms relative to audio, including frame 1.
+-- Negative = video starts this many ms ahead of audio.
+-- Example: if video starts ahead of music, try 100 or 150.
+local AUDIO_VIDEO_OFFSET_MS = 0
+
+-- Use the cassette byte position as the master clock when the tape drive exposes it.
+-- If unavailable, falls back to wall-clock timing.
+local USE_TAPE_BYTE_CLOCK = true
+
+local COLOR_SLOTS = {
+    colors.white, colors.orange, colors.magenta, colors.lightBlue,
+    colors.yellow, colors.lime, colors.pink, colors.gray,
+    colors.lightGray, colors.cyan, colors.purple, colors.blue,
+    colors.brown, colors.green, colors.red, colors.black,
+}
+
+local HEX_TO_SLOT_INDEX = {
+    ["0"] = 1, ["1"] = 2, ["2"] = 3, ["3"] = 4,
+    ["4"] = 5, ["5"] = 6, ["6"] = 7, ["7"] = 8,
+    ["8"] = 9, ["9"] = 10, ["a"] = 11, ["b"] = 12,
+    ["c"] = 13, ["d"] = 14, ["e"] = 15, ["f"] = 16,
+}
+
+local HEX_BYTE = {}
+for i = 0, 255 do
+    HEX_BYTE[string.format("%02x", i)] = string.char(i)
+    HEX_BYTE[string.format("%02X", i)] = string.char(i)
+end
+
+local function urlEncode(s)
+    return tostring(s):gsub("([^%w%-_%.~])", function(c)
+        return string.format("%%%02X", string.byte(c))
+    end)
+end
+
+local function clearTerm()
+    term.setBackgroundColor(colors.black)
+    term.setTextColor(colors.white)
+    term.clear()
+    term.setCursorPos(1, 1)
+end
+
+local function get(url)
+    local h, err = http.get(url)
+    if not h then return nil, err end
+    local b = h.readAll()
+    h.close()
+    return b, nil
+end
+
+local function getJson(url)
+    local b, err = get(url)
+    if not b then return nil, err end
+    local j = textutils.unserializeJSON(b)
+    if not j then return nil, "bad json: " .. tostring(b) end
+    return j, nil
+end
+
+local function waitKey()
+    print("")
+    print("Press any key...")
+    os.pullEvent("key")
+end
+
+local function trim(s, n)
+    s = tostring(s or "")
+    if #s <= n then return s end
+    return s:sub(1, n - 3) .. "..."
+end
+
+local function wall_ms()
+    if os.epoch then return os.epoch("utc") end
+    return math.floor(os.clock() * 1000 + 0.5)
+end
+
+local function hexStringToCharsFast(h)
+    local out = {}
+    local n = 1
+    for i = 1, #h, 2 do
+        out[n] = HEX_BYTE[h:sub(i, i + 1)] or " "
+        n = n + 1
+    end
+    return table.concat(out)
+end
+
+local function getDisplay()
+    local mon = peripheral.find("monitor") or term.current()
+    if mon.setTextScale then mon.setTextScale(0.5) end
+    mon.setBackgroundColor(colors.black)
+    mon.clear()
+    return mon
+end
+
+local function findTapeDrive()
+    for _, name in ipairs(peripheral.getNames()) do
+        local typ = tostring(peripheral.getType(name) or "")
+        local ok, methods = pcall(peripheral.getMethods, name)
+        methods = ok and methods or {}
+        local joined = table.concat(methods, " "):lower()
+        if typ:lower():find("tape") or (joined:find("write") and joined:find("play") and joined:find("seek")) then
+            return peripheral.wrap(name), name
+        end
+    end
+    return nil, nil
+end
+
+local function rewindTape(tape)
+    pcall(function() tape.stop() end)
+    sleep(0.05)
+    pcall(function() tape.seek(-999999999) end)
+    sleep(0.05)
+end
+
+local function writeAudioToTape(audioUrl, speed, expectedBytes)
+    clearTerm()
+    print("Finding tape drive...")
+
+    local tape, tapeName = findTapeDrive()
+    if not tape then
+        print("No tape drive found.")
+        return nil
+    end
+
+    print("Tape: " .. tostring(tapeName))
+    print("Rewinding...")
+    rewindTape(tape)
+    pcall(function() tape.setSpeed(speed or 1.0) end)
+
+    print("Opening audio...")
+    local res = http.get(audioUrl, nil, true) or http.get(audioUrl)
+    if not res then
+        print("Failed to open audio URL")
+        return nil
+    end
+
+    local written = 0
+    local lastPrint = os.clock()
+
+    while true do
+        local chunk = nil
+        local ok, data = pcall(function() return res.read(AUDIO_CHUNK_SIZE) end)
+        if ok then chunk = data else chunk = res.readAll() end
+        if not chunk or #chunk == 0 then break end
+
+        local wok, werr = pcall(function() tape.write(chunk) end)
+        if not wok then
+            print("Tape write failed: " .. tostring(werr))
+            res.close()
+            return nil
+        end
+
+        written = written + #chunk
+
+        if os.clock() - lastPrint > 0.5 then
+            clearTerm()
+            print("Writing audio to tape...")
+            print("Bytes: " .. tostring(written))
+            if expectedBytes then print("Expected: " .. tostring(expectedBytes)) end
+            lastPrint = os.clock()
+        end
+
+        -- One polite yield per large audio write. This does not touch video speed.
+        sleep(0)
+    end
+
+    res.close()
+
+    if expectedBytes and tonumber(expectedBytes) and tonumber(expectedBytes) > 0 then
+        local ratio = written / tonumber(expectedBytes)
+        clearTerm()
+        print("Audio write finished.")
+        print("Expected bytes: " .. tostring(expectedBytes))
+        print("Written bytes:  " .. tostring(written))
+        print("Ratio: " .. tostring(math.floor(ratio * 1000) / 10) .. "%")
+        if ratio < AUDIO_MIN_RATIO_OK then
+            print("")
+            print("WARNING: audio write ended early.")
+            waitKey()
+            return nil
+        end
+        sleep(0.3)
+    end
+
+    -- short silence tail to prevent old tape content immediately continuing
+    local silence = string.rep(string.char(0), AUDIO_CHUNK_SIZE)
+    for _ = 1, 2 do pcall(function() tape.write(silence) end) end
+
+    rewindTape(tape)
+    pcall(function() tape.setSpeed(speed or 1.0) end)
+
+    return tape
+end
+
+local function startTape(tape, speed)
+    rewindTape(tape)
+    pcall(function() tape.setSpeed(speed or 1.0) end)
+    sleep(0.05)
+    pcall(function() tape.play() end)
+end
+
+local function getTapePosition(tape)
+    if not tape then return nil end
+
+    local candidates = {"getPosition", "getPos", "position", "tell"}
+    for _, name in ipairs(candidates) do
+        if tape[name] then
+            local ok, value = pcall(function() return tape[name]() end)
+            if ok and type(value) == "number" then return value end
+        end
+    end
+
+    return nil
+end
+
+local function makePlaybackClock(tape, tapeSpeed, fps)
+    local startPos = getTapePosition(tape)
+
+    return {
+        tape = tape,
+        tapeSpeed = tapeSpeed or 1.0,
+        tapeStartPos = startPos,
+        useTapeClock = USE_TAPE_BYTE_CLOCK and startPos ~= nil,
+        fps = fps or DEFAULT_FPS,
+        msPer = math.floor(1000 / (fps or DEFAULT_FPS) + 0.5),
+        wallStart = wall_ms(),
+        frames = 0,
+        rendered = 0,
+        dropped = 0,
+    }
+end
+
+local function playbackAudioMs(playback)
+    if playback.useTapeClock then
+        local pos = getTapePosition(playback.tape)
+        if pos then
+            local delta = pos - playback.tapeStartPos
+            if delta < 0 then delta = 0 end
+            return (delta / (TAPE_BYTES_PER_SECOND_1X * playback.tapeSpeed)) * 1000
+        end
+    end
+
+    return wall_ms() - playback.wallStart
+end
+
+local function frameTargetAudioMs(playback, frameNumber)
+    return ((frameNumber - 1) * playback.msPer) + AUDIO_VIDEO_OFFSET_MS
+end
+
+
+local function applyPalette(mon, pal)
+    for i = 1, 16 do
+        local p = pal[i]
+        if p then
+            mon.setPaletteColor(COLOR_SLOTS[i], p[1], p[2], p[3])
+        end
+    end
+end
+
+local function parsePaletteLine(pal, line)
+    local slot, rgb = line:match("^P%s+([0-9a-f])%s+([0-9a-fA-F]+)")
+    if slot and rgb then
+        local idx = HEX_TO_SLOT_INDEX[slot]
+        if idx then
+            pal[idx] = {
+                tonumber(rgb:sub(1, 2), 16) / 255,
+                tonumber(rgb:sub(3, 4), 16) / 255,
+                tonumber(rgb:sub(5, 6), 16) / 255,
+            }
+        end
+    end
+end
+
+local function decodeRLE(s)
+    local chars, fg, bg = {}, {}, {}
+
+    for token in string.gmatch(s, "([^,]+)") do
+        local count, cell = token:match("^(%d+)%*(%x%x%x%x)$")
+        if not count then
+            count = 1
+            cell = token
+        else
+            count = tonumber(count)
+        end
+
+        if cell and #cell == 4 then
+            local ch = HEX_BYTE[cell:sub(1, 2)] or " "
+            local f = cell:sub(3, 3)
+            local b = cell:sub(4, 4)
+
+            for _ = 1, count do
+                chars[#chars + 1] = ch
+                fg[#fg + 1] = f
+                bg[#bg + 1] = b
+            end
+        end
+    end
+
+    return table.concat(chars), table.concat(fg), table.concat(bg)
+end
+
+local function drawSpan(mon, y, x, rle)
+    local chars, fg, bg = decodeRLE(rle)
+    if #chars > 0 then
+        mon.setCursorPos(x, y)
+        mon.blit(chars, fg, bg)
+    end
+end
+
+-- =========================
+-- CVD4: per-frame palette + full row blits, inspired by your older halfblock player.
+-- =========================
+
+local function readCVD4Header(res)
+    local fps = DEFAULT_FPS
+    while true do
+        local posLine = res.readLine()
+        if not posLine then return fps, "eof" end
+        if posLine:sub(1, 4) == "WAIT" or posLine:sub(1, 7) == "SEGMENT" then
+            sleep(0)
+        elseif posLine == "STREAM_END" then
+            return fps, "end"
+        elseif posLine:sub(1, 2) == "F " then
+            return fps, nil, posLine
+        elseif posLine:match("^fps=") then
+            fps = tonumber(posLine:match("^fps=(.+)$")) or fps
+        end
+    end
+end
+
+local function readCVD4Frame(res, firstLine)
+    local line = firstLine or res.readLine()
+    while line and line ~= "END" and line ~= "STREAM_END" and line:sub(1, 2) ~= "F " do
+        if line:sub(1, 4) == "WAIT" then sleep(0) end
+        line = res.readLine()
+    end
+    if not line or line == "END" or line == "STREAM_END" then return nil, "end" end
+
+    local frameNo = tonumber(line:match("^F%s+(%d+)")) or 1
+    local palette = {}
+    local rows = {}
+
+    while true do
+        line = res.readLine()
+        if not line then return nil, "eof" end
+
+        if line:sub(1, 4) == "PAL " then
+            local idx = 1
+            for rgb in string.gmatch(line:sub(5), "([0-9a-fA-F]+)") do
+                if #rgb >= 6 and idx <= 16 then
+                    palette[idx] = {
+                        tonumber(rgb:sub(1, 2), 16) / 255,
+                        tonumber(rgb:sub(3, 4), 16) / 255,
+                        tonumber(rgb:sub(5, 6), 16) / 255,
+                    }
+                    idx = idx + 1
+                end
+            end
+
+        elseif line:sub(1, 2) == "R " then
+            local y, chHex, fg, bg = line:match("^R%s+(%d+)%s+([0-9a-fA-F]+)%s+([0-9a-fA-F]+)%s+([0-9a-fA-F]+)$")
+            if y then
+                rows[#rows + 1] = {
+                    y = tonumber(y),
+                    chars = hexStringToCharsFast(chHex),
+                    fg = fg,
+                    bg = bg,
+                }
+            end
+
+        elseif line == "E" then
+            return {
+                number = frameNo,
+                palette = palette,
+                rows = rows,
+            }, nil
+
+        elseif line == "END" then
+            return nil, "end"
+        end
+    end
+end
+
+local function drawCVD4Frame(mon, frame)
+    applyPalette(mon, frame.palette)
+    for _, row in ipairs(frame.rows) do
+        mon.setCursorPos(1, row.y)
+        mon.blit(row.chars, row.fg, row.bg)
+    end
+end
+
+local function skipCVD4Frame(res, firstLine)
+    local frame = readCVD4Frame(res, firstLine)
+    return frame ~= nil
+end
+
+local function waitForFrameSync(playback, frameNumber)
+    -- This is the hard sync fix:
+    -- AUDIO_VIDEO_OFFSET_MS is part of the target frame time itself.
+    -- Positive offset means frame N is not shown until audio has advanced farther.
+    -- Negative offset means frame N may be shown earlier.
+    local targetMs = frameTargetAudioMs(playback, frameNumber)
+
+    while true do
+        local audioMs = playbackAudioMs(playback)
+        local earlyBy = targetMs - audioMs
+
+        if earlyBy <= 0 then
+            return
+        end
+
+        -- If we are early, actually wait until the offset-adjusted target.
+        -- The old player only changed future frame spacing, so big offsets like 2000ms
+        -- never truly held frame 1/2 back.
+        sleep(math.min(0.05, earlyBy / 1000))
+    end
+end
+
+local function adaptivePostFrameDelay(playback, frameNumber)
+    -- After a frame is drawn, choose the next-frame spacing.
+    -- If behind, shorten spacing to catch up without skipping.
+    -- If ahead, normal waitForFrameSync on the next frame will hold.
+    local audioMs = playbackAudioMs(playback)
+    local targetMs = frameTargetAudioMs(playback, frameNumber)
+    local lagMs = audioMs - targetMs
+
+    if lagMs > 250 then
+        return 50
+    else
+        return playback.msPer
+    end
+end
+
+local function playCVD4Segment(res, mon, playback, firstFrame)
+    local firstLine = nil
+    local frames = 0
+
+    local function present(frame)
+        if not frame then return end
+
+        waitForFrameSync(playback, frame.number)
+
+        drawCVD4Frame(mon, frame)
+        frames = frames + 1
+        playback.rendered = (playback.rendered or 0) + 1
+        playback.frames = frame.number
+
+        local delayMs = adaptivePostFrameDelay(playback, frame.number)
+        if delayMs > 0 then
+            sleep(delayMs / 1000)
+        else
+            sleep(0)
+        end
+    end
+
+    if firstFrame then
+        present(firstFrame)
+    else
+        local fps, err, fl = readCVD4Header(res)
+        playback.fps = fps or playback.fps
+        playback.msPer = math.floor(1000 / playback.fps + 0.5)
+        firstLine = fl
+    end
+
+    while true do
+        local frame, reason = readCVD4Frame(res, firstLine)
+        firstLine = nil
+        if not frame then
+            return {frames = frames, dropped = 0, reason = reason}
+        end
+
+        -- NO FRAME SKIPPING.
+        -- If late, adaptiveFrameDelay uses 50ms frame spacing until we catch up.
+        present(frame)
+    end
+end
+
+-- =========================
+-- CVD2: 5-second palettes + delta spans
+-- =========================
+
+local function readCVD2Frame(res, state)
+    local frame = nil
+
+    while true do
+        local line = res.readLine()
+        if not line then return nil, "eof" end
+
+        if line:sub(1, 4) == "WAIT" or line:sub(1, 7) == "SEGMENT" then
+            sleep(0)
+
+        elseif line == "STREAM_END" then
+            return nil, "end"
+
+        elseif line == "PALETTE" then
+            state.palette = {}
+            state.paletteApplied = false
+
+        elseif line:sub(1, 2) == "P " then
+            parsePaletteLine(state.palette, line)
+
+        elseif line:match("^fps=") then
+            state.fps = tonumber(line:match("^fps=(.+)$")) or state.fps
+
+        elseif line:sub(1, 2) == "F " then
+            if not state.paletteApplied then
+                applyPalette(state.mon, state.palette)
+                state.paletteApplied = true
+            end
+
+            local n = tonumber(line:match("^F%s+(%d+)")) or ((state.lastFrame or 0) + 1)
+            frame = { number = n, spans = {} }
+            state.lastFrame = n
+
+        elseif line:sub(1, 2) == "S " and frame then
+            local y, x, rle = line:match("^S%s+(%d+)%s+(%d+)%s+(.+)$")
+            if y and x and rle then
+                frame.spans[#frame.spans + 1] = {
+                    y = tonumber(y),
+                    x = tonumber(x),
+                    rle = rle,
+                }
+            end
+
+        elseif line == "E" and frame then
+            return frame, nil
+
+        elseif line == "END" then
+            return nil, "end"
+        end
+    end
+end
+
+local function drawCVD2Frame(mon, frame)
+    for _, sp in ipairs(frame.spans) do
+        drawSpan(mon, sp.y, sp.x, sp.rle)
+    end
+end
+
+local function playCVD2Segment(res, mon, playback)
+    local state = {
+        mon = mon,
+        palette = {},
+        paletteApplied = false,
+        fps = playback.fps,
+        lastFrame = 0,
+    }
+
+    local frames = 0
+
+    while true do
+        local frame, reason = readCVD2Frame(res, state)
+        if not frame then return {frames = frames, dropped = 0, reason = reason} end
+
+        waitForFrameSync(playback, frame.number)
+
+        drawCVD2Frame(mon, frame)
+        playback.rendered = (playback.rendered or 0) + 1
+        playback.frames = frame.number
+        frames = frames + 1
+
+        local delayMs = adaptivePostFrameDelay(playback, frame.number)
+        if delayMs > 0 then
+            sleep(delayMs / 1000)
+        else
+            sleep(0)
+        end
+    end
+end
+
+local function openSegment(url)
+    return http.get(url)
+end
+
+local function search()
+    clearTerm()
+    print("YouTube search or URL:")
+    write("> ")
+    local q = read()
+
+    clearTerm()
+    print("Searching...")
+    local data, err = getJson(BASE .. "/yt_search?q=" .. urlEncode(q) .. "&max_results=5")
+    if not data then
+        print(err)
+        waitKey()
+        return nil
+    end
+
+    local r = data.results or {}
+    for i, v in ipairs(r) do
+        print(i .. ". " .. trim(v.title, 42))
+        print("   " .. trim(v.channel, 34))
+    end
+
+    print("")
+    write("Pick: ")
+    local n = tonumber(read())
+    if n and r[n] then return r[n] end
+    return nil
+end
+
+local function waitForPrepared(job)
+    while true do
+        local st = getJson(BASE .. "/status?job=" .. urlEncode(job))
+        clearTerm()
+        print("Preparing YouTube job...")
+        if st then
+            print("Status: " .. tostring(st.status))
+            print("Mode: " .. tostring(st.quality_mode) .. " / " .. tostring(st.video_codec))
+            print("Audio: " .. tostring(st.audio_ready) .. " bytes " .. tostring(st.audio_bytes or 0))
+            print("Segments: " .. tostring(st.segments_ready or 0) .. "/" .. tostring(st.segment_count or 0))
+            print(tostring(st.message or ""))
+
+            if st.status == "error" then
+                print(st.error)
+                waitKey()
+                return nil
+            end
+
+            local needed = START_BUFFER_SEGMENTS
+            local total = tonumber(st.segment_count or 0)
+            if total > 0 and total < needed then needed = total end
+
+            if st.audio_ready and tonumber(st.segments_ready or 0) >= needed then
+                return st
+            end
+        end
+        sleep(1)
+    end
+end
+
+local function getManifest(job)
+    return getJson(BASE .. "/manifest?job=" .. urlEncode(job))
+end
+
+clearTerm()
+print("Testing server...")
+local pong, pingErr = get(BASE .. "/ping")
+if not pong then
+    print("Ping failed: " .. tostring(pingErr))
+    waitKey()
+    return
+end
+
+local picked = search()
+if not picked then return end
+
+clearTerm()
+print("Picked:")
+print(trim(picked.title, 50))
+print("")
+print("Total seconds: " .. TOTAL_SECONDS .. " (0 = whole video)")
+print("Segment prefetch + sync offset mode")
+print("A/V offset ms: " .. tostring(AUDIO_VIDEO_OFFSET_MS))
+print("Tape byte clock: " .. tostring(USE_TAPE_BYTE_CLOCK))
+print("")
+print("Continue? y")
+if tostring(read()):lower() ~= "y" then return end
+
+local prep, prepErr = getJson(
+    BASE
+    .. "/yt_prepare?id=" .. urlEncode(picked.id)
+    .. "&total_seconds=" .. tostring(TOTAL_SECONDS)
+    .. "&segment_seconds=" .. tostring(SEGMENT_SECONDS)
+    .. "&fps=" .. tostring(DEFAULT_FPS)
+)
+
+if not prep then
+    print("prepare failed: " .. tostring(prepErr))
+    waitKey()
+    return
+end
+
+local st = waitForPrepared(prep.job)
+if not st then return end
+
+local man = getManifest(prep.job)
+if not man then
+    print("No manifest")
+    waitKey()
+    return
+end
+
+local audioUrl = man.audio_url
+if audioUrl:sub(1, 1) == "/" then audioUrl = BASE .. audioUrl end
+
+clearTerm()
+print("Audio mode:")
+print("Tape speed: " .. tostring(man.tape_speed or 1.0))
+print("Slow factor: " .. tostring(man.audio_slow_factor or "?"))
+print("Mode: " .. tostring(man.audio_mode or "?"))
+print("Bytes: " .. tostring(man.audio_bytes or 0))
+if man.audio_expected_bytes then print("Expected: " .. tostring(man.audio_expected_bytes)) end
+
+if tonumber(man.tape_speed or 1) >= 1.9 then
+    local got = tonumber(man.audio_bytes or 0) or 0
+    local exp = tonumber(man.audio_expected_bytes or 0) or 0
+    if exp > 0 and got < exp * 0.80 then
+        print("")
+        print("ERROR: 2x tape mode but audio is not double-length.")
+        print("Refusing to play fast/high-pitched audio.")
+        waitKey()
+        return
+    end
+end
+sleep(1)
+
+local tape = writeAudioToTape(audioUrl, man.tape_speed or 1.0, man.audio_bytes)
+if not tape then
+    waitKey()
+    return
+end
+
+local mon = getDisplay()
+
+local function absoluteUrl(u)
+    if u and u:sub(1, 1) == "/" then return BASE .. u end
+    return u
+end
+
+local function refreshManifestUntilSegment(index)
+    while true do
+        man = getManifest(prep.job)
+        if man and man.segments and man.segments[index] then
+            return man.segments[index]
+        end
+
+        local stWait = getJson(BASE .. "/status?job=" .. urlEncode(prep.job))
+        if stWait and stWait.ready then return nil end
+
+        clearTerm()
+        print("Waiting for segment " .. tostring(index) .. "...")
+        if stWait then
+            print("Ready: " .. tostring(stWait.segments_ready or 0) .. "/" .. tostring(stWait.segment_count or "?"))
+        end
+        sleep(0.5)
+    end
+end
+
+local function openSegmentNow(index)
+    local seg = refreshManifestUntilSegment(index)
+    if not seg then return nil, nil, "no segment" end
+
+    local url = absoluteUrl(seg.url)
+    local h, err = http.get(url)
+    return h, seg, err
+end
+
+local firstCVD2State = nil
+
+local function readFirstFrameFromHandle(seg, res)
+    local codec = seg.codec or man.video_codec or "CVD2"
+    local firstFrame = nil
+
+    if codec == "CVD4" then
+        local fps, err, firstLine = readCVD4Header(res)
+        man.fps = fps or man.fps or DEFAULT_FPS
+        firstFrame = readCVD4Frame(res, firstLine)
+    else
+        firstCVD2State = {
+            mon = mon,
+            palette = {},
+            paletteApplied = false,
+            fps = man.fps or DEFAULT_FPS,
+            lastFrame = 0,
+        }
+        firstFrame = readCVD2Frame(res, firstCVD2State)
+    end
+
+    return firstFrame
+end
+
+local function presentFirstFrame(seg, frame, playback)
+    local codec = seg.codec or man.video_codec or "CVD2"
+
+    waitForFrameSync(playback, frame.number)
+
+    if codec == "CVD4" then
+        drawCVD4Frame(mon, frame)
+    else
+        drawCVD2Frame(mon, frame)
+    end
+
+    playback.frames = frame.number or 1
+    playback.rendered = (playback.rendered or 0) + 1
+end
+
+local function playSegmentHandle(seg, res, playback)
+    local codec = seg.codec or man.video_codec or "CVD2"
+
+    if codec == "CVD4" then
+        return playCVD4Segment(res, mon, playback, nil)
+    else
+        return playCVD2Segment(res, mon, playback)
+    end
+end
+
+-- Open first segment.
+clearTerm()
+print("Opening first segment...")
+local currentHandle, currentSeg, currentErr = openSegmentNow(1)
+if not currentHandle then
+    print("Failed to open first segment:")
+    print(tostring(currentErr))
+    waitKey()
+    return
+end
+
+-- Preload/decode first frame before starting audio, but DO NOT draw it yet.
+-- Drawing the first frame before tape start made the picture look permanently ahead,
+-- and large offsets could not fix that.
+clearTerm()
+print("Preloading first frame data...")
+local firstFrame = readFirstFrameFromHandle(currentSeg, currentHandle)
+if not firstFrame then
+    print("Could not preload first frame.")
+    waitKey()
+    return
+end
+
+clearTerm()
+print("First frame decoded, not drawn yet.")
+print("A/V offset ms: " .. tostring(AUDIO_VIDEO_OFFSET_MS))
+print("Starting tape + synced video...")
+sleep(0.05)
+
+startTape(tape, man.tape_speed or 1.0)
+
+local playback = makePlaybackClock(tape, man.tape_speed or 1.0, man.fps or DEFAULT_FPS)
+playback.frames = 0
+playback.rendered = 0
+
+clearTerm()
+print("Playback clock:")
+print("Tape byte clock: " .. tostring(playback.useTapeClock))
+if playback.useTapeClock then
+    print("Tape start byte: " .. tostring(playback.tapeStartPos))
+else
+    print("Using wall-clock fallback.")
+end
+print("A/V offset ms: " .. tostring(AUDIO_VIDEO_OFFSET_MS))
+sleep(0.2)
+
+-- Now draw frame 1 using the same sync rules as every other frame.
+presentFirstFrame(currentSeg, firstFrame, playback)
+
+local segmentIndex = 1
+local nextHandle = nil
+local nextSeg = nil
+local nextErr = nil
+
+while currentHandle and currentSeg do
+    -- Open the next segment in parallel while this one is playing.
+    nextHandle, nextSeg, nextErr = nil, nil, nil
+
+    local function playCurrent()
+        playSegmentHandle(currentSeg, currentHandle, playback)
+    end
+
+    local function prefetchNext()
+        local target = segmentIndex + 1
+        local seg = refreshManifestUntilSegment(target)
+        if not seg then return end
+        local url = absoluteUrl(seg.url)
+        local h, err = http.get(url)
+        nextHandle, nextSeg, nextErr = h, seg, err
+    end
+
+    -- If there is probably a next segment, prefetch while playing.
+    -- If this is the last segment, prefetchNext will return after status says ready/no segment.
+    parallel.waitForAll(playCurrent, prefetchNext)
+
+    if currentHandle and currentHandle.close then currentHandle.close() end
+
+    segmentIndex = segmentIndex + 1
+
+    if nextHandle and nextSeg then
+        currentHandle, currentSeg = nextHandle, nextSeg
+    else
+        -- Confirm if video is done or just not ready.
+        local stWait = getJson(BASE .. "/status?job=" .. urlEncode(prep.job))
+        if stWait and stWait.ready then
+            break
+        end
+
+        currentHandle, currentSeg, currentErr = openSegmentNow(segmentIndex)
+        if not currentHandle then break end
+    end
+end
+
+clearTerm()
+print("Done.")
+print("Frames clocked: " .. tostring(playback.frames))
+print("Frames rendered: " .. tostring(playback.rendered))
+print("Frames dropped intentionally: 0")
+print("Tape byte clock: " .. tostring(playback.useTapeClock))
+print("A/V offset ms: " .. tostring(AUDIO_VIDEO_OFFSET_MS))
+waitKey()
