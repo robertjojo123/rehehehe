@@ -1,0 +1,195 @@
+local BASE = "https://PASTE-YOUR-NGROK-URL-HERE"
+
+-- For ngrok free tunnel browser warning.
+local HTTP_HEADERS = {
+    ["ngrok-skip-browser-warning"] = "true",
+    ["User-Agent"] = "ComputerCraft-HTTP"
+}
+
+local WS_HEADERS = {
+    ["ngrok-skip-browser-warning"] = "true",
+    ["User-Agent"] = "ComputerCraft-WebSocket"
+}
+
+local function clear()
+    term.setBackgroundColor(colors.black)
+    term.setTextColor(colors.white)
+    term.clear()
+    term.setCursorPos(1, 1)
+end
+
+local function waitKey()
+    print("")
+    print("Press any key...")
+    os.pullEvent("key")
+end
+
+local function trim(s, n)
+    s = tostring(s or "")
+    if #s <= n then return s end
+    return s:sub(1, n - 3) .. "..."
+end
+
+local function httpRead(path)
+    local url = BASE .. path
+    print("HTTP GET " .. path)
+    local h, err = http.get(url, HTTP_HEADERS)
+    if not h then
+        print("HTTP FAIL:")
+        print(tostring(err))
+        return nil
+    end
+    local body = h.readAll()
+    local code = nil
+    if h.getResponseCode then
+        pcall(function() code = h.getResponseCode() end)
+    end
+    h.close()
+    print("HTTP OK code=" .. tostring(code))
+    print(trim(body, 120))
+    return body
+end
+
+local function wsUrl(path)
+    return BASE:gsub("^https", "wss"):gsub("^http", "ws") .. path
+end
+
+local function wsOpen(path)
+    local url = wsUrl(path)
+    print("WS OPEN " .. path)
+    print(trim(url, 80))
+    local ws, err = http.websocket(url, WS_HEADERS)
+    if not ws then
+        print("WS FAIL:")
+        print(tostring(err))
+        return nil
+    end
+    print("WS OPENED")
+    return ws
+end
+
+local function testWsPing()
+    local ws = wsOpen("/ws_ping")
+    if not ws then return false end
+
+    local msg = ws.receive()
+    print("RECV: " .. tostring(msg))
+    pcall(function() ws.close() end)
+
+    return msg == "WS_OK"
+end
+
+local function testWsEcho()
+    local ws = wsOpen("/ws_echo")
+    if not ws then return false end
+
+    local msg = ws.receive()
+    print("RECV: " .. tostring(msg))
+
+    if msg ~= "ECHO_READY" then
+        pcall(function() ws.close() end)
+        return false
+    end
+
+    ws.send("hello from CC")
+    local echo = ws.receive()
+    print("RECV: " .. tostring(echo))
+
+    ws.send("close")
+    local bye = ws.receive()
+    print("RECV: " .. tostring(bye))
+
+    pcall(function() ws.close() end)
+    return echo == "ECHO:hello from CC"
+end
+
+local function testWsCounter()
+    local ws = wsOpen("/ws_counter")
+    if not ws then return false end
+
+    local count = 0
+    while true do
+        local msg = ws.receive()
+        print("RECV: " .. tostring(msg))
+        if not msg then break end
+        if msg:sub(1, 4) == "TICK" then count = count + 1 end
+        if msg == "COUNTER_DONE" then break end
+    end
+
+    pcall(function() ws.close() end)
+    print("Ticks received: " .. tostring(count))
+    return count >= 10
+end
+
+clear()
+print("ComputerCraft WebSocket Diagnostic")
+print("BASE:")
+print(BASE)
+print("")
+
+if not http then
+    print("No http API.")
+    waitKey()
+    return
+end
+
+if not http.websocket then
+    print("http.websocket is nil.")
+    waitKey()
+    return
+end
+
+print("http.websocket exists.")
+print("")
+
+local okPing = httpRead("/ping") ~= nil
+print("")
+
+local okProbe = httpRead("/ws_probe") ~= nil
+print("")
+
+local okWsPing = testWsPing()
+print("WS ping result: " .. tostring(okWsPing))
+print("")
+
+local okWsEcho = false
+if okWsPing then
+    okWsEcho = testWsEcho()
+    print("WS echo result: " .. tostring(okWsEcho))
+    print("")
+else
+    print("Skipping echo because ping failed.")
+end
+
+local okWsCounter = false
+if okWsPing then
+    okWsCounter = testWsCounter()
+    print("WS counter result: " .. tostring(okWsCounter))
+    print("")
+else
+    print("Skipping counter because ping failed.")
+end
+
+print("SUMMARY")
+print("HTTP /ping:    " .. tostring(okPing))
+print("HTTP /probe:   " .. tostring(okProbe))
+print("WS /ws_ping:   " .. tostring(okWsPing))
+print("WS /ws_echo:   " .. tostring(okWsEcho))
+print("WS /counter:   " .. tostring(okWsCounter))
+
+if okPing and okProbe and not okWsPing then
+    print("")
+    print("Diagnosis:")
+    print("Normal HTTP works, websocket handshake fails.")
+    print("Tunnel/CC handshake is the issue.")
+elseif okWsPing and okWsEcho and okWsCounter then
+    print("")
+    print("Diagnosis:")
+    print("WebSockets work. Video route can use WS.")
+else
+    print("")
+    print("Diagnosis:")
+    print("Partial failure. Check server/ngrok logs.")
+end
+
+waitKey()
