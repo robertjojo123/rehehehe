@@ -1,0 +1,480 @@
+local BASE = "https://unpledged-reactive-grieving.ngrok-free.dev"
+
+local DEFAULT_FPS = 10
+local TOTAL_SECONDS = 0 -- 0 = detected full video
+
+local AUDIO_VIDEO_OFFSET_MS = 0
+local USE_TAPE_BYTE_CLOCK = true
+local TAPE_BPS_1X_OVERRIDE = 0 -- try 5800 if 2x tape audio is slightly fast
+local TAPE_BYTES_PER_SECOND_1X = 6000
+
+local AUDIO_CHUNK_SIZE = 262144
+local AUDIO_MIN_RATIO_OK = 0.98
+
+local COLOR_SLOTS = {
+    colors.white, colors.orange, colors.magenta, colors.lightBlue,
+    colors.yellow, colors.lime, colors.pink, colors.gray,
+    colors.lightGray, colors.cyan, colors.purple, colors.blue,
+    colors.brown, colors.green, colors.red, colors.black,
+}
+
+local HEX_BYTE = {}
+for i = 0, 255 do
+    HEX_BYTE[string.format("%02x", i)] = string.char(i)
+    HEX_BYTE[string.format("%02X", i)] = string.char(i)
+end
+
+local function clearTerm()
+    term.setBackgroundColor(colors.black)
+    term.setTextColor(colors.white)
+    term.clear()
+    term.setCursorPos(1, 1)
+end
+
+local function urlEncode(s)
+    return tostring(s):gsub("([^%w%-_%.~])", function(c)
+        return string.format("%%%02X", string.byte(c))
+    end)
+end
+
+local function trim(s, n)
+    s = tostring(s or "")
+    if #s <= n then return s end
+    return s:sub(1, n - 3) .. "..."
+end
+
+local function get(url)
+    local h, err = http.get(url)
+    if not h then return nil, err end
+    local b = h.readAll()
+    h.close()
+    return b, nil
+end
+
+local function getJson(url)
+    local b, err = get(url)
+    if not b then return nil, err end
+    local j = textutils.unserializeJSON(b)
+    if not j then return nil, "bad json: " .. tostring(b) end
+    return j, nil
+end
+
+local function waitKey()
+    print("")
+    print("Press any key...")
+    os.pullEvent("key")
+end
+
+local function wall_ms()
+    if os.epoch then return os.epoch("utc") end
+    return math.floor(os.clock() * 1000 + 0.5)
+end
+
+local function hexStringToCharsFast(h)
+    local out = {}
+    local n = 1
+    for i = 1, #h, 2 do
+        out[n] = HEX_BYTE[h:sub(i, i + 1)] or " "
+        n = n + 1
+    end
+    return table.concat(out)
+end
+
+local function getDisplay()
+    local mon = peripheral.find("monitor") or term.current()
+    if mon.setTextScale then mon.setTextScale(0.5) end
+    mon.setBackgroundColor(colors.black)
+    mon.clear()
+    return mon
+end
+
+local function findTapeDrive()
+    for _, name in ipairs(peripheral.getNames()) do
+        local typ = tostring(peripheral.getType(name) or "")
+        local ok, methods = pcall(peripheral.getMethods, name)
+        methods = ok and methods or {}
+        local joined = table.concat(methods, " "):lower()
+        if typ:lower():find("tape") or (joined:find("write") and joined:find("play") and joined:find("seek")) then
+            return peripheral.wrap(name), name
+        end
+    end
+    return nil, nil
+end
+
+local function rewindTape(tape)
+    pcall(function() tape.stop() end)
+    sleep(0.05)
+    pcall(function() tape.seek(-999999999) end)
+    sleep(0.05)
+end
+
+local function getTapePosition(tape)
+    if not tape then return nil end
+    for _, name in ipairs({"getPosition", "getPos", "position", "tell"}) do
+        if tape[name] then
+            local ok, value = pcall(function() return tape[name]() end)
+            if ok and type(value) == "number" then return value end
+        end
+    end
+    return nil
+end
+
+local function writeAudioToTape(audioUrl, speed, expectedBytes)
+    clearTerm()
+    print("Finding tape drive...")
+    local tape, tapeName = findTapeDrive()
+    if not tape then print("No tape drive found.") return nil end
+
+    print("Tape: " .. tostring(tapeName))
+    print("Rewinding...")
+    rewindTape(tape)
+    pcall(function() tape.setSpeed(speed or 1.0) end)
+
+    print("Opening audio...")
+    local res = http.get(audioUrl, nil, true) or http.get(audioUrl)
+    if not res then print("Failed to open audio URL") return nil end
+
+    local written = 0
+    local lastPrint = os.clock()
+
+    while true do
+        local chunk = res.read(AUDIO_CHUNK_SIZE)
+        if not chunk or #chunk == 0 then break end
+
+        local ok, err = pcall(function() tape.write(chunk) end)
+        if not ok then
+            print("Tape write failed: " .. tostring(err))
+            res.close()
+            return nil
+        end
+
+        written = written + #chunk
+        if os.clock() - lastPrint > 0.5 then
+            clearTerm()
+            print("Writing audio to tape...")
+            print("Bytes: " .. tostring(written))
+            if expectedBytes then print("Expected: " .. tostring(expectedBytes)) end
+            lastPrint = os.clock()
+        end
+        sleep(0)
+    end
+    res.close()
+
+    if expectedBytes and tonumber(expectedBytes) and tonumber(expectedBytes) > 0 then
+        local ratio = written / tonumber(expectedBytes)
+        clearTerm()
+        print("Audio write finished.")
+        print("Expected bytes: " .. tostring(expectedBytes))
+        print("Written bytes:  " .. tostring(written))
+        print("Ratio: " .. tostring(math.floor(ratio * 1000) / 10) .. "%")
+        if ratio < AUDIO_MIN_RATIO_OK then
+            print("")
+            print("WARNING: audio write ended early.")
+            waitKey()
+            return nil
+        end
+        sleep(0.3)
+    end
+
+    local silence = string.rep(string.char(0), AUDIO_CHUNK_SIZE)
+    for _ = 1, 2 do pcall(function() tape.write(silence) end) end
+
+    rewindTape(tape)
+    pcall(function() tape.setSpeed(speed or 1.0) end)
+    return tape
+end
+
+local function startTape(tape, speed)
+    rewindTape(tape)
+    pcall(function() tape.setSpeed(speed or 1.0) end)
+    sleep(0.05)
+    pcall(function() tape.play() end)
+end
+
+local function applyPalette(mon, pal)
+    for i = 1, 16 do
+        local p = pal[i]
+        if p then
+            mon.setPaletteColor(COLOR_SLOTS[i], p[1], p[2], p[3])
+        end
+    end
+end
+
+local function parsePal(line)
+    local pal = {}
+    local idx = 1
+    for rgb in string.gmatch(line:sub(5), "([0-9a-fA-F]+)") do
+        if #rgb >= 6 and idx <= 16 then
+            pal[idx] = {
+                tonumber(rgb:sub(1, 2), 16) / 255,
+                tonumber(rgb:sub(3, 4), 16) / 255,
+                tonumber(rgb:sub(5, 6), 16) / 255,
+            }
+            idx = idx + 1
+        end
+    end
+    return pal
+end
+
+local function readWsFrame(ws)
+    local frame = nil
+    while true do
+        local msg = ws.receive()
+        if not msg then return nil, "eof" end
+        if msg:sub(1, 5) == "ERROR" then return nil, msg end
+        if msg == "STREAM_END" then return nil, "end" end
+        if msg:sub(1, 4) == "META" then
+            -- metadata ignored
+        elseif msg:sub(1, 2) == "F " then
+            frame = { number = tonumber(msg:match("^F%s+(%d+)")) or 1, palette = {}, rows = {} }
+        elseif msg:sub(1, 4) == "PAL " and frame then
+            frame.palette = parsePal(msg)
+        elseif msg:sub(1, 2) == "R " and frame then
+            local y, chHex, fg, bg = msg:match("^R%s+(%d+)%s+([0-9a-fA-F]+)%s+([0-9a-fA-F]+)%s+([0-9a-fA-F]+)$")
+            if y then
+                frame.rows[#frame.rows + 1] = { y = tonumber(y), chars = hexStringToCharsFast(chHex), fg = fg, bg = bg }
+            end
+        elseif msg == "E" and frame then
+            return frame, nil
+        end
+    end
+end
+
+local function drawFrame(mon, frame)
+    applyPalette(mon, frame.palette)
+    for _, row in ipairs(frame.rows) do
+        mon.setCursorPos(1, row.y)
+        mon.blit(row.chars, row.fg, row.bg)
+    end
+end
+
+local function makePlaybackClock(tape, tapeSpeed, fps)
+    local startPos = getTapePosition(tape)
+    local now = wall_ms()
+    local bps = TAPE_BYTES_PER_SECOND_1X
+    if TAPE_BPS_1X_OVERRIDE and TAPE_BPS_1X_OVERRIDE > 0 then bps = TAPE_BPS_1X_OVERRIDE end
+    return {
+        tape = tape, tapeSpeed = tapeSpeed or 1.0, tapeStartPos = startPos,
+        useTapeClock = USE_TAPE_BYTE_CLOCK and startPos ~= nil,
+        fps = fps or DEFAULT_FPS, msPer = math.floor(1000 / (fps or DEFAULT_FPS) + 0.5),
+        wallStart = now, bps1x = bps, frames = 0, rendered = 0
+    }
+end
+
+local function playbackAudioMs(playback)
+    if playback.useTapeClock then
+        local pos = getTapePosition(playback.tape)
+        if pos then
+            local delta = pos - playback.tapeStartPos
+            if delta < 0 then delta = 0 end
+            return (delta / ((playback.bps1x or TAPE_BYTES_PER_SECOND_1X) * playback.tapeSpeed)) * 1000
+        end
+    end
+    return wall_ms() - playback.wallStart
+end
+
+local function frameTargetMs(playback, frameNumber)
+    return ((frameNumber - 1) * playback.msPer) + AUDIO_VIDEO_OFFSET_MS
+end
+
+local function waitForFrame(playback, frameNumber)
+    while true do
+        local earlyBy = frameTargetMs(playback, frameNumber) - playbackAudioMs(playback)
+        if earlyBy <= 0 then return end
+        sleep(math.min(0.03, earlyBy / 1000))
+    end
+end
+
+local function search()
+    clearTerm()
+    print("YouTube search or URL:")
+    write("> ")
+    local q = read()
+    clearTerm()
+    print("Searching...")
+    local data, err = getJson(BASE .. "/yt_search?q=" .. urlEncode(q) .. "&max_results=5")
+    if not data then print(err) waitKey() return nil end
+    local r = data.results or {}
+    for i, v in ipairs(r) do
+        print(i .. ". " .. trim(v.title, 42))
+        print("   " .. trim(v.channel, 34))
+    end
+    print("")
+    write("Pick: ")
+    local n = tonumber(read())
+    if n and r[n] then return r[n] end
+    return nil
+end
+
+local function waitForPrepared(job)
+    while true do
+        local st = getJson(BASE .. "/status?job=" .. urlEncode(job))
+        clearTerm()
+        print("Preparing audio/job...")
+        if st then
+            print("Status: " .. tostring(st.status))
+            print("Audio: " .. tostring(st.audio_ready) .. " bytes " .. tostring(st.audio_bytes or 0))
+            print("Mode: " .. tostring(st.audio_mode or "?") .. " tape=" .. tostring(st.tape_speed or "?"))
+            print(tostring(st.message or ""))
+            if st.status == "error" then print(st.error) waitKey() return nil end
+            if st.audio_ready then return st end
+        end
+        sleep(1)
+    end
+end
+
+local function getManifest(job)
+    return getJson(BASE .. "/manifest?job=" .. urlEncode(job))
+end
+
+clearTerm()
+print("Testing server...")
+local pong, pingErr = get(BASE .. "/ping")
+if not pong then print("Ping failed: " .. tostring(pingErr)) waitKey() return end
+if not http.websocket then print("No http.websocket.") waitKey() return end
+
+local picked = search()
+if not picked then return end
+
+clearTerm()
+print("Picked:")
+print(trim(picked.title, 50))
+print("")
+print("WebSocket live video mode")
+print("Audio writes first, video streams live")
+print("Offset ms: " .. tostring(AUDIO_VIDEO_OFFSET_MS))
+print("")
+print("Continue? y")
+if tostring(read()):lower() ~= "y" then return end
+
+local prep, prepErr = getJson(
+    BASE .. "/yt_prepare?id=" .. urlEncode(picked.id)
+    .. "&total_seconds=" .. tostring(TOTAL_SECONDS)
+    .. "&segment_seconds=120"
+    .. "&fps=" .. tostring(DEFAULT_FPS)
+)
+
+if not prep then print("prepare failed: " .. tostring(prepErr)) waitKey() return end
+
+local st = waitForPrepared(prep.job)
+if not st then return end
+
+local man = getManifest(prep.job)
+if not man then print("No manifest") waitKey() return end
+
+local audioUrl = man.audio_url
+if audioUrl:sub(1, 1) == "/" then audioUrl = BASE .. audioUrl end
+
+clearTerm()
+print("Audio mode:")
+print("Tape speed: " .. tostring(man.tape_speed or 1.0))
+print("Slow factor: " .. tostring(man.audio_slow_factor or "?"))
+print("Mode: " .. tostring(man.audio_mode or "?"))
+print("Bytes: " .. tostring(man.audio_bytes or 0))
+if man.audio_expected_bytes then print("Expected: " .. tostring(man.audio_expected_bytes)) end
+sleep(1)
+
+local tape = writeAudioToTape(audioUrl, man.tape_speed or 1.0, man.audio_bytes)
+if not tape then waitKey() return end
+
+local mon = getDisplay()
+local wsUrl = BASE:gsub("^http", "ws") .. "/ws_video?job=" .. urlEncode(prep.job)
+    .. "&fps=" .. tostring(DEFAULT_FPS)
+    .. "&total_seconds=" .. tostring(TOTAL_SECONDS)
+
+clearTerm()
+print("Checking websocket server route...")
+local probe, probeErr = getJson(BASE .. "/ws_probe")
+if not probe or not probe.ok then
+    print("/ws_probe failed.")
+    print("This usually means the Python server was not restarted")
+    print("or the new local_youtube_fast_server.py is not running.")
+    print(tostring(probeErr))
+    waitKey()
+    return
+end
+
+local wsPingUrl = BASE:gsub("^http", "ws") .. "/ws_ping"
+print("Testing websocket ping...")
+local pingWs, pingErr = http.websocket(wsPingUrl)
+if not pingWs then
+    print("WebSocket ping failed:")
+    print(tostring(pingErr))
+    print("")
+    print("If /ws_probe worked but this fails, Cloudflare tunnel")
+    print("is rejecting websockets. Restart cloudflared or use http2.")
+    waitKey()
+    return
+end
+
+local pong = pingWs.receive()
+pcall(function() pingWs.close() end)
+if pong ~= "WS_OK" then
+    print("Bad websocket ping response:")
+    print(tostring(pong))
+    waitKey()
+    return
+end
+
+clearTerm()
+print("Opening WebSocket video...")
+print(trim(wsUrl, 50))
+local ws, wsErr = http.websocket(wsUrl)
+if not ws then
+    print("WebSocket failed:")
+    print(tostring(wsErr))
+    waitKey()
+    return
+end
+
+-- First message should be WS_VIDEO_OK because the server accepts immediately.
+local hello = ws.receive()
+if hello ~= "WS_VIDEO_OK" then
+    print("Unexpected WS hello:")
+    print(tostring(hello))
+    waitKey()
+    return
+end
+
+clearTerm()
+print("Preloading first WS frame...")
+local firstFrame, reason = readWsFrame(ws)
+if not firstFrame then print("No first frame: " .. tostring(reason)) waitKey() return end
+
+clearTerm()
+print("First frame decoded, not drawn.")
+print("Starting tape + WebSocket video...")
+sleep(0.05)
+
+startTape(tape, man.tape_speed or 1.0)
+local playback = makePlaybackClock(tape, man.tape_speed or 1.0, DEFAULT_FPS)
+
+waitForFrame(playback, firstFrame.number)
+drawFrame(mon, firstFrame)
+playback.frames = firstFrame.number
+playback.rendered = 1
+
+while true do
+    local frame, err = readWsFrame(ws)
+    if not frame then
+        clearTerm()
+        print("Video stream ended: " .. tostring(err))
+        break
+    end
+    waitForFrame(playback, frame.number)
+    drawFrame(mon, frame)
+    playback.frames = frame.number
+    playback.rendered = playback.rendered + 1
+    sleep(0)
+end
+
+pcall(function() ws.close() end)
+
+clearTerm()
+print("Done.")
+print("Frames rendered: " .. tostring(playback.rendered))
+print("Last frame: " .. tostring(playback.frames))
+print("Tape clock: " .. tostring(playback.useTapeClock))
+print("BPS1x: " .. tostring(playback.bps1x))
+print("Offset ms: " .. tostring(AUDIO_VIDEO_OFFSET_MS))
+waitKey()
