@@ -1,0 +1,760 @@
+-- mob_chess_ui_sprites.lua
+-- Living Mob Chess monitor UI with 2x3 subpixel chess-piece sprites
+-- Target: 4x4 advanced monitor at text scale 0.5, about 79x52 chars.
+-- Features:
+--   - 8x8 chess board
+--   - right-side status/message panel
+--   - tap piece to highlight legal moves
+--   - tap destination to move piece locally
+--   - reset/clear buttons
+--   - 14x18 pixel sprites compressed into 7x6 monitor cells
+--
+-- Notes:
+--   - Basic movement only. No check/checkmate/castling/en passant/promotion yet.
+--   - This is ready to later replace instant moves with NI/mob movement commands.
+
+local mon = peripheral.find("monitor")
+if not mon then error("No monitor found") end
+
+mon.setTextScale(0.5)
+local W, H = mon.getSize()
+
+if W < 79 or H < 52 then
+    error("This UI expects about 79x52 at scale 0.5. Current size: " .. W .. "x" .. H)
+end
+
+-- =========================
+-- PALETTE TWEAKS
+-- =========================
+if mon.setPaletteColor then
+    -- board colors, roughly like the reference image
+    mon.setPaletteColor(colors.white,     0.84, 0.84, 0.84) -- light squares
+    mon.setPaletteColor(colors.lightBlue, 0.49, 0.58, 0.78) -- dark squares
+
+    -- interaction colors
+    mon.setPaletteColor(colors.orange,    0.95, 0.65, 0.20) -- selected
+    mon.setPaletteColor(colors.lime,      0.55, 0.82, 0.42) -- valid move
+
+    -- panel
+    mon.setPaletteColor(colors.gray,      0.22, 0.22, 0.24)
+    mon.setPaletteColor(colors.lightGray, 0.65, 0.65, 0.68)
+end
+
+-- =========================
+-- LAYOUT
+-- =========================
+local SQ_W = 7
+local SQ_H = 6
+
+local BOARD_X = 2
+local BOARD_Y = 2
+
+local BOARD_W = SQ_W * 8   -- 56
+local BOARD_H = SQ_H * 8   -- 48
+
+local PANEL_X = BOARD_X + BOARD_W + 2
+local PANEL_Y = 1
+local PANEL_W = W - PANEL_X + 1
+local PANEL_H = H
+
+local FILE_LABEL_Y = BOARD_Y + BOARD_H
+local RANK_LABEL_X = 1
+
+-- =========================
+-- COLORS
+-- =========================
+local LIGHT_SQUARE = colors.white
+local DARK_SQUARE = colors.lightBlue
+local SELECT_SQUARE = colors.orange
+local HIGHLIGHT_SQUARE = colors.lime
+
+local PANEL_BG = colors.gray
+local PANEL_TEXT = colors.white
+
+local BTN_BG = colors.lightGray
+local BTN_TEXT = colors.black
+local BTN_WARN = colors.red
+
+-- =========================
+-- STATE
+-- =========================
+local selected = nil
+local legalMoves = {}
+local statusMessage = "White to move."
+local currentTurn = "w"
+local boardBusy = false
+
+local function freshBoard()
+    return {
+        {"bR","bN","bB","bQ","bK","bB","bN","bR"}, -- rank 8
+        {"bP","bP","bP","bP","bP","bP","bP","bP"}, -- rank 7
+        {nil,nil,nil,nil,nil,nil,nil,nil},
+        {nil,nil,nil,nil,nil,nil,nil,nil},
+        {nil,nil,nil,nil,nil,nil,nil,nil},
+        {nil,nil,nil,nil,nil,nil,nil,nil},
+        {"wP","wP","wP","wP","wP","wP","wP","wP"}, -- rank 2
+        {"wR","wN","wB","wQ","wK","wB","wN","wR"}, -- rank 1
+    }
+end
+
+local board = freshBoard()
+
+-- =========================
+-- HELPERS
+-- =========================
+local files = {"a","b","c","d","e","f","g","h"}
+
+local function writeAt(x, y, text, fg, bg)
+    if x < 1 or y < 1 or x > W or y > H then return end
+    if bg then mon.setBackgroundColor(bg) end
+    if fg then mon.setTextColor(fg) end
+    mon.setCursorPos(x, y)
+    mon.write(text)
+end
+
+local function fill(x, y, w, h, bg)
+    mon.setBackgroundColor(bg)
+    local line = string.rep(" ", math.max(0, w))
+    for yy = y, y + h - 1 do
+        if yy >= 1 and yy <= H then
+            mon.setCursorPos(x, yy)
+            mon.write(line)
+        end
+    end
+end
+
+local function centerText(x, y, w, text, fg, bg)
+    local tx = x + math.floor((w - #text) / 2)
+    writeAt(tx, y, text, fg, bg)
+end
+
+local function sideOf(piece)
+    return piece and piece:sub(1,1) or nil
+end
+
+local function kindOf(piece)
+    return piece and piece:sub(2,2) or nil
+end
+
+local function boardToArray(rank, file)
+    -- rank 8 at row 1, rank 1 at row 8
+    return 9 - rank, file
+end
+
+local function getPiece(file, rank)
+    if file < 1 or file > 8 or rank < 1 or rank > 8 then return nil end
+    local row, col = boardToArray(rank, file)
+    return board[row][col]
+end
+
+local function setPiece(file, rank, piece)
+    local row, col = boardToArray(rank, file)
+    board[row][col] = piece
+end
+
+local function squareName(file, rank)
+    return files[file] .. tostring(rank)
+end
+
+local function inBounds(file, rank)
+    return file >= 1 and file <= 8 and rank >= 1 and rank <= 8
+end
+
+local function addMove(moves, file, rank)
+    if inBounds(file, rank) then
+        table.insert(moves, {file = file, rank = rank})
+    end
+end
+
+local function containsMove(moves, file, rank)
+    for _, m in ipairs(moves) do
+        if m.file == file and m.rank == rank then
+            return true
+        end
+    end
+    return false
+end
+
+local function traceLineMoves(moves, file, rank, df, dr, side)
+    local f = file + df
+    local r = rank + dr
+    while inBounds(f, r) do
+        local p = getPiece(f, r)
+        if not p then
+            addMove(moves, f, r)
+        else
+            if sideOf(p) ~= side then
+                addMove(moves, f, r)
+            end
+            break
+        end
+        f = f + df
+        r = r + dr
+    end
+end
+
+-- =========================
+-- BASIC LEGAL MOVES
+-- =========================
+local function getLegalMoves(file, rank)
+    local piece = getPiece(file, rank)
+    if not piece then return {} end
+
+    local side = sideOf(piece)
+    local kind = kindOf(piece)
+    local moves = {}
+
+    if kind == "P" then
+        local dir = (side == "w") and 1 or -1
+        local startRank = (side == "w") and 2 or 7
+
+        if inBounds(file, rank + dir) and not getPiece(file, rank + dir) then
+            addMove(moves, file, rank + dir)
+
+            if rank == startRank and not getPiece(file, rank + 2 * dir) then
+                addMove(moves, file, rank + 2 * dir)
+            end
+        end
+
+        for _, df in ipairs({-1, 1}) do
+            local target = getPiece(file + df, rank + dir)
+            if target and sideOf(target) ~= side then
+                addMove(moves, file + df, rank + dir)
+            end
+        end
+
+    elseif kind == "N" then
+        local jumps = {
+            { 1,  2}, { 2,  1}, { 2, -1}, { 1, -2},
+            {-1, -2}, {-2, -1}, {-2,  1}, {-1,  2},
+        }
+        for _, j in ipairs(jumps) do
+            local f, r = file + j[1], rank + j[2]
+            if inBounds(f, r) then
+                local p = getPiece(f, r)
+                if not p or sideOf(p) ~= side then
+                    addMove(moves, f, r)
+                end
+            end
+        end
+
+    elseif kind == "B" then
+        traceLineMoves(moves, file, rank,  1,  1, side)
+        traceLineMoves(moves, file, rank,  1, -1, side)
+        traceLineMoves(moves, file, rank, -1,  1, side)
+        traceLineMoves(moves, file, rank, -1, -1, side)
+
+    elseif kind == "R" then
+        traceLineMoves(moves, file, rank,  1,  0, side)
+        traceLineMoves(moves, file, rank, -1,  0, side)
+        traceLineMoves(moves, file, rank,  0,  1, side)
+        traceLineMoves(moves, file, rank,  0, -1, side)
+
+    elseif kind == "Q" then
+        traceLineMoves(moves, file, rank,  1,  0, side)
+        traceLineMoves(moves, file, rank, -1,  0, side)
+        traceLineMoves(moves, file, rank,  0,  1, side)
+        traceLineMoves(moves, file, rank,  0, -1, side)
+        traceLineMoves(moves, file, rank,  1,  1, side)
+        traceLineMoves(moves, file, rank,  1, -1, side)
+        traceLineMoves(moves, file, rank, -1,  1, side)
+        traceLineMoves(moves, file, rank, -1, -1, side)
+
+    elseif kind == "K" then
+        for df = -1, 1 do
+            for dr = -1, 1 do
+                if not (df == 0 and dr == 0) then
+                    local f, r = file + df, rank + dr
+                    if inBounds(f, r) then
+                        local p = getPiece(f, r)
+                        if not p or sideOf(p) ~= side then
+                            addMove(moves, f, r)
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    return moves
+end
+
+-- =========================
+-- 2x3 SUBPIXEL SPRITES
+-- Each sprite is 14x18 pixels, compressed into 7x6 monitor cells.
+-- # = filled pixel, . = empty pixel
+-- =========================
+local PIECE_SPRITES = {
+    P = {
+        "..............",
+        "......##......",
+        ".....####.....",
+        ".....####.....",
+        "......##......",
+        ".....####.....",
+        "....######....",
+        "...########...",
+        "...########...",
+        "....######....",
+        ".....####.....",
+        "....######....",
+        "...########...",
+        "..##########..",
+        "..##########..",
+        ".############.",
+        ".############.",
+        "..............",
+    },
+
+    R = {
+        "..............",
+        "..###..###..##",
+        "..############",
+        "..############",
+        "...########...",
+        "...########...",
+        "...########...",
+        "...########...",
+        "...########...",
+        "...########...",
+        "...########...",
+        "...########...",
+        "..##########..",
+        "..##########..",
+        ".############.",
+        ".############.",
+        ".############.",
+        "..............",
+    },
+
+    N = {
+        "..............",
+        ".....######...",
+        "....########..",
+        "...#########..",
+        "..####..####..",
+        "..###....###..",
+        ".####.######..",
+        ".##########...",
+        ".#########....",
+        "..########....",
+        "...#######....",
+        "....######....",
+        "....#######...",
+        "...#########..",
+        "..##########..",
+        ".############.",
+        ".############.",
+        "..............",
+    },
+
+    B = {
+        "..............",
+        "......##......",
+        ".....####.....",
+        "....######....",
+        "....###.##....",
+        "...###..###...",
+        "...########...",
+        "....######....",
+        ".....####.....",
+        ".....####.....",
+        "....######....",
+        "...########...",
+        "..##########..",
+        "..##########..",
+        ".############.",
+        ".############.",
+        ".############.",
+        "..............",
+    },
+
+    Q = {
+        "..............",
+        "..##..##..##..",
+        "..############",
+        "...########...",
+        "....######....",
+        "...########...",
+        "..##########..",
+        "..##########..",
+        "...########...",
+        "....######....",
+        "....######....",
+        "...########...",
+        "..##########..",
+        "..##########..",
+        ".############.",
+        ".############.",
+        ".############.",
+        "..............",
+    },
+
+    K = {
+        "..............",
+        "......##......",
+        "....######....",
+        "......##......",
+        "......##......",
+        "....######....",
+        "...########...",
+        "...########...",
+        "....######....",
+        ".....####.....",
+        "....######....",
+        "...########...",
+        "..##########..",
+        "..##########..",
+        ".############.",
+        ".############.",
+        ".############.",
+        "..............",
+    },
+}
+
+-- Converts six 2x3 subpixels into a ComputerCraft extended character.
+-- Pixel order assumed:
+--   1 2
+--   4 8
+--   16 32
+-- If the sprites look scrambled on your pack, only this bit order needs changing.
+local function subpixelChar(p1, p2, p3, p4, p5, p6)
+    local mask = 0
+    if p1 then mask = mask + 1 end
+    if p2 then mask = mask + 2 end
+    if p3 then mask = mask + 4 end
+    if p4 then mask = mask + 8 end
+    if p5 then mask = mask + 16 end
+    if p6 then mask = mask + 32 end
+    if mask == 0 then return " " end
+    return string.char(128 + mask)
+end
+
+local function spritePixel(sprite, px, py)
+    local row = sprite[py]
+    if not row then return false end
+    return row:sub(px, px) == "#"
+end
+
+local function drawPieceSprite(piece, squareX, squareY, squareBg)
+    local kind = kindOf(piece)
+    local sprite = PIECE_SPRITES[kind]
+    if not sprite then return end
+
+    local fg = (sideOf(piece) == "w") and colors.white or colors.black
+
+    mon.setTextColor(fg)
+    mon.setBackgroundColor(squareBg)
+
+    -- 14x18 sprite -> 7x6 text cells
+    for cy = 0, 5 do
+        for cx = 0, 6 do
+            local px = cx * 2 + 1
+            local py = cy * 3 + 1
+
+            local ch = subpixelChar(
+                spritePixel(sprite, px,     py),
+                spritePixel(sprite, px + 1, py),
+                spritePixel(sprite, px,     py + 1),
+                spritePixel(sprite, px + 1, py + 1),
+                spritePixel(sprite, px,     py + 2),
+                spritePixel(sprite, px + 1, py + 2)
+            )
+
+            mon.setCursorPos(squareX + cx, squareY + cy)
+            mon.write(ch)
+        end
+    end
+end
+
+-- =========================
+-- DRAWING
+-- =========================
+local function squareScreenRect(file, rank)
+    local x = BOARD_X + (file - 1) * SQ_W
+    local y = BOARD_Y + (8 - rank) * SQ_H
+    return x, y, SQ_W, SQ_H
+end
+
+local function drawSquare(file, rank)
+    local x, y, w, h = squareScreenRect(file, rank)
+
+    local isLight = ((file + rank) % 2 == 0)
+    local bg = isLight and LIGHT_SQUARE or DARK_SQUARE
+
+    if selected and selected.file == file and selected.rank == rank then
+        bg = SELECT_SQUARE
+    elseif containsMove(legalMoves, file, rank) then
+        bg = HIGHLIGHT_SQUARE
+    end
+
+    fill(x, y, w, h, bg)
+
+    local piece = getPiece(file, rank)
+    if piece then
+        drawPieceSprite(piece, x, y, bg)
+    elseif containsMove(legalMoves, file, rank) then
+        local px = x + math.floor(w / 2)
+        local py = y + math.floor(h / 2)
+        writeAt(px, py, "*", colors.black, bg)
+    end
+end
+
+local function drawBoard()
+    fill(1, 1, BOARD_X + BOARD_W, H, colors.black)
+
+    for rank = 1, 8 do
+        for file = 1, 8 do
+            drawSquare(file, rank)
+        end
+    end
+
+    for file = 1, 8 do
+        local x = BOARD_X + (file - 1) * SQ_W
+        centerText(x, FILE_LABEL_Y + 1, SQ_W, files[file], colors.white, colors.black)
+    end
+
+    for rank = 8, 1, -1 do
+        local y = BOARD_Y + (8 - rank) * SQ_H
+        centerText(RANK_LABEL_X, y + math.floor(SQ_H / 2), 1, tostring(rank), colors.white, colors.black)
+    end
+
+    centerText(BOARD_X, 1, BOARD_W, "LIVING MOB CHESS", colors.white, colors.black)
+end
+
+local function drawPanelBox(x, y, w, h, title)
+    fill(x, y, w, h, PANEL_BG)
+    writeAt(x, y, "+" .. string.rep("-", w - 2) .. "+", PANEL_TEXT, PANEL_BG)
+    for yy = y + 1, y + h - 2 do
+        writeAt(x, yy, "|", PANEL_TEXT, PANEL_BG)
+        writeAt(x + w - 1, yy, "|", PANEL_TEXT, PANEL_BG)
+    end
+    writeAt(x, y + h - 1, "+" .. string.rep("-", w - 2) .. "+", PANEL_TEXT, PANEL_BG)
+
+    if title then
+        local label = " " .. title .. " "
+        local tx = x + math.max(1, math.floor((w - #label) / 2))
+        writeAt(tx, y, label, PANEL_TEXT, PANEL_BG)
+    end
+end
+
+local function panelWriteLine(x, y, w, text, fg, bg)
+    bg = bg or PANEL_BG
+    fill(x, y, w, 1, bg)
+    writeAt(x, y, tostring(text or ""):sub(1, w), fg or PANEL_TEXT, bg)
+end
+
+local function drawButton(x, y, w, h, label, bg, fg)
+    fill(x, y, w, h, bg)
+    centerText(x, y + math.floor(h / 2), w, label, fg, bg)
+end
+
+local function drawPanel()
+    fill(PANEL_X, PANEL_Y, PANEL_W, PANEL_H, colors.black)
+
+    drawPanelBox(PANEL_X, 1, PANEL_W, 10, "STATUS")
+    drawPanelBox(PANEL_X, 12, PANEL_W, 16, "MESSAGE")
+    drawPanelBox(PANEL_X, 29, PANEL_W, 14, "SELECTION")
+    drawPanelBox(PANEL_X, 44, PANEL_W, 9, "ACTIONS")
+
+    local turnText = (currentTurn == "w") and "White turn" or "Black turn"
+    panelWriteLine(PANEL_X + 2, 3, PANEL_W - 4, "Turn: " .. turnText)
+    panelWriteLine(PANEL_X + 2, 4, PANEL_W - 4, "Board: " .. (boardBusy and "BUSY" or "READY"))
+
+    if selected then
+        local p = getPiece(selected.file, selected.rank)
+        if p then
+            panelWriteLine(PANEL_X + 2, 6, PANEL_W - 4, "Selected:")
+            panelWriteLine(PANEL_X + 2, 7, PANEL_W - 4, p .. " @ " .. squareName(selected.file, selected.rank))
+        else
+            panelWriteLine(PANEL_X + 2, 6, PANEL_W - 4, "Selected: none")
+        end
+    else
+        panelWriteLine(PANEL_X + 2, 6, PANEL_W - 4, "Selected: none")
+    end
+
+    local width = PANEL_W - 4
+    local msg = statusMessage or ""
+    panelWriteLine(PANEL_X + 2, 14, width, msg:sub(1, width))
+    panelWriteLine(PANEL_X + 2, 15, width, msg:sub(width + 1, width * 2))
+    panelWriteLine(PANEL_X + 2, 16, width, msg:sub(width * 2 + 1, width * 3))
+    panelWriteLine(PANEL_X + 2, 17, width, msg:sub(width * 3 + 1, width * 4))
+
+    panelWriteLine(PANEL_X + 2, 19, width, "Tap piece, then square.")
+    panelWriteLine(PANEL_X + 2, 20, width, "Green = valid moves.")
+    panelWriteLine(PANEL_X + 2, 21, width, "Orange = selected.")
+
+    if selected then
+        local piece = getPiece(selected.file, selected.rank)
+        panelWriteLine(PANEL_X + 2, 31, width, "Piece: " .. (piece or "none"))
+        panelWriteLine(PANEL_X + 2, 32, width, "At: " .. squareName(selected.file, selected.rank))
+        panelWriteLine(PANEL_X + 2, 33, width, "Moves: " .. tostring(#legalMoves))
+    else
+        panelWriteLine(PANEL_X + 2, 31, width, "Piece: none")
+        panelWriteLine(PANEL_X + 2, 32, width, "At: -")
+        panelWriteLine(PANEL_X + 2, 33, width, "Moves: 0")
+    end
+
+    panelWriteLine(PANEL_X + 2, 35, width, "NI/mob state goes")
+    panelWriteLine(PANEL_X + 2, 36, width, "here later.")
+
+    drawButton(PANEL_X + 2, 46, PANEL_W - 4, 2, "RESET BOARD", BTN_WARN, colors.white)
+    drawButton(PANEL_X + 2, 49, PANEL_W - 4, 2, "CLEAR SELECT", BTN_BG, BTN_TEXT)
+end
+
+local function redraw()
+    drawBoard()
+    drawPanel()
+end
+
+-- =========================
+-- INTERACTION
+-- =========================
+local function screenToSquare(x, y)
+    if x < BOARD_X or x >= BOARD_X + BOARD_W or y < BOARD_Y or y >= BOARD_Y + BOARD_H then
+        return nil
+    end
+
+    local file = math.floor((x - BOARD_X) / SQ_W) + 1
+    local rank = 8 - math.floor((y - BOARD_Y) / SQ_H)
+
+    if inBounds(file, rank) then
+        return file, rank
+    end
+    return nil
+end
+
+local function movePiece(fromFile, fromRank, toFile, toRank)
+    local moving = getPiece(fromFile, fromRank)
+    local target = getPiece(toFile, toRank)
+
+    if not moving then
+        statusMessage = "No piece selected."
+        return false
+    end
+
+    -- Later replace this instant move with:
+    --   boardBusy = true
+    --   send NI command to the real mob
+    --   wait for ARRIVED/CAPTURED confirmation
+    --   update board
+    --   boardBusy = false
+
+    setPiece(toFile, toRank, moving)
+    setPiece(fromFile, fromRank, nil)
+
+    local movedText = moving .. " " .. squareName(fromFile, fromRank) .. " -> " .. squareName(toFile, toRank)
+    if target then
+        movedText = movedText .. " captures " .. target
+    end
+
+    statusMessage = movedText
+    currentTurn = (currentTurn == "w") and "b" or "w"
+    return true
+end
+
+local function clearSelection()
+    selected = nil
+    legalMoves = {}
+end
+
+local function resetBoard()
+    board = freshBoard()
+    currentTurn = "w"
+    selected = nil
+    legalMoves = {}
+    boardBusy = false
+    statusMessage = "Board reset. White to move."
+end
+
+local function panelButtonHit(x, y)
+    if x >= PANEL_X + 2 and x <= PANEL_X + PANEL_W - 3 and y >= 46 and y <= 47 then
+        return "reset"
+    end
+    if x >= PANEL_X + 2 and x <= PANEL_X + PANEL_W - 3 and y >= 49 and y <= 50 then
+        return "clear"
+    end
+    return nil
+end
+
+local function handleBoardTap(file, rank)
+    if boardBusy then
+        statusMessage = "Board is busy. Wait for piece move/reset."
+        return
+    end
+
+    local piece = getPiece(file, rank)
+
+    if not selected then
+        if not piece then
+            statusMessage = "No piece there."
+            return
+        end
+
+        if sideOf(piece) ~= currentTurn then
+            statusMessage = "Not your turn for that piece."
+            return
+        end
+
+        selected = {file = file, rank = rank}
+        legalMoves = getLegalMoves(file, rank)
+        statusMessage = "Selected " .. piece .. " at " .. squareName(file, rank) .. "."
+        return
+    end
+
+    if selected.file == file and selected.rank == rank then
+        clearSelection()
+        statusMessage = "Selection cleared."
+        return
+    end
+
+    if piece and sideOf(piece) == currentTurn then
+        selected = {file = file, rank = rank}
+        legalMoves = getLegalMoves(file, rank)
+        statusMessage = "Selected " .. piece .. " at " .. squareName(file, rank) .. "."
+        return
+    end
+
+    if containsMove(legalMoves, file, rank) then
+        local ok = movePiece(selected.file, selected.rank, file, rank)
+        clearSelection()
+        if not ok then
+            statusMessage = "Move failed."
+        end
+    else
+        statusMessage = "Invalid move for selected piece."
+    end
+end
+
+-- =========================
+-- MAIN
+-- =========================
+resetBoard()
+redraw()
+
+while true do
+    local event, side, x, y = os.pullEvent()
+
+    if event == "monitor_touch" then
+        local action = panelButtonHit(x, y)
+        if action == "reset" then
+            resetBoard()
+            redraw()
+        elseif action == "clear" then
+            clearSelection()
+            statusMessage = "Selection cleared."
+            redraw()
+        else
+            local file, rank = screenToSquare(x, y)
+            if file and rank then
+                handleBoardTap(file, rank)
+                redraw()
+            end
+        end
+
+    elseif event == "monitor_resize" then
+        mon.setTextScale(0.5)
+        W, H = mon.getSize()
+        redraw()
+    end
+end
