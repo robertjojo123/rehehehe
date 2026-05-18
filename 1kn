@@ -1,0 +1,1211 @@
+-- mob_chess_ui_sixel_v8_no_borders.lua
+-- Living Mob Chess monitor prototype
+-- No-outline piece sprites for cleaner 2x3 subpixel rendering.
+-- 4x4 advanced monitor at text scale 0.5 should be about 79x52.
+
+local mon = peripheral.find("monitor")
+if not mon then error("No monitor found") end
+
+mon.setTextScale(0.5)
+local W, H = mon.getSize()
+
+-- =========================================================
+-- === Config
+-- =========================================================
+
+local SQ_W, SQ_H = 7, 6
+local BOARD_X, BOARD_Y = 2, 2
+local BOARD_W, BOARD_H = SQ_W * 8, SQ_H * 8
+local PANEL_X = BOARD_X + BOARD_W + 2
+local PANEL_W = math.max(18, W - PANEL_X + 1)
+
+local LIGHT_SQUARE = colors.white
+local DARK_SQUARE  = colors.lightBlue
+local SELECT_SQUARE = colors.orange
+local MOVE_SQUARE = colors.lime
+local CAPTURE_SQUARE = colors.red
+local PANEL_BG = colors.gray
+
+local WHITE_FILL = colors.yellow
+local WHITE_OUTLINE = colors.black
+local BLACK_FILL = colors.black
+local BLACK_OUTLINE = colors.yellow
+
+local files = {"a","b","c","d","e","f","g","h"}
+
+if mon.setPaletteColor then
+    pcall(function()
+        -- warm cream light square
+        mon.setPaletteColor(colors.white, 0.90, 0.89, 0.83)
+        -- soft slate blue dark square
+        mon.setPaletteColor(colors.lightBlue, 0.53, 0.61, 0.80)
+        -- gold for white pieces / black outlines against it
+        mon.setPaletteColor(colors.yellow, 0.94, 0.76, 0.22)
+        -- selection / move colors
+        mon.setPaletteColor(colors.orange, 0.96, 0.58, 0.24)
+        mon.setPaletteColor(colors.lime, 0.46, 0.81, 0.42)
+        mon.setPaletteColor(colors.red, 0.85, 0.24, 0.22)
+        mon.setPaletteColor(colors.gray, 0.18, 0.18, 0.20)
+    end)
+end
+
+-- =========================================================
+-- === Sixel / 2x3 subpixel renderer
+-- =========================================================
+
+local BLIT_LOOKUP = {
+    [colors.white] = "0", [colors.orange] = "1", [colors.magenta] = "2", [colors.lightBlue] = "3",
+    [colors.yellow] = "4", [colors.lime] = "5", [colors.pink] = "6", [colors.gray] = "7",
+    [colors.lightGray] = "8", [colors.cyan] = "9", [colors.purple] = "a", [colors.blue] = "b",
+    [colors.brown] = "c", [colors.green] = "d", [colors.red] = "e", [colors.black] = "f",
+}
+
+local function colorToBlit(color)
+    return BLIT_LOOKUP[color or colors.white] or "0"
+end
+
+local function sixelChar(mask)
+    if mask > 31 then
+        return string.char(0x80 + (63 - mask)), true
+    end
+    return string.char(0x80 + mask), false
+end
+
+local function newSubCanvas(w, h, bg)
+    local pix = {}
+    for y = 1, h do
+        pix[y] = {}
+        for x = 1, w do pix[y][x] = bg end
+    end
+    return { w = w, h = h, bg = bg, pix = pix }
+end
+
+local function setSub(canvas, x, y, color)
+    if x >= 1 and x <= canvas.w and y >= 1 and y <= canvas.h then
+        canvas.pix[y][x] = color
+    end
+end
+
+local function plotSprite(canvas, sprite, color)
+    for y = 1, #sprite do
+        local row = sprite[y]
+        for x = 1, #row do
+            if row:sub(x, x) == "#" then
+                setSub(canvas, x, y, color)
+            end
+        end
+    end
+end
+
+local function spriteMask(sprite)
+    local mask = {}
+    for y = 1, #sprite do
+        mask[y] = {}
+        local row = sprite[y]
+        for x = 1, #row do
+            mask[y][x] = row:sub(x, x) == "#"
+        end
+    end
+    return mask
+end
+
+local function plotOutlinedSprite(canvas, sprite, fillColor, outlineColor)
+    local mask = spriteMask(sprite)
+    local h = #mask
+    local w = #mask[1]
+
+    -- outline first
+    for y = 1, h do
+        for x = 1, w do
+            if mask[y][x] then
+                for dy = -1, 1 do
+                    for dx = -1, 1 do
+                        local nx, ny = x + dx, y + dy
+                        if nx >= 1 and nx <= w and ny >= 1 and ny <= h then
+                            if not mask[ny][nx] then
+                                setSub(canvas, nx, ny, outlineColor)
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    -- fill on top
+    for y = 1, h do
+        for x = 1, w do
+            if mask[y][x] then
+                setSub(canvas, x, y, fillColor)
+            end
+        end
+    end
+
+    canvas.pieceFill = fillColor
+    canvas.pieceOutline = outlineColor
+end
+
+local function renderSubCanvas(target, x, y, canvas)
+    local outW, outH = canvas.w, canvas.h
+    while outW % 2 ~= 0 do outW = outW + 1 end
+    while outH % 3 ~= 0 do outH = outH + 1 end
+
+    local charW = math.floor(outW / 2)
+    local charH = math.floor(outH / 3)
+    local tw, th = target.getSize()
+
+    for cy = 1, charH do
+        local chars, fgs, bgs = {}, {}, {}
+
+        for cx = 1, charW do
+            local bg = canvas.bg
+            local px = (cx - 1) * 2
+            local py = (cy - 1) * 3
+
+            local points = {
+                canvas.pix[py + 1] and canvas.pix[py + 1][px + 1] or bg,
+                canvas.pix[py + 1] and canvas.pix[py + 1][px + 2] or bg,
+                canvas.pix[py + 2] and canvas.pix[py + 2][px + 1] or bg,
+                canvas.pix[py + 2] and canvas.pix[py + 2][px + 2] or bg,
+                canvas.pix[py + 3] and canvas.pix[py + 3][px + 1] or bg,
+                canvas.pix[py + 3] and canvas.pix[py + 3][px + 2] or bg,
+            }
+
+            local function countColor(col)
+                local n = 0
+                for _, c in ipairs(points) do
+                    if c == col then n = n + 1 end
+                end
+                return n
+            end
+
+            local fill = canvas.pieceFill
+            local outline = canvas.pieceOutline
+            local fillCount = fill and countColor(fill) or 0
+            local outlineCount = outline and countColor(outline) or 0
+            local bgCount = countColor(bg)
+
+            local fgColor = nil
+            local bgColor = bg
+
+            -- Leak-safe priority:
+            -- If the 2x3 cell has board background AND both fill/outline,
+            -- keep the real board background as bg instead of turning the whole
+            -- empty part of the cell into outline. This is what caused crown/rook leaks.
+            if fillCount > 0 then
+                fgColor = fill
+                bgColor = bg
+            elseif outlineCount > 0 then
+                fgColor = outline
+                bgColor = bg
+            else
+                -- Fallback for non-piece drawings with arbitrary colors.
+                local counts, unique = {}, {}
+                for _, c in ipairs(points) do
+                    if not counts[c] then counts[c] = 0; unique[#unique + 1] = c end
+                    counts[c] = counts[c] + 1
+                end
+                if #unique == 1 then
+                    fgColor = nil
+                    bgColor = unique[1]
+                else
+                    local best = nil
+                    for _, c in ipairs(unique) do
+                        if c ~= bg and (not best or counts[c] > counts[best]) then best = c end
+                    end
+                    fgColor = best
+                    bgColor = bg
+                end
+            end
+
+            local function addChar(ch, fg, bkg)
+                chars[#chars + 1] = ch
+                fgs[#fgs + 1] = colorToBlit(fg or bkg or bg)
+                bgs[#bgs + 1] = colorToBlit(bkg or bg)
+            end
+
+            if not fgColor or fgColor == bgColor then
+                addChar(" ", bgColor, bgColor)
+            else
+                local bitValues = {1, 2, 4, 8, 16, 32}
+                local mask = 0
+                for i, c in ipairs(points) do
+                    if c == fgColor then mask = mask + bitValues[i] end
+                end
+
+                if mask == 0 then
+                    addChar(" ", bgColor, bgColor)
+                elseif mask == 63 then
+                    addChar(" ", fgColor, fgColor)
+                else
+                    local ch, inverted = sixelChar(mask)
+                    if inverted then
+                        addChar(ch, bgColor, fgColor)
+                    else
+                        addChar(ch, fgColor, bgColor)
+                    end
+                end
+            end
+        end
+
+        local rowY = y + cy - 1
+        if rowY >= 1 and rowY <= th then
+            local rowText, rowFg, rowBg = table.concat(chars), table.concat(fgs), table.concat(bgs)
+            local drawX = x
+            if drawX < 1 then
+                local trim = 2 - drawX
+                rowText = rowText:sub(trim)
+                rowFg = rowFg:sub(trim)
+                rowBg = rowBg:sub(trim)
+                drawX = 1
+            end
+            if drawX <= tw and #rowText > 0 then
+                local maxLen = tw - drawX + 1
+                target.setCursorPos(drawX, rowY)
+                target.blit(rowText:sub(1, maxLen), rowFg:sub(1, maxLen), rowBg:sub(1, maxLen))
+            end
+        end
+    end
+end
+
+-- =========================================================
+-- === Piece sprites (14x18)
+-- cleaner, more centered silhouettes for outlined rendering
+-- =========================================================
+
+local SPRITES = {
+    -- 14x18 masks, redesigned smaller.
+    -- Fill stays inside cols 3-12 and rows 3-16.
+    -- Auto-outline may extend to cols 2-13 and rows 2-17, leaving a real
+    -- 1-subpixel background gap on every side of the square.
+
+    P = {
+        "..............",
+        "..............",
+        ".....####.....",
+        "....######....",
+        "....######....",
+        ".....####.....",
+        ".....####.....",
+        "....######....",
+        "...########...",
+        "....######....",
+        ".....####.....",
+        ".....####.....",
+        "....######....",
+        "...########...",
+        "..##########..",
+        "..##########..",
+        "..............",
+        "..............",
+    },
+
+    R = {
+        "..............",
+        "..............",
+        "..##..##..##..",
+        "..##########..",
+        "..##########..",
+        "...########...",
+        "....######....",
+        "....######....",
+        "....######....",
+        "....######....",
+        "....######....",
+        "....######....",
+        "...########...",
+        "..##########..",
+        "..##########..",
+        "..##########..",
+        "..............",
+        "..............",
+    },
+
+    N = {
+        "..............",
+        "..............",
+        ".....#####....",
+        "....#######...",
+        "...########...",
+        "...####.###...",
+        "...###...###..",
+        "...###....##..",
+        "....##...###..",
+        ".....######...",
+        ".....#####....",
+        "....######....",
+        "...########...",
+        "..##########..",
+        "..##########..",
+        "..##########..",
+        "..............",
+        "..............",
+    },
+
+    B = {
+        "..............",
+        "..............",
+        "......##......",
+        ".....####.....",
+        "....######....",
+        "....###.##....",
+        "...###..###...",
+        "...########...",
+        "....######....",
+        ".....####.....",
+        ".....####.....",
+        "....######....",
+        "...########...",
+        "..##########..",
+        "..##########..",
+        "..##########..",
+        "..............",
+        "..............",
+    },
+
+    Q = {
+        "..............",
+        "..............",
+        "...##.##.##...",
+        "...########...",
+        "....######....",
+        ".....####.....",
+        "....######....",
+        "...########...",
+        "...########...",
+        "....######....",
+        "....######....",
+        "....######....",
+        "...########...",
+        "..##########..",
+        "..##########..",
+        "..##########..",
+        "..............",
+        "..............",
+    },
+
+    K = {
+        "..............",
+        "..............",
+        "......##......",
+        "....######....",
+        "......##......",
+        "......##......",
+        "....######....",
+        "...########...",
+        "...########...",
+        "....######....",
+        ".....####.....",
+        "....######....",
+        "...########...",
+        "..##########..",
+        "..##########..",
+        "..##########..",
+        "..............",
+        "..............",
+    },
+}
+
+-- =========================================================
+-- === Drawing helpers
+-- =========================================================
+
+local function fillRect(x, y, w, h, bg)
+    mon.setBackgroundColor(bg)
+    local blank = string.rep(" ", math.max(0, w))
+    for yy = y, y + h - 1 do
+        if yy >= 1 and yy <= H then
+            mon.setCursorPos(math.max(1, x), yy)
+            mon.write(blank:sub(1, math.max(0, W - math.max(1, x) + 1)))
+        end
+    end
+end
+
+local function writeAt(x, y, text, fg, bg)
+    if y < 1 or y > H or x > W then return end
+    text = tostring(text or "")
+    if x < 1 then
+        text = text:sub(2 - x)
+        x = 1
+    end
+    if #text <= 0 then return end
+    mon.setCursorPos(x, y)
+    mon.setTextColor(fg or colors.white)
+    mon.setBackgroundColor(bg or colors.black)
+    mon.write(text:sub(1, W - x + 1))
+end
+
+local function centerText(x, y, w, text, fg, bg)
+    text = tostring(text or "")
+    writeAt(x + math.floor((w - #text) / 2), y, text, fg, bg)
+end
+
+local function drawPanelBox(x, y, w, h, title)
+    fillRect(x, y, w, h, PANEL_BG)
+    writeAt(x, y, "+" .. string.rep("-", math.max(0, w - 2)) .. "+", colors.white, PANEL_BG)
+    for yy = y + 1, y + h - 2 do
+        writeAt(x, yy, "|", colors.white, PANEL_BG)
+        writeAt(x + w - 1, yy, "|", colors.white, PANEL_BG)
+    end
+    writeAt(x, y + h - 1, "+" .. string.rep("-", math.max(0, w - 2)) .. "+", colors.white, PANEL_BG)
+    if title then centerText(x, y, w, " " .. title .. " ", colors.yellow, PANEL_BG) end
+end
+
+local function drawButton(x, y, w, h, label, bg, fg)
+    fillRect(x, y, w, h, bg)
+    centerText(x, y + math.floor(h / 2), w, label, fg or colors.white, bg)
+end
+
+local function sideOf(piece) return piece and piece:sub(1,1) or nil end
+local function kindOf(piece) return piece and piece:sub(2,2) or nil end
+
+local function drawPiece(piece, sx, sy, squareBg)
+    local sprite = SPRITES[kindOf(piece)]
+    if not sprite then return end
+
+    local fillColor
+    if sideOf(piece) == "w" then
+        fillColor = WHITE_FILL
+    else
+        fillColor = BLACK_FILL
+    end
+
+    -- No outline: every non-fill pixel stays as the square background.
+    -- This keeps each 2x3 cell to only bg+piece color and removes the edge leaking.
+    local c = newSubCanvas(14, 18, squareBg)
+    plotSprite(c, sprite, fillColor)
+    renderSubCanvas(mon, sx, sy, c)
+end
+
+-- =========================================================
+-- === Chess state
+-- =========================================================
+
+local function freshBoard()
+    return {
+        {"bR","bN","bB","bQ","bK","bB","bN","bR"},
+        {"bP","bP","bP","bP","bP","bP","bP","bP"},
+        {nil,nil,nil,nil,nil,nil,nil,nil},
+        {nil,nil,nil,nil,nil,nil,nil,nil},
+        {nil,nil,nil,nil,nil,nil,nil,nil},
+        {nil,nil,nil,nil,nil,nil,nil,nil},
+        {"wP","wP","wP","wP","wP","wP","wP","wP"},
+        {"wR","wN","wB","wQ","wK","wB","wN","wR"},
+    }
+end
+
+local board = freshBoard()
+local selected = nil
+local legalMoves = {}
+local currentTurn = "w"
+local statusMessage = "White to move. Tap a piece."
+local boardBusy = false
+local gameOver = false
+local lastMove = "None"
+
+-- Full chess-rule state.
+-- Castling rights are removed when a king/rook moves, or when a rook is captured.
+local castleRights = { wK = true, wQ = true, bK = true, bQ = true }
+
+-- En passant target, set only immediately after a two-square pawn move.
+-- Shape: {file=number, rank=number, captureFile=number, captureRank=number}
+local enPassant = nil
+
+local function inBounds(file, rank)
+    return file >= 1 and file <= 8 and rank >= 1 and rank <= 8
+end
+
+local function arrayPos(file, rank)
+    return 9 - rank, file
+end
+
+local function getPiece(file, rank)
+    if not inBounds(file, rank) then return nil end
+    local r, c = arrayPos(file, rank)
+    return board[r][c]
+end
+
+local function setPiece(file, rank, piece)
+    local r, c = arrayPos(file, rank)
+    board[r][c] = piece
+end
+
+local function squareName(file, rank)
+    return files[file] .. tostring(rank)
+end
+
+local function findMove(moves, file, rank)
+    for _, m in ipairs(moves) do
+        if m.file == file and m.rank == rank then return m end
+    end
+    return nil
+end
+
+local function containsMove(moves, file, rank)
+    local m = findMove(moves, file, rank)
+    if m then return true, m.capture end
+    return false, false
+end
+
+local function addMove(moves, file, rank, capture, flags)
+    if inBounds(file, rank) then
+        flags = flags or {}
+        flags.file = file
+        flags.rank = rank
+        flags.capture = capture or false
+        moves[#moves + 1] = flags
+    end
+end
+
+local function addRayMoves(moves, file, rank, df, dr, side)
+    local f, r = file + df, rank + dr
+    while inBounds(f, r) do
+        local p = getPiece(f, r)
+        if not p then
+            addMove(moves, f, r, false)
+        else
+            if sideOf(p) ~= side then addMove(moves, f, r, true) end
+            break
+        end
+        f, r = f + df, r + dr
+    end
+end
+
+local function opposite(side)
+    return side == "w" and "b" or "w"
+end
+
+local function kingSquare(side)
+    local king = side .. "K"
+    for rank = 1, 8 do
+        for file = 1, 8 do
+            if getPiece(file, rank) == king then
+                return file, rank
+            end
+        end
+    end
+    return nil, nil
+end
+
+local function isSquareAttacked(file, rank, bySide)
+    -- Pawns attack diagonally forward from their own side.
+    local pawnDir = (bySide == "w") and 1 or -1
+    for _, df in ipairs({-1, 1}) do
+        local p = getPiece(file - df, rank - pawnDir)
+        if p == bySide .. "P" then return true end
+    end
+
+    -- Knights.
+    local jumps = {{1,2},{2,1},{2,-1},{1,-2},{-1,-2},{-2,-1},{-2,1},{-1,2}}
+    for _, j in ipairs(jumps) do
+        local p = getPiece(file + j[1], rank + j[2])
+        if p == bySide .. "N" then return true end
+    end
+
+    -- King adjacency.
+    for df = -1, 1 do
+        for dr = -1, 1 do
+            if not (df == 0 and dr == 0) then
+                local p = getPiece(file + df, rank + dr)
+                if p == bySide .. "K" then return true end
+            end
+        end
+    end
+
+    -- Rooks / queens on straight lines.
+    local rookDirs = {{1,0},{-1,0},{0,1},{0,-1}}
+    for _, d in ipairs(rookDirs) do
+        local f, r = file + d[1], rank + d[2]
+        while inBounds(f, r) do
+            local p = getPiece(f, r)
+            if p then
+                if sideOf(p) == bySide and (kindOf(p) == "R" or kindOf(p) == "Q") then
+                    return true
+                end
+                break
+            end
+            f, r = f + d[1], r + d[2]
+        end
+    end
+
+    -- Bishops / queens on diagonals.
+    local bishopDirs = {{1,1},{1,-1},{-1,1},{-1,-1}}
+    for _, d in ipairs(bishopDirs) do
+        local f, r = file + d[1], rank + d[2]
+        while inBounds(f, r) do
+            local p = getPiece(f, r)
+            if p then
+                if sideOf(p) == bySide and (kindOf(p) == "B" or kindOf(p) == "Q") then
+                    return true
+                end
+                break
+            end
+            f, r = f + d[1], r + d[2]
+        end
+    end
+
+    return false
+end
+
+local function inCheck(side)
+    local kf, kr = kingSquare(side)
+    if not kf then return true end
+    return isSquareAttacked(kf, kr, opposite(side))
+end
+
+local function addCastleMoves(moves, side)
+    local rank = (side == "w") and 1 or 8
+    local enemy = opposite(side)
+
+    -- You cannot castle out of check.
+    if inCheck(side) then return end
+
+    if side == "w" then
+        if castleRights.wK
+            and getPiece(5, 1) == "wK"
+            and getPiece(8, 1) == "wR"
+            and not getPiece(6, 1)
+            and not getPiece(7, 1)
+            and not isSquareAttacked(6, 1, enemy)
+            and not isSquareAttacked(7, 1, enemy) then
+            addMove(moves, 7, 1, false, {castle = "K"})
+        end
+
+        if castleRights.wQ
+            and getPiece(5, 1) == "wK"
+            and getPiece(1, 1) == "wR"
+            and not getPiece(4, 1)
+            and not getPiece(3, 1)
+            and not getPiece(2, 1)
+            and not isSquareAttacked(4, 1, enemy)
+            and not isSquareAttacked(3, 1, enemy) then
+            addMove(moves, 3, 1, false, {castle = "Q"})
+        end
+    else
+        if castleRights.bK
+            and getPiece(5, 8) == "bK"
+            and getPiece(8, 8) == "bR"
+            and not getPiece(6, 8)
+            and not getPiece(7, 8)
+            and not isSquareAttacked(6, 8, enemy)
+            and not isSquareAttacked(7, 8, enemy) then
+            addMove(moves, 7, 8, false, {castle = "K"})
+        end
+
+        if castleRights.bQ
+            and getPiece(5, 8) == "bK"
+            and getPiece(1, 8) == "bR"
+            and not getPiece(4, 8)
+            and not getPiece(3, 8)
+            and not getPiece(2, 8)
+            and not isSquareAttacked(4, 8, enemy)
+            and not isSquareAttacked(3, 8, enemy) then
+            addMove(moves, 3, 8, false, {castle = "Q"})
+        end
+    end
+end
+
+local function getPseudoMoves(file, rank)
+    local piece = getPiece(file, rank)
+    if not piece then return {} end
+    local side, kind = sideOf(piece), kindOf(piece)
+    local moves = {}
+
+    if kind == "P" then
+        local dir = (side == "w") and 1 or -1
+        local startRank = (side == "w") and 2 or 7
+        local promoteRank = (side == "w") and 8 or 1
+
+        if inBounds(file, rank + dir) and not getPiece(file, rank + dir) then
+            addMove(moves, file, rank + dir, false, {promotion = (rank + dir == promoteRank)})
+            if rank == startRank and not getPiece(file, rank + 2 * dir) then
+                addMove(moves, file, rank + 2 * dir, false, {doublePawn = true})
+            end
+        end
+
+        for _, df in ipairs({-1, 1}) do
+            local tf, tr = file + df, rank + dir
+            local target = getPiece(tf, tr)
+            if target and sideOf(target) ~= side then
+                addMove(moves, tf, tr, true, {promotion = (tr == promoteRank)})
+            end
+
+            -- En passant capture. The captured pawn is not on the destination square.
+            if enPassant and enPassant.file == tf and enPassant.rank == tr then
+                addMove(moves, tf, tr, true, {
+                    enPassant = true,
+                    captureFile = enPassant.captureFile,
+                    captureRank = enPassant.captureRank
+                })
+            end
+        end
+
+    elseif kind == "N" then
+        local jumps = {{1,2},{2,1},{2,-1},{1,-2},{-1,-2},{-2,-1},{-2,1},{-1,2}}
+        for _, j in ipairs(jumps) do
+            local f, r = file + j[1], rank + j[2]
+            if inBounds(f, r) then
+                local p = getPiece(f, r)
+                if not p then addMove(moves, f, r, false)
+                elseif sideOf(p) ~= side then addMove(moves, f, r, true) end
+            end
+        end
+
+    elseif kind == "B" then
+        addRayMoves(moves, file, rank, 1, 1, side)
+        addRayMoves(moves, file, rank, 1, -1, side)
+        addRayMoves(moves, file, rank, -1, 1, side)
+        addRayMoves(moves, file, rank, -1, -1, side)
+
+    elseif kind == "R" then
+        addRayMoves(moves, file, rank, 1, 0, side)
+        addRayMoves(moves, file, rank, -1, 0, side)
+        addRayMoves(moves, file, rank, 0, 1, side)
+        addRayMoves(moves, file, rank, 0, -1, side)
+
+    elseif kind == "Q" then
+        addRayMoves(moves, file, rank, 1, 0, side)
+        addRayMoves(moves, file, rank, -1, 0, side)
+        addRayMoves(moves, file, rank, 0, 1, side)
+        addRayMoves(moves, file, rank, 0, -1, side)
+        addRayMoves(moves, file, rank, 1, 1, side)
+        addRayMoves(moves, file, rank, 1, -1, side)
+        addRayMoves(moves, file, rank, -1, 1, side)
+        addRayMoves(moves, file, rank, -1, -1, side)
+
+    elseif kind == "K" then
+        for df = -1, 1 do
+            for dr = -1, 1 do
+                if not (df == 0 and dr == 0) then
+                    local f, r = file + df, rank + dr
+                    if inBounds(f, r) then
+                        local p = getPiece(f, r)
+                        if not p then addMove(moves, f, r, false)
+                        elseif sideOf(p) ~= side then addMove(moves, f, r, true) end
+                    end
+                end
+            end
+        end
+
+        addCastleMoves(moves, side)
+    end
+
+    return moves
+end
+
+local function wouldLeaveKingInCheck(fromFile, fromRank, move)
+    local piece = getPiece(fromFile, fromRank)
+    if not piece then return true end
+
+    local side = sideOf(piece)
+    local toFile, toRank = move.file, move.rank
+    local captured = getPiece(toFile, toRank)
+
+    local epCaptured = nil
+    if move.enPassant then
+        epCaptured = getPiece(move.captureFile, move.captureRank)
+        setPiece(move.captureFile, move.captureRank, nil)
+    end
+
+    setPiece(toFile, toRank, piece)
+    setPiece(fromFile, fromRank, nil)
+
+    -- For castling, also temporarily move the rook so attack tests match the real final board.
+    local rookFromFile, rookToFile = nil, nil
+    local rookPiece = nil
+    if move.castle == "K" then
+        rookFromFile, rookToFile = 8, 6
+    elseif move.castle == "Q" then
+        rookFromFile, rookToFile = 1, 4
+    end
+    if rookFromFile then
+        rookPiece = getPiece(rookFromFile, fromRank)
+        setPiece(rookToFile, fromRank, rookPiece)
+        setPiece(rookFromFile, fromRank, nil)
+    end
+
+    local bad = inCheck(side)
+
+    -- Undo.
+    if rookFromFile then
+        setPiece(rookFromFile, fromRank, rookPiece)
+        setPiece(rookToFile, fromRank, nil)
+    end
+    setPiece(fromFile, fromRank, piece)
+    setPiece(toFile, toRank, captured)
+    if move.enPassant then
+        setPiece(move.captureFile, move.captureRank, epCaptured)
+    end
+
+    return bad
+end
+
+local function getLegalMoves(file, rank)
+    local piece = getPiece(file, rank)
+    if not piece then return {} end
+
+    local pseudo = getPseudoMoves(file, rank)
+    local legal = {}
+
+    for _, m in ipairs(pseudo) do
+        if not wouldLeaveKingInCheck(file, rank, m) then
+            legal[#legal + 1] = m
+        end
+    end
+
+    return legal
+end
+
+local function hasAnyLegalMove(side)
+    for rank = 1, 8 do
+        for file = 1, 8 do
+            local p = getPiece(file, rank)
+            if p and sideOf(p) == side and #getLegalMoves(file, rank) > 0 then
+                return true
+            end
+        end
+    end
+    return false
+end
+
+local function clearSelection()
+    selected = nil
+    legalMoves = {}
+end
+
+local function resetGame()
+    board = freshBoard()
+    selected = nil
+    legalMoves = {}
+    currentTurn = "w"
+    statusMessage = "Board reset. White to move."
+    boardBusy = false
+    gameOver = false
+    lastMove = "None"
+    castleRights = { wK = true, wQ = true, bK = true, bQ = true }
+    enPassant = nil
+end
+
+-- =========================================================
+-- === Board drawing
+-- =========================================================
+
+local function squareRect(file, rank)
+    return BOARD_X + (file - 1) * SQ_W, BOARD_Y + (8 - rank) * SQ_H, SQ_W, SQ_H
+end
+
+local function squareBg(file, rank)
+    local bg = ((file + rank) % 2 == 0) and LIGHT_SQUARE or DARK_SQUARE
+    if selected and selected.file == file and selected.rank == rank then
+        bg = SELECT_SQUARE
+    else
+        local isMove, isCap = containsMove(legalMoves, file, rank)
+        if isMove then bg = isCap and CAPTURE_SQUARE or MOVE_SQUARE end
+    end
+    return bg
+end
+
+local function drawSquare(file, rank)
+    local x, y, w, h = squareRect(file, rank)
+    local bg = squareBg(file, rank)
+    fillRect(x, y, w, h, bg)
+
+    local piece = getPiece(file, rank)
+    if piece then
+        drawPiece(piece, x, y, bg)
+    else
+        local isMove = containsMove(legalMoves, file, rank)
+        if isMove then
+            writeAt(x + 3, y + 2, "*", colors.black, bg)
+        end
+    end
+end
+
+local function drawBoard()
+    fillRect(1, 1, math.min(W, PANEL_X - 2), H, colors.black)
+    centerText(BOARD_X, 1, BOARD_W, "LIVING MOB CHESS", colors.white, colors.black)
+
+    for rank = 1, 8 do
+        for file = 1, 8 do drawSquare(file, rank) end
+    end
+
+    for file = 1, 8 do
+        local x = BOARD_X + (file - 1) * SQ_W
+        centerText(x, BOARD_Y + BOARD_H + 1, SQ_W, files[file], colors.white, colors.black)
+    end
+    for rank = 1, 8 do
+        local _, y = squareRect(1, rank)
+        writeAt(1, y + 2, tostring(rank), colors.white, colors.black)
+    end
+end
+
+local function writePanelLine(y, text, fg)
+    fillRect(PANEL_X + 1, y, PANEL_W - 2, 1, PANEL_BG)
+    writeAt(PANEL_X + 1, y, tostring(text or ""):sub(1, PANEL_W - 2), fg or colors.white, PANEL_BG)
+end
+
+local function wrapPanelText(startY, maxLines, text, fg)
+    local width = PANEL_W - 2
+    text = tostring(text or "")
+    for i = 0, maxLines - 1 do
+        local part = text:sub(i * width + 1, (i + 1) * width)
+        writePanelLine(startY + i, part, fg)
+    end
+end
+
+local function drawPanel()
+    fillRect(PANEL_X, 1, PANEL_W, H, colors.black)
+    drawPanelBox(PANEL_X, 1, PANEL_W, 9, "STATUS")
+    drawPanelBox(PANEL_X, 10, PANEL_W, 13, "MESSAGE")
+    drawPanelBox(PANEL_X, 23, PANEL_W, 12, "SELECT")
+    drawPanelBox(PANEL_X, 36, PANEL_W, 16, "ACTIONS")
+
+    local turnName = currentTurn == "w" and "White" or "Black"
+    writePanelLine(3, "Turn: " .. turnName)
+    writePanelLine(4, "State: " .. (gameOver and "GAME OVER" or (boardBusy and "BUSY" or "READY")), gameOver and colors.red or colors.lime)
+    writePanelLine(6, "Last:")
+    wrapPanelText(7, 2, lastMove, colors.lightGray)
+
+    wrapPanelText(12, 7, statusMessage, colors.white)
+
+    if selected then
+        local p = getPiece(selected.file, selected.rank)
+        writePanelLine(25, "Piece: " .. tostring(p or "none"))
+        writePanelLine(26, "At: " .. squareName(selected.file, selected.rank))
+        writePanelLine(27, "Moves: " .. tostring(#legalMoves))
+        writePanelLine(29, "Tap green/red")
+        writePanelLine(30, "destination.")
+    else
+        writePanelLine(25, "Piece: none")
+        writePanelLine(26, "At: -")
+        writePanelLine(27, "Moves: 0")
+        writePanelLine(29, "Tap a piece")
+        writePanelLine(30, "to select it.")
+    end
+
+    drawButton(PANEL_X + 2, 38, PANEL_W - 4, 3, "RESET", colors.red, colors.white)
+    drawButton(PANEL_X + 2, 42, PANEL_W - 4, 3, "CLEAR", colors.lightGray, colors.black)
+    writePanelLine(47, "Rules:", colors.yellow)
+    writePanelLine(48, "Check, castle, EP")
+    writePanelLine(49, "Auto queen promo")
+end
+
+local function redraw()
+    mon.setBackgroundColor(colors.black)
+    mon.clear()
+    drawBoard()
+    drawPanel()
+end
+
+-- =========================================================
+-- === Input / actions
+-- =========================================================
+
+local function screenToSquare(x, y)
+    if x < BOARD_X or x >= BOARD_X + BOARD_W or y < BOARD_Y or y >= BOARD_Y + BOARD_H then return nil end
+    local file = math.floor((x - BOARD_X) / SQ_W) + 1
+    local rank = 8 - math.floor((y - BOARD_Y) / SQ_H)
+    if inBounds(file, rank) then return file, rank end
+    return nil
+end
+
+local function panelButton(x, y)
+    if x >= PANEL_X + 2 and x <= PANEL_X + PANEL_W - 3 then
+        if y >= 38 and y <= 40 then return "reset" end
+        if y >= 42 and y <= 44 then return "clear" end
+    end
+    return nil
+end
+
+local function updateCastleRightsForMove(piece, fromFile, fromRank, captured, toFile, toRank, move)
+    if piece == "wK" then
+        castleRights.wK = false
+        castleRights.wQ = false
+    elseif piece == "bK" then
+        castleRights.bK = false
+        castleRights.bQ = false
+    elseif piece == "wR" then
+        if fromFile == 1 and fromRank == 1 then castleRights.wQ = false end
+        if fromFile == 8 and fromRank == 1 then castleRights.wK = false end
+    elseif piece == "bR" then
+        if fromFile == 1 and fromRank == 8 then castleRights.bQ = false end
+        if fromFile == 8 and fromRank == 8 then castleRights.bK = false end
+    end
+
+    -- Capturing a rook on its original square also removes that side's castling right.
+    if captured == "wR" then
+        if toFile == 1 and toRank == 1 then castleRights.wQ = false end
+        if toFile == 8 and toRank == 1 then castleRights.wK = false end
+    elseif captured == "bR" then
+        if toFile == 1 and toRank == 8 then castleRights.bQ = false end
+        if toFile == 8 and toRank == 8 then castleRights.bK = false end
+    end
+end
+
+local function movePiece(fromFile, fromRank, toFile, toRank, move)
+    move = move or findMove(legalMoves, toFile, toRank) or {file = toFile, rank = toRank}
+
+    local moving = getPiece(fromFile, fromRank)
+    local target = getPiece(toFile, toRank)
+    if not moving then return false end
+
+    local captured = target
+    if move.enPassant then
+        captured = getPiece(move.captureFile, move.captureRank)
+        setPiece(move.captureFile, move.captureRank, nil)
+    end
+
+    updateCastleRightsForMove(moving, fromFile, fromRank, captured, toFile, toRank, move)
+
+    setPiece(toFile, toRank, moving)
+    setPiece(fromFile, fromRank, nil)
+
+    if move.castle == "K" then
+        -- King side castle: rook h-file to f-file.
+        setPiece(6, fromRank, getPiece(8, fromRank))
+        setPiece(8, fromRank, nil)
+    elseif move.castle == "Q" then
+        -- Queen side castle: rook a-file to d-file.
+        setPiece(4, fromRank, getPiece(1, fromRank))
+        setPiece(1, fromRank, nil)
+    end
+
+    -- En passant is only available immediately after a two-square pawn move.
+    enPassant = nil
+    if move.doublePawn then
+        local dir = (sideOf(moving) == "w") and 1 or -1
+        enPassant = {
+            file = fromFile,
+            rank = fromRank + dir,
+            captureFile = toFile,
+            captureRank = toRank
+        }
+    end
+
+    local promotionText = nil
+    if kindOf(moving) == "P" and ((sideOf(moving) == "w" and toRank == 8) or (sideOf(moving) == "b" and toRank == 1)) then
+        -- For now, auto-promote to queen. Later we can add a monitor chooser for Q/R/B/N.
+        moving = sideOf(moving) .. "Q"
+        setPiece(toFile, toRank, moving)
+        promotionText = " Pawn promoted to Queen."
+    end
+
+    lastMove = moving .. " " .. squareName(fromFile, fromRank) .. " -> " .. squareName(toFile, toRank)
+    if captured then
+        if move.enPassant then
+            lastMove = lastMove .. " en passant captures " .. captured
+        else
+            lastMove = lastMove .. " captures " .. captured
+        end
+    elseif move.castle == "K" then
+        lastMove = lastMove .. " castles king-side"
+    elseif move.castle == "Q" then
+        lastMove = lastMove .. " castles queen-side"
+    end
+
+    currentTurn = opposite(currentTurn)
+    clearSelection()
+
+    local turnName = (currentTurn == "w") and "White" or "Black"
+    local justMovedName = (sideOf(moving) == "w") and "White" or "Black"
+
+    if captured and kindOf(captured) == "K" then
+        gameOver = true
+        statusMessage = justMovedName .. " wins by capturing the king."
+        return true
+    end
+
+    if inCheck(currentTurn) then
+        if not hasAnyLegalMove(currentTurn) then
+            gameOver = true
+            statusMessage = "Checkmate. " .. justMovedName .. " wins." .. (promotionText or "")
+        else
+            statusMessage = turnName .. " is in check." .. (promotionText or "")
+        end
+    else
+        if not hasAnyLegalMove(currentTurn) then
+            gameOver = true
+            statusMessage = "Stalemate. Draw." .. (promotionText or "")
+        else
+            statusMessage = turnName .. " to move." .. (promotionText or "")
+        end
+    end
+
+    return true
+end
+
+local function handleSquareTap(file, rank)
+    if boardBusy then
+        statusMessage = "Board busy. Wait for mob movement/reset."
+        return
+    end
+    if gameOver then
+        statusMessage = "Game over. Press RESET to start again."
+        return
+    end
+
+    local piece = getPiece(file, rank)
+
+    if not selected then
+        if not piece then
+            statusMessage = "No piece on " .. squareName(file, rank) .. "."
+            return
+        end
+        if sideOf(piece) ~= currentTurn then
+            statusMessage = "That is not " .. ((currentTurn == "w") and "White's" or "Black's") .. " piece."
+            return
+        end
+        selected = { file = file, rank = rank }
+        legalMoves = getLegalMoves(file, rank)
+        statusMessage = "Selected " .. piece .. " at " .. squareName(file, rank) .. "."
+        if #legalMoves == 0 then statusMessage = statusMessage .. " No legal moves." end
+        return
+    end
+
+    if selected.file == file and selected.rank == rank then
+        clearSelection()
+        statusMessage = "Selection cleared."
+        return
+    end
+
+    if piece and sideOf(piece) == currentTurn then
+        selected = { file = file, rank = rank }
+        legalMoves = getLegalMoves(file, rank)
+        statusMessage = "Selected " .. piece .. " at " .. squareName(file, rank) .. "."
+        if #legalMoves == 0 then statusMessage = statusMessage .. " No legal moves." end
+        return
+    end
+
+    local chosenMove = findMove(legalMoves, file, rank)
+    if chosenMove then
+        movePiece(selected.file, selected.rank, file, rank, chosenMove)
+    else
+        statusMessage = "Invalid destination for selected piece."
+    end
+end
+
+resetGame()
+redraw()
+
+while true do
+    local event, side, x, y = os.pullEvent()
+
+    if event == "monitor_touch" then
+        local btn = panelButton(x, y)
+        if btn == "reset" then
+            resetGame()
+        elseif btn == "clear" then
+            clearSelection()
+            statusMessage = "Selection cleared."
+        else
+            local file, rank = screenToSquare(x, y)
+            if file and rank then handleSquareTap(file, rank) end
+        end
+        redraw()
+
+    elseif event == "monitor_resize" then
+        mon.setTextScale(0.5)
+        W, H = mon.getSize()
+        redraw()
+    end
+end
