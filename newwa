@@ -1,0 +1,418 @@
+-- wizard_chess_pawn_agent_a2_v1.lua
+-- First-edition mob/NI agent for the bottom-left pawn.
+--
+-- Goal:
+--   1. Boot on a mob wearing a Neural Interface.
+--   2. Try to disable/suppress mob AI.
+--   3. Sense the reference boat sitting at A1 / file 1 rank 1.
+--   4. Move this pawn to A2 / file 1 rank 2.
+--   5. Hold itself there and keep correcting if pushed.
+--   6. Face positive Z if a usable facing method exists.
+--
+-- Assumptions:
+--   - Board square size = 2 blocks.
+--   - Boat is exactly at the A1 reference point for X/Z.
+--   - Board coordinates are rotated 90 degrees clockwise in world-relative space:
+--       rank +1 means X -2 from the boat/A1 reference
+--       file +1 means Z -2 from the boat/A1 reference
+--   - Boat is 2 blocks lower than the pieces, with TARGET_Y_EXTRA_UP added after testing.
+--   - This pawn should occupy A2.
+--
+-- NOTE:
+-- This is deliberately defensive because Plethora/NI method names can vary.
+-- Run it and check printed errors if kinetic/AI methods need to be adjusted.
+
+-- =========================================================
+-- Config
+-- =========================================================
+
+local PIECE_ID = os.getComputerLabel() or "W_PAWN_A"
+local PIECE_KIND = "pawn"
+local PIECE_SIDE = "white"
+
+local MODEM_SIDE = "front"
+local PROTOCOL = "wizard_chess"
+
+local SENSE_RANGE = 24
+local BOAT_NAME_CONTAINS = "boat"
+
+local SQUARE_SIZE = 2
+
+-- Boat is A1 / file 1 rank 1.
+local TARGET_FILE = 1
+local TARGET_RANK = 2
+local TARGET_SQUARE = "A2"
+
+-- Boat is one block below the floor, and floor is one block below pieces.
+-- So the piece target is about boat.y + 2.
+local PIECE_Y_ABOVE_BOAT = 2.0
+
+local HOLD_TOLERANCE = 0.20
+local FACE_TOLERANCE = 0.65
+
+-- Very quick checks, but much slower/softer movement.
+-- This keeps it from rocketing past the target.
+local LOOP_DELAY = 0.03
+local BOAT_RESCAN_SECONDS = 0.75
+local STATUS_SECONDS = 1.0
+
+-- Kinetic tuning.
+-- Slow movement: much smaller launch pulses.
+local MIN_LAUNCH_POWER = 0.012
+local MAX_LAUNCH_POWER = 0.105
+local POWER_PER_BLOCK = 0.035
+
+-- The current sensed Y delta was getting stuck around 1.14.
+-- Add this to the target Y so Y error stops dominating the distance.
+local TARGET_Y_EXTRA_UP = 1.14
+
+-- Ignore Y in the "are we close enough?" check and movement vector.
+-- The pawn will aim horizontally to the square and keep Y as a soft bias only.
+local IGNORE_Y_FOR_DISTANCE = true
+
+local KEEP_SUPPRESSING_AI = true
+
+-- Recovery chest notes for the matching controller/recovery layer.
+-- You said 434 is now 436, and 437 is a manual-deposit recovery chest.
+local RECOVERY_CHESTS = {
+    "minecraft:chest_432",
+    "minecraft:chest_433",
+    "minecraft:chest_435",
+    "minecraft:chest_436",
+    "minecraft:chest_437", -- manual deposit if black-hole pickup misses the NI
+}
+
+-- =========================================================
+-- Setup
+-- =========================================================
+
+local ni = peripheral.find("neuralInterface")
+if not ni then error("Neural Interface not found") end
+
+local function tryOpenRednet()
+    if not rednet then return false end
+
+    if peripheral.getType(MODEM_SIDE) == "modem" then
+        if not rednet.isOpen(MODEM_SIDE) then
+            pcall(rednet.open, MODEM_SIDE)
+        end
+        return rednet.isOpen(MODEM_SIDE)
+    end
+
+    for _, name in ipairs(peripheral.getNames()) do
+        if peripheral.getType(name) == "modem" then
+            if not rednet.isOpen(name) then pcall(rednet.open, name) end
+            if rednet.isOpen(name) then
+                MODEM_SIDE = name
+                return true
+            end
+        end
+    end
+
+    return false
+end
+
+local rednetReady = tryOpenRednet()
+
+local function broadcast(msg)
+    if not rednetReady then rednetReady = tryOpenRednet() end
+    if rednetReady then
+        msg.pieceId = PIECE_ID
+        msg.side = PIECE_SIDE
+        msg.kind = PIECE_KIND
+        msg.time = os.clock()
+        pcall(rednet.broadcast, msg, PROTOCOL)
+    end
+end
+
+-- =========================================================
+-- Utility
+-- =========================================================
+
+local function lower(s)
+    return tostring(s or ""):lower()
+end
+
+local function cleanName(e)
+    local n = tostring((e and (e.displayName or e.name)) or "")
+    n = n:gsub("§.", "")
+    return n
+end
+
+local function dist3(x, y, z)
+    return math.sqrt(x * x + y * y + z * z)
+end
+
+local function clamp(v, lo, hi)
+    if v < lo then return lo end
+    if v > hi then return hi end
+    return v
+end
+
+local function vectorToYawPitch(x, y, z)
+    -- Minecraft-ish yaw/pitch guess.
+    -- If movement goes the wrong way, swap/negate yaw in here first.
+    local horizontal = math.sqrt(x * x + z * z)
+    local yaw = math.deg(math.atan2(-x, z))
+    local pitch = -math.deg(math.atan2(y, horizontal))
+    return yaw, pitch
+end
+
+local function callIfExists(obj, name, ...)
+    if type(obj) == "table" and type(obj[name]) == "function" then
+        return pcall(obj[name], ...)
+    end
+    return false, "missing " .. tostring(name)
+end
+
+-- =========================================================
+-- AI suppression / facing
+-- =========================================================
+
+local function suppressAI()
+    -- Defensive method guesses across Plethora/guardian variants.
+    -- Nonexistent methods are ignored.
+    local attempts = {
+        function() return callIfExists(ni, "disableAI") end,
+        function() return callIfExists(ni, "setAI", false) end,
+        function() return callIfExists(ni, "setNoAI", true) end,
+        function() return callIfExists(ni, "setMobAI", false) end,
+        function() return callIfExists(ni, "setEntityAI", false) end,
+        function() return callIfExists(ni, "clearTarget") end,
+        function() return callIfExists(ni, "setTarget", nil) end,
+    }
+
+    local worked = false
+    for _, fn in ipairs(attempts) do
+        local ok = fn()
+        if ok then worked = true end
+    end
+    return worked
+end
+
+local function facePositiveZ()
+    -- If no facing method exists, this just does nothing safely.
+    local attempts = {
+        function() return callIfExists(ni, "look", 0, 0) end,
+        function() return callIfExists(ni, "setYaw", 0) end,
+        function() return callIfExists(ni, "face", 0, 0, 1) end,
+        function() return callIfExists(ni, "lookAt", 0, 0, 10) end,
+    }
+
+    for _, fn in ipairs(attempts) do
+        local ok = fn()
+        if ok then return true end
+    end
+    return false
+end
+
+-- =========================================================
+-- Boat sensing and target calculation
+-- =========================================================
+
+local lastBoat = nil
+local lastBoatScan = -999
+
+local function findReferenceBoat()
+    local ok, entities = pcall(function()
+        return ni.sense(SENSE_RANGE)
+    end)
+
+    if not ok or type(entities) ~= "table" then
+        return nil, "sense failed"
+    end
+
+    local best = nil
+    local bestDist = 999999
+
+    for _, e in ipairs(entities) do
+        local display = lower(cleanName(e))
+        local internal = lower(e.name or "")
+
+        if display:find(BOAT_NAME_CONTAINS, 1, true) or internal:find(BOAT_NAME_CONTAINS, 1, true) then
+            local x = tonumber(e.x) or 0
+            local y = tonumber(e.y) or 0
+            local z = tonumber(e.z) or 0
+            local d = dist3(x, y, z)
+
+            if d < bestDist then
+                best = {
+                    x = x,
+                    y = y,
+                    z = z,
+                    name = cleanName(e),
+                    dist = d,
+                }
+                bestDist = d
+            end
+        end
+    end
+
+    if not best then
+        return nil, "no boat found"
+    end
+
+    return best
+end
+
+local function getBoat()
+    local now = os.clock()
+
+    if lastBoat and now - lastBoatScan < BOAT_RESCAN_SECONDS then
+        return lastBoat
+    end
+
+    local boat, err = findReferenceBoat()
+    lastBoatScan = now
+
+    if boat then
+        lastBoat = boat
+        return boat
+    end
+
+    return nil, err
+end
+
+local function targetRelativeFromBoat(boat)
+    -- Boat is A1 / 1,1.
+    --
+    -- Your physical board is rotated 90 degrees clockwise relative to the
+    -- original assumed world axes:
+    --   chess 1,2 / A2 = -2 X from A1
+    --   chess 2,1 / B1 = -2 Z from A1
+    --
+    -- So:
+    --   rank offset affects world X negatively
+    --   file offset affects world Z negatively
+    local worldXOffset = -((TARGET_RANK - 1) * SQUARE_SIZE)
+    local worldZOffset = -((TARGET_FILE - 1) * SQUARE_SIZE)
+
+    return {
+        x = boat.x + worldXOffset,
+        y = boat.y + PIECE_Y_ABOVE_BOAT + TARGET_Y_EXTRA_UP,
+        z = boat.z + worldZOffset,
+    }
+end
+
+-- =========================================================
+-- Kinetic movement
+-- =========================================================
+
+local function launchToward(vec)
+    local d = dist3(vec.x, vec.y, vec.z)
+
+    if d < HOLD_TOLERANCE then
+        return true, "already centered"
+    end
+
+    local yaw, pitch = vectorToYawPitch(vec.x, vec.y, vec.z)
+    local power = clamp(d * POWER_PER_BLOCK, MIN_LAUNCH_POWER, MAX_LAUNCH_POWER)
+
+    -- Try common kinetic augment signatures.
+    local attempts = {
+        function() return callIfExists(ni, "launch", yaw, pitch, power) end,
+        function() return callIfExists(ni, "launch", power, yaw, pitch) end,
+        function() return callIfExists(ni, "launch", {yaw = yaw, pitch = pitch, power = power}) end,
+        function() return callIfExists(ni, "kinetic", yaw, pitch, power) end,
+        function() return callIfExists(ni, "move", vec.x, vec.y, vec.z, power) end,
+    }
+
+    local lastErr = nil
+    for _, fn in ipairs(attempts) do
+        local ok, err = fn()
+        if ok then return true end
+        lastErr = err
+    end
+
+    return false, tostring(lastErr or "no kinetic launch method worked")
+end
+
+local function holdTarget()
+    local boat, err = getBoat()
+    if not boat then
+        return false, err or "missing boat"
+    end
+
+    local target = targetRelativeFromBoat(boat)
+
+    -- NI sense coordinates are relative to the mob/piece.
+    -- So target.x/y/z are also relative offsets from current piece to desired target.
+    -- For board holding, horizontal X/Z error matters. Y is ignored for close-enough
+    -- so it does not get stuck correcting vertical offset forever.
+    local horizontalD = math.sqrt(target.x * target.x + target.z * target.z)
+    local fullD = dist3(target.x, target.y, target.z)
+
+    if horizontalD > HOLD_TOLERANCE then
+        local moveVec = {
+            x = target.x,
+            y = IGNORE_Y_FOR_DISTANCE and 0 or target.y,
+            z = target.z,
+        }
+
+        local ok, moveErr = launchToward(moveVec)
+        if not ok then return false, moveErr end
+    end
+
+    if horizontalD <= HOLD_TOLERANCE then
+        -- We are close enough horizontally; do not keep nudging and overshooting.
+        facePositiveZ()
+    elseif horizontalD < FACE_TOLERANCE then
+        facePositiveZ()
+    end
+
+    return true, ("delta x=%.2f y=%.2f z=%.2f h=%.2f full=%.2f"):format(
+        target.x, target.y, target.z, horizontalD, fullD
+    )
+end
+
+-- =========================================================
+-- Main loop
+-- =========================================================
+
+print("Wizard Chess pawn agent starting.")
+print("Piece:", PIECE_ID)
+print("Target:", TARGET_SQUARE, "file", TARGET_FILE, "rank", TARGET_RANK)
+print("Reference: nearest boat = A1.")
+print("Square size:", SQUARE_SIZE)
+print("Piece Y above boat:", PIECE_Y_ABOVE_BOAT)
+print("Extra target Y up:", TARGET_Y_EXTRA_UP)
+print("Coord map: rank +1 => X -2, file +1 => Z -2")
+print("Hold tolerance:", HOLD_TOLERANCE)
+print("Loop delay:", LOOP_DELAY)
+print("Rednet:", rednetReady and ("open on " .. MODEM_SIDE) or "not open")
+
+broadcast({
+    type = "piece_hello",
+    targetFile = TARGET_FILE,
+    targetRank = TARGET_RANK,
+    targetSquare = TARGET_SQUARE,
+    message = "pawn agent booted",
+})
+
+local lastStatus = 0
+local lastAiSuppress = 0
+
+while true do
+    local now = os.clock()
+
+    if KEEP_SUPPRESSING_AI or now - lastAiSuppress > 5 then
+        suppressAI()
+        lastAiSuppress = now
+    end
+
+    local ok, msg = holdTarget()
+
+    if now - lastStatus >= STATUS_SECONDS then
+        lastStatus = now
+        print((ok and "OK " or "WAIT ") .. tostring(msg))
+        broadcast({
+            type = "piece_status",
+            state = ok and "HOLDING_A2" or "WAITING",
+            ok = ok,
+            detail = msg,
+            targetSquare = TARGET_SQUARE,
+        })
+    end
+
+    sleep(LOOP_DELAY)
+end
