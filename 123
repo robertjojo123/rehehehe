@@ -1,0 +1,379 @@
+-- wizard_chess_particle_turtle_v1.lua
+-- Runs on particle turtle computer / turtle_426 / rednet ID 10375.
+--
+-- Purpose:
+--   Spawn white/black particle effects from living chess mobs so teams are readable.
+--
+-- Hardware:
+--   - Ender/wired modem for rednet.
+--   - Onboard particle module.
+--   - Entity sensor/manipulator peripheral: manipulator_44.
+--
+-- Floor computer:
+--   ID 8898
+--
+-- Protocol:
+--   wizard_chess
+
+local FLOOR_COMPUTER_ID = 8898
+local PARTICLE_TURTLE_ID = 10375
+local PROTOCOL = "wizard_chess"
+
+-- Modem layout:
+--   front = wired modem for floor/controller computer
+--   right = wireless/ender modem for talking with mob NIs
+local WIRED_MODEM_SIDE = "front"
+local WIRELESS_MODEM_SIDE = "right"
+
+local MANIPULATOR_NAME = "manipulator_44"
+
+-- User said the sensor returns positions from a manipulator sitting -1x and +1z of turtle.
+local SENSOR_OFFSET_X = -1
+local SENSOR_OFFSET_Y = 0
+local SENSOR_OFFSET_Z = 1
+
+local SENSE_RANGE = 48
+local BOAT_NAME_CONTAINS = "boat"
+
+local SQUARE_SIZE = 2
+local PIECE_Y_ABOVE_BOAT = 2.0
+local TARGET_Y_EXTRA_UP = 1.14
+
+local LOOP_DELAY = 0.20
+local REGISTRY_REBROADCAST_SECONDS = 4.0
+local PIECE_IDENTITY_QUERY_SECONDS = 5.0
+
+-- Particle config. Particle peripheral APIs vary, so calls are defensive.
+local WHITE_PARTICLE = "cloud"
+local BLACK_PARTICLE = "smoke"
+local PARTICLES_PER_PIECE = 2
+local PARTICLE_SPREAD = 0.18
+local MATCH_RADIUS = 1.45
+
+local active = false
+local pieceRegistry = {}
+local pieceState = {}
+local lastRegistryAsk = 0
+
+local manipulator = peripheral.wrap(MANIPULATOR_NAME)
+if not manipulator then
+    print("WARNING: missing " .. MANIPULATOR_NAME)
+end
+
+local particle = nil
+for _, name in ipairs(peripheral.getNames()) do
+    local p = peripheral.wrap(name)
+    if p and (p.spawn or p.spawnParticle or p.addParticle or p.particle) then
+        particle = p
+        print("Using particle peripheral:", name, peripheral.getType(name))
+        break
+    end
+end
+
+if not particle then
+    print("WARNING: no particle peripheral found by method scan.")
+end
+
+local function openRednetSides()
+    if not rednet then return false end
+
+    local okAny = false
+
+    if peripheral.getType(WIRED_MODEM_SIDE) == "modem" then
+        if not rednet.isOpen(WIRED_MODEM_SIDE) then pcall(rednet.open, WIRED_MODEM_SIDE) end
+        okAny = rednet.isOpen(WIRED_MODEM_SIDE) or okAny
+    else
+        print("WARNING: wired modem not found on " .. WIRED_MODEM_SIDE)
+    end
+
+    if peripheral.getType(WIRELESS_MODEM_SIDE) == "modem" then
+        if not rednet.isOpen(WIRELESS_MODEM_SIDE) then pcall(rednet.open, WIRELESS_MODEM_SIDE) end
+        okAny = rednet.isOpen(WIRELESS_MODEM_SIDE) or okAny
+    else
+        print("WARNING: wireless/ender modem not found on " .. WIRELESS_MODEM_SIDE)
+    end
+
+    print("Rednet front/wired:", rednet.isOpen(WIRED_MODEM_SIDE) and "OPEN" or "OFF")
+    print("Rednet right/wireless:", rednet.isOpen(WIRELESS_MODEM_SIDE) and "OPEN" or "OFF")
+
+    return okAny
+end
+
+local rednetReady = openRednetSides()
+
+local function sendFloor(msg)
+    if rednetReady then
+        msg.fromParticleTurtle = os.getComputerID()
+        msg.time = os.clock()
+        pcall(rednet.send, FLOOR_COMPUTER_ID, msg, PROTOCOL)
+    end
+end
+
+local function lower(s) return tostring(s or ""):lower() end
+
+local function cleanName(e)
+    local n = tostring((e and (e.displayName or e.name)) or "")
+    n = n:gsub("§.", "")
+    return n
+end
+
+local function dist3(x, y, z)
+    return math.sqrt(x*x + y*y + z*z)
+end
+
+local function squareToFileRank(square)
+    square = tostring(square or ""):upper()
+    local fch = square:sub(1,1)
+    local rank = tonumber(square:sub(2,2))
+    local files = {A=1,B=2,C=3,D=4,E=5,F=6,G=7,H=8}
+    return files[fch], rank
+end
+
+local function senseEntities()
+    if not manipulator then
+        manipulator = peripheral.wrap(MANIPULATOR_NAME)
+    end
+    if not manipulator then return {} end
+
+    local attempts = {
+        function() return manipulator.sense(SENSE_RANGE) end,
+        function() return manipulator.sense() end,
+        function() return manipulator.getEntities(SENSE_RANGE) end,
+        function() return manipulator.scan(SENSE_RANGE) end,
+    }
+
+    for _, fn in ipairs(attempts) do
+        local ok, entities = pcall(fn)
+        if ok and type(entities) == "table" then return entities end
+    end
+    return {}
+end
+
+local function findBoat(entities)
+    local best, bestD = nil, 999999
+    for _, e in ipairs(entities) do
+        local display = lower(cleanName(e))
+        local internal = lower(e.name or "")
+        if display:find(BOAT_NAME_CONTAINS, 1, true) or internal:find(BOAT_NAME_CONTAINS, 1, true) then
+            local x = (tonumber(e.x) or 0) + SENSOR_OFFSET_X
+            local y = (tonumber(e.y) or 0) + SENSOR_OFFSET_Y
+            local z = (tonumber(e.z) or 0) + SENSOR_OFFSET_Z
+            local d = dist3(x,y,z)
+            if d < bestD then
+                best = {x=x,y=y,z=z,name=cleanName(e)}
+                bestD = d
+            end
+        end
+    end
+    return best
+end
+
+local function targetPosFromBoat(boat, square)
+    local file, rank = squareToFileRank(square)
+    if not file or not rank then return nil end
+
+    -- Same rotated board coordinate map as the NIs:
+    -- rank +1 => X -2
+    -- file +1 => Z -2
+    return {
+        x = boat.x - ((rank - 1) * SQUARE_SIZE),
+        y = boat.y + PIECE_Y_ABOVE_BOAT + TARGET_Y_EXTRA_UP,
+        z = boat.z - ((file - 1) * SQUARE_SIZE),
+    }
+end
+
+local function findEntityNearTarget(entities, target)
+    if not target then return nil end
+
+    local best, bestD = nil, 999999
+    for _, e in ipairs(entities) do
+        local name = lower(cleanName(e))
+        local internal = lower(e.name or "")
+        local isBad =
+            name:find("boat",1,true) or internal:find("boat",1,true) or
+            name:find("item",1,true) or internal:find("item",1,true) or
+            name:find("xp",1,true) or internal:find("xp",1,true)
+
+        if not isBad then
+            local x = (tonumber(e.x) or 0) + SENSOR_OFFSET_X
+            local y = (tonumber(e.y) or 0) + SENSOR_OFFSET_Y
+            local z = (tonumber(e.z) or 0) + SENSOR_OFFSET_Z
+            local d = dist3(x - target.x, y - target.y, z - target.z)
+            if d < bestD and d <= MATCH_RADIUS then
+                best = {x=x,y=y,z=z,name=cleanName(e),raw=e}
+                bestD = d
+            end
+        end
+    end
+
+    return best, bestD
+end
+
+local function spawnParticle(name, x, y, z)
+    if not particle then return false end
+
+    local attempts = {
+        function() return particle.spawnParticle(name, x, y, z, 0, 0.02, 0, PARTICLE_SPREAD, 1) end,
+        function() return particle.spawn(name, x, y, z, 0, 0.02, 0, PARTICLE_SPREAD, 1) end,
+        function() return particle.addParticle(name, x, y, z, 0, 0.02, 0) end,
+        function() return particle.particle(name, x, y, z) end,
+        function() return particle.spawnParticle({name=name, x=x, y=y, z=z, count=1, spread=PARTICLE_SPREAD}) end,
+    }
+
+    for _, fn in ipairs(attempts) do
+        local ok = pcall(fn)
+        if ok then return true end
+    end
+    return false
+end
+
+local function particleForSide(side)
+    if side == "w" or side == "white" then return WHITE_PARTICLE end
+    if side == "b" or side == "black" then return BLACK_PARTICLE end
+    return "cloud"
+end
+
+local function handlePacket(sender, msg)
+    if type(msg) ~= "table" then return end
+
+    -- Piece identity replies come wirelessly from the NIs.
+    if msg.type == "piece_particle_identity" then
+        local id = msg.pieceId
+        if id then
+            pieceState[id] = pieceState[id] or {}
+            pieceState[id].square = msg.square or msg.targetSquare or pieceState[id].square
+            pieceState[id].side = msg.side or pieceState[id].side
+            pieceState[id].active = msg.active ~= false
+            pieceState[id].label = msg.label or pieceState[id].label
+            pieceState[id].computerId = msg.computerId or sender
+        end
+        return
+    end
+
+    -- All control packets should come from the floor/controller.
+    if sender ~= FLOOR_COMPUTER_ID and msg.controllerId ~= FLOOR_COMPUTER_ID then return end
+
+    if msg.type == "particle_registry" and type(msg.pieces) == "table" then
+        pieceRegistry = msg.pieces
+        for id, p in pairs(pieceRegistry) do
+            pieceState[id] = pieceState[id] or {
+                square = p.start,
+                side = p.side,
+                active = true,
+            }
+            pieceState[id].side = p.side or pieceState[id].side
+            pieceState[id].square = pieceState[id].square or p.start
+        end
+        print("Registry received")
+        sendFloor({type="particle_turtle_registry_ok"})
+
+    elseif msg.type == "particle_start_game" then
+        active = true
+        for id, p in pairs(pieceRegistry) do
+            pieceState[id] = pieceState[id] or {}
+            pieceState[id].active = true
+            pieceState[id].square = p.start or pieceState[id].square
+            pieceState[id].side = p.side or pieceState[id].side
+        end
+        print("Particle effects START")
+        sendFloor({type="particle_turtle_started"})
+
+    elseif msg.type == "particle_piece_update" or msg.type == "piece_particle_identity" then
+        local id = msg.pieceId
+        if id then
+            pieceState[id] = pieceState[id] or {}
+            pieceState[id].square = msg.square or msg.targetSquare or pieceState[id].square
+            pieceState[id].side = msg.side or pieceState[id].side
+            pieceState[id].active = msg.active ~= false
+            pieceState[id].label = msg.label or pieceState[id].label
+            pieceState[id].computerId = msg.computerId or pieceState[id].computerId
+        end
+
+    elseif msg.type == "particle_piece_captured" then
+        local id = msg.pieceId
+        if id and pieceState[id] then
+            pieceState[id].active = false
+        end
+
+    elseif msg.type == "particle_clear" then
+        active = false
+        for id in pairs(pieceState) do pieceState[id].active = false end
+        print("Particle effects CLEAR")
+    end
+end
+
+local function rednetLoop()
+    while true do
+        if not rednetReady then
+            rednetReady = openRednetSides()
+            sleep(1)
+        else
+            local sender, msg = rednet.receive(PROTOCOL, 0.10)
+            if sender then handlePacket(sender, msg) end
+        end
+    end
+end
+
+local function pieceQueryLoop()
+    while true do
+        if rednetReady then
+            rednet.broadcast({
+                type = "particle_identity_query",
+                fromParticleTurtle = PARTICLE_TURTLE_ID,
+            }, PROTOCOL)
+        end
+        sleep(PIECE_IDENTITY_QUERY_SECONDS)
+    end
+end
+
+local function particleLoop()
+    while true do
+        if active then
+            local entities = senseEntities()
+            local boat = findBoat(entities)
+
+            if boat then
+                local spawned = 0
+
+                for id, st in pairs(pieceState) do
+                    if st.active and st.square then
+                        local target = targetPosFromBoat(boat, st.square)
+                        local ent = findEntityNearTarget(entities, target)
+                        local reg = pieceRegistry[id]
+                        local side = st.side or (reg and reg.side)
+                        local pname = particleForSide(side)
+
+                        if ent then
+                            for i = 1, PARTICLES_PER_PIECE do
+                                spawnParticle(pname, ent.x, ent.y + 0.7, ent.z)
+                                spawned = spawned + 1
+                            end
+                        end
+                    end
+                end
+
+                if spawned == 0 and os.clock() - lastRegistryAsk > REGISTRY_REBROADCAST_SECONDS then
+                    lastRegistryAsk = os.clock()
+                    sendFloor({type="particle_turtle_need_updates", message="no matched entities"})
+                end
+            elseif os.clock() - lastRegistryAsk > REGISTRY_REBROADCAST_SECONDS then
+                lastRegistryAsk = os.clock()
+                sendFloor({type="particle_turtle_no_boat", message="reference boat not found"})
+            end
+        end
+
+        sleep(LOOP_DELAY)
+    end
+end
+
+print("Wizard Chess particle turtle starting.")
+print("Computer ID:", os.getComputerID())
+print("Manipulator:", MANIPULATOR_NAME)
+print("Floor:", FLOOR_COMPUTER_ID)
+print("Wired modem:", WIRED_MODEM_SIDE)
+print("Wireless modem:", WIRELESS_MODEM_SIDE)
+print("Offsets:", SENSOR_OFFSET_X, SENSOR_OFFSET_Y, SENSOR_OFFSET_Z)
+
+sendFloor({type="particle_turtle_hello", message="online"})
+
+parallel.waitForAny(rednetLoop, pieceQueryLoop, particleLoop)
