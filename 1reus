@@ -1,0 +1,748 @@
+-- wizard_chess_piece_agent_reusable_v7.lua
+-- Reusable Wizard Chess NI/mob agent for all mapped pieces.
+--
+-- Labels / IDs:
+--   White pawns: wp1..wp8 = 10342..10349
+--   Black pawns: bp1..bp8 = 10350..10357
+--   White back row: wr1, wn1, wb1, wq, wk, wb2, wn2, wr2 = 10358..10365
+--   Black back row: br1, bn1, bb1, bk, bq, bb2, bn2, br2 = 10366..10373
+--
+-- Main flow:
+--   floor monitor selects/moves piece
+--   floor computer 8898 validates chess move
+--   floor sends direct rednet packet to this NI
+--   this NI updates current board coord and walks/holds there
+--   if action/capture says attack, it fires/attacks first, then moves
+--
+-- Coordinate map:
+--   reference boat = A1
+--   rank +1 => world X -2
+--   file +1 => world Z -2
+--   board square size = 2 blocks
+
+-- =========================================================
+-- Config
+-- =========================================================
+
+local FLOOR_COMPUTER_ID = 8898
+local MODEM_SIDE = "front"
+local PROTOCOL = "wizard_chess"
+
+local SENSE_RANGE = 24
+local BOAT_NAME_CONTAINS = "boat"
+
+local SQUARE_SIZE = 2
+local PIECE_Y_ABOVE_BOAT = 2.0
+local TARGET_Y_EXTRA_UP = 1.14
+
+local HOLD_TOLERANCE = 0.20
+local FACE_TOLERANCE = 0.65
+
+-- One Minecraft tick. Do not set below 0.05.
+local LOOP_DELAY = 0.05
+local BOAT_RESCAN_SECONDS = 0.75
+local STATUS_SECONDS = 1.0
+local REDNET_TIMEOUT = 0.05
+
+-- Slow movement pulses.
+local MIN_LAUNCH_POWER = 0.012
+local MAX_LAUNCH_POWER = 0.105
+local POWER_PER_BLOCK = 0.035
+
+local KEEP_SUPPRESSING_AI = true
+
+-- Attack tuning.
+-- Full-potency capture behavior. Increase pulses if mobs survive.
+local ATTACK_PULSES = 8
+local ATTACK_PULSE_DELAY = 0.10
+local ATTACK_SENSE_RANGE = 6
+local LASER_FULL_POWER = 5
+
+-- Capture aiming:
+-- The floor sends targetRelX/Z from this piece's current square to the destination square.
+-- We wait until the intended target square is close enough and only fire if an entity is
+-- near that intended line/square, instead of blindly firing at nearest entity.
+local ATTACK_LOS_RANGE = 7.0
+local ATTACK_ENTITY_RADIUS_AT_TARGET = 1.35
+local ATTACK_LINE_WIDTH = 0.75
+local ATTACK_APPROACH_DISTANCE = 2.35
+local ATTACK_WAIT_TIMEOUT = 6.0
+
+local FILES = {"A","B","C","D","E","F","G","H"}
+
+local PIECE_BY_LABEL = {
+    -- White pawns, left-to-right for White: A..H
+    wp1 = {pieceId="W_PAWN_A", side="white", kind="pawn", file=1, rank=2, square="A2"},
+    wp2 = {pieceId="W_PAWN_B", side="white", kind="pawn", file=2, rank=2, square="B2"},
+    wp3 = {pieceId="W_PAWN_C", side="white", kind="pawn", file=3, rank=2, square="C2"},
+    wp4 = {pieceId="W_PAWN_D", side="white", kind="pawn", file=4, rank=2, square="D2"},
+    wp5 = {pieceId="W_PAWN_E", side="white", kind="pawn", file=5, rank=2, square="E2"},
+    wp6 = {pieceId="W_PAWN_F", side="white", kind="pawn", file=6, rank=2, square="F2"},
+    wp7 = {pieceId="W_PAWN_G", side="white", kind="pawn", file=7, rank=2, square="G2"},
+    wp8 = {pieceId="W_PAWN_H", side="white", kind="pawn", file=8, rank=2, square="H2"},
+
+    -- Black pawns, left-to-right for Black: H..A
+    bp1 = {pieceId="B_PAWN_H", side="black", kind="pawn", file=8, rank=7, square="H7"},
+    bp2 = {pieceId="B_PAWN_G", side="black", kind="pawn", file=7, rank=7, square="G7"},
+    bp3 = {pieceId="B_PAWN_F", side="black", kind="pawn", file=6, rank=7, square="F7"},
+    bp4 = {pieceId="B_PAWN_E", side="black", kind="pawn", file=5, rank=7, square="E7"},
+    bp5 = {pieceId="B_PAWN_D", side="black", kind="pawn", file=4, rank=7, square="D7"},
+    bp6 = {pieceId="B_PAWN_C", side="black", kind="pawn", file=3, rank=7, square="C7"},
+    bp7 = {pieceId="B_PAWN_B", side="black", kind="pawn", file=2, rank=7, square="B7"},
+    bp8 = {pieceId="B_PAWN_A", side="black", kind="pawn", file=1, rank=7, square="A7"},
+
+    -- White back row
+    wr1 = {pieceId="W_ROOK_A", side="white", kind="rook", file=1, rank=1, square="A1"},
+    wn1 = {pieceId="W_KNIGHT_B", side="white", kind="knight", file=2, rank=1, square="B1"},
+    wb1 = {pieceId="W_BISHOP_C", side="white", kind="bishop", file=3, rank=1, square="C1"},
+    wq  = {pieceId="W_QUEEN", side="white", kind="queen", file=4, rank=1, square="D1"},
+    wk  = {pieceId="W_KING", side="white", kind="king", file=5, rank=1, square="E1"},
+    wb2 = {pieceId="W_BISHOP_F", side="white", kind="bishop", file=6, rank=1, square="F1"},
+    wn2 = {pieceId="W_KNIGHT_G", side="white", kind="knight", file=7, rank=1, square="G1"},
+    wr2 = {pieceId="W_ROOK_H", side="white", kind="rook", file=8, rank=1, square="H1"},
+
+    -- Black back row, left-to-right for Black: H..A
+    br1 = {pieceId="B_ROOK_H", side="black", kind="rook", file=8, rank=8, square="H8"},
+    bn1 = {pieceId="B_KNIGHT_G", side="black", kind="knight", file=7, rank=8, square="G8"},
+    bb1 = {pieceId="B_BISHOP_F", side="black", kind="bishop", file=6, rank=8, square="F8"},
+    bk  = {pieceId="B_KING", side="black", kind="king", file=5, rank=8, square="E8"},
+    bq  = {pieceId="B_QUEEN", side="black", kind="queen", file=4, rank=8, square="D8"},
+    bb2 = {pieceId="B_BISHOP_C", side="black", kind="bishop", file=3, rank=8, square="C8"},
+    bn2 = {pieceId="B_KNIGHT_B", side="black", kind="knight", file=2, rank=8, square="B8"},
+    br2 = {pieceId="B_ROOK_A", side="black", kind="rook", file=1, rank=8, square="A8"},
+}
+
+-- Optional white aliases if you accidentally label the white back pieces without w.
+PIECE_BY_LABEL.r1 = PIECE_BY_LABEL.wr1
+PIECE_BY_LABEL.n1 = PIECE_BY_LABEL.wn1
+PIECE_BY_LABEL.b1 = PIECE_BY_LABEL.wb1
+PIECE_BY_LABEL.q  = PIECE_BY_LABEL.wq
+PIECE_BY_LABEL.k  = PIECE_BY_LABEL.wk
+PIECE_BY_LABEL.b2 = PIECE_BY_LABEL.wb2
+PIECE_BY_LABEL.n2 = PIECE_BY_LABEL.wn2
+PIECE_BY_LABEL.r2 = PIECE_BY_LABEL.wr2
+
+-- =========================================================
+-- Setup / identity
+-- =========================================================
+
+local ni = peripheral.find("neuralInterface")
+if not ni then error("Neural Interface not found") end
+
+local label = tostring(os.getComputerLabel() or ""):lower()
+local identity = PIECE_BY_LABEL[label]
+
+if not identity then
+    error("Unknown piece label '" .. tostring(os.getComputerLabel()) .. "'.")
+end
+
+local PIECE_LABEL = label
+local PIECE_ID = identity.pieceId
+local PIECE_KIND = identity.kind
+local PIECE_SIDE = identity.side
+
+local START_FILE = identity.file
+local START_RANK = identity.rank
+local START_SQUARE = identity.square
+
+local currentFile = START_FILE
+local currentRank = START_RANK
+local currentSquare = START_SQUARE
+
+local pendingCapture = false
+local pendingCapturedPiece = nil
+local pendingTargetVector = nil
+local currentAction = "hold"
+
+local function squareName(file, rank)
+    return (FILES[file] or "?") .. tostring(rank or "?")
+end
+
+local function tryOpenRednet()
+    if not rednet then return false end
+
+    if peripheral.getType(MODEM_SIDE) == "modem" then
+        if not rednet.isOpen(MODEM_SIDE) then pcall(rednet.open, MODEM_SIDE) end
+        return rednet.isOpen(MODEM_SIDE)
+    end
+
+    for _, name in ipairs(peripheral.getNames()) do
+        if peripheral.getType(name) == "modem" then
+            if not rednet.isOpen(name) then pcall(rednet.open, name) end
+            if rednet.isOpen(name) then
+                MODEM_SIDE = name
+                return true
+            end
+        end
+    end
+
+    return false
+end
+
+local rednetReady = tryOpenRednet()
+
+local function sendToController(msg)
+    if not rednetReady then rednetReady = tryOpenRednet() end
+    if rednetReady then
+        msg.pieceId = PIECE_ID
+        msg.label = PIECE_LABEL
+        msg.side = PIECE_SIDE
+        msg.kind = PIECE_KIND
+        msg.computerId = os.getComputerID()
+        msg.time = os.clock()
+        pcall(rednet.send, FLOOR_COMPUTER_ID, msg, PROTOCOL)
+    end
+end
+
+-- =========================================================
+-- Utility
+-- =========================================================
+
+local function lower(s) return tostring(s or ""):lower() end
+
+local function cleanName(e)
+    local n = tostring((e and (e.displayName or e.name)) or "")
+    n = n:gsub("§.", "")
+    return n
+end
+
+local function dist3(x, y, z)
+    return math.sqrt(x * x + y * y + z * z)
+end
+
+local function clamp(v, lo, hi)
+    if v < lo then return lo end
+    if v > hi then return hi end
+    return v
+end
+
+local function vectorToYawPitch(x, y, z)
+    local horizontal = math.sqrt(x * x + z * z)
+    local yaw = math.deg(math.atan2(-x, z))
+    local pitch = -math.deg(math.atan2(y, horizontal))
+    return yaw, pitch
+end
+
+local function callIfExists(obj, name, ...)
+    if type(obj) == "table" and type(obj[name]) == "function" then
+        return pcall(obj[name], ...)
+    end
+    return false, "missing " .. tostring(name)
+end
+
+-- =========================================================
+-- AI suppression / facing / attack
+-- =========================================================
+
+local function suppressAI()
+    local attempts = {
+        function() return callIfExists(ni, "disableAI") end,
+        function() return callIfExists(ni, "setAI", false) end,
+        function() return callIfExists(ni, "setNoAI", true) end,
+        function() return callIfExists(ni, "setMobAI", false) end,
+        function() return callIfExists(ni, "setEntityAI", false) end,
+        function() return callIfExists(ni, "clearTarget") end,
+        function() return callIfExists(ni, "setTarget", nil) end,
+    }
+
+    local worked = false
+    for _, fn in ipairs(attempts) do
+        local ok = fn()
+        if ok then worked = true end
+    end
+    return worked
+end
+
+local function facePositiveZ()
+    local attempts = {
+        function() return callIfExists(ni, "look", 0, 0) end,
+        function() return callIfExists(ni, "setYaw", 0) end,
+        function() return callIfExists(ni, "face", 0, 0, 1) end,
+        function() return callIfExists(ni, "lookAt", 0, 0, 10) end,
+    }
+
+    for _, fn in ipairs(attempts) do
+        local ok = fn()
+        if ok then return true end
+    end
+    return false
+end
+
+
+local function findCaptureTargetEntity()
+    -- Choose an entity near the INTENDED destination square/line, not just the nearest entity.
+    -- This prevents the attacker from firing through or at unrelated nearby pieces.
+    if not pendingTargetVector then return nil, nil, "no target vector" end
+
+    local tx = tonumber(pendingTargetVector.x) or 0
+    local ty = tonumber(pendingTargetVector.y) or 0
+    local tz = tonumber(pendingTargetVector.z) or 0
+
+    local targetDist = math.sqrt(tx * tx + ty * ty + tz * tz)
+    if targetDist < 0.01 then return nil, nil, "target vector too small" end
+
+    local ok, entities = pcall(function()
+        return ni.sense(ATTACK_SENSE_RANGE)
+    end)
+    if not ok or type(entities) ~= "table" then return nil, nil, "sense failed" end
+
+    local ux, uy, uz = tx / targetDist, ty / targetDist, tz / targetDist
+
+    local best, bestScore = nil, 999999
+    local bestDebug = nil
+
+    for _, e in ipairs(entities) do
+        local name = lower(cleanName(e))
+        local internal = lower(e.name or "")
+
+        local isBoat = name:find("boat", 1, true) or internal:find("boat", 1, true)
+        local isItem = name:find("item", 1, true) or internal:find("item", 1, true)
+        local isXp = name:find("xp", 1, true) or internal:find("xp", 1, true)
+
+        if not isBoat and not isItem and not isXp then
+            local ex = tonumber(e.x) or 0
+            local ey = tonumber(e.y) or 0
+            local ez = tonumber(e.z) or 0
+
+            -- Projection of entity onto intended shot line.
+            local along = ex * ux + ey * uy + ez * uz
+
+            -- Perpendicular distance to shot line.
+            local px = ex - ux * along
+            local py = ey - uy * along
+            local pz = ez - uz * along
+            local lineD = math.sqrt(px * px + py * py + pz * pz)
+
+            -- Distance to intended destination point.
+            local destD = math.sqrt((ex - tx)^2 + (ey - ty)^2 + (ez - tz)^2)
+
+            -- Must be in front of us, close to the line, and close to the intended destination.
+            if along > 0
+                and along <= ATTACK_LOS_RANGE
+                and lineD <= ATTACK_LINE_WIDTH
+                and destD <= ATTACK_ENTITY_RADIUS_AT_TARGET then
+
+                -- Score favors closest to intended destination, then closest to line.
+                local score = destD * 10 + lineD
+                if score < bestScore then
+                    best = e
+                    bestScore = score
+                    bestDebug = {
+                        along = along,
+                        lineD = lineD,
+                        destD = destD,
+                        name = cleanName(e),
+                    }
+                end
+            end
+        end
+    end
+
+    if best then
+        return best, bestDebug and bestDebug.destD or nil, bestDebug
+    end
+
+    return nil, nil, "no entity on intended line/target square"
+end
+
+local function tryAttackPulse()
+    -- Fire only along the intended destination line. Entity-aware methods are attempted first,
+    -- then vector/full-power laser methods. If no valid target is lined up, do not fire.
+    local target, dist, debugInfo = findCaptureTargetEntity()
+    if not target then
+        return false, tostring(debugInfo or "no lined-up target")
+    end
+
+    local tx = tonumber(target.x) or 0
+    local ty = tonumber(target.y) or 0
+    local tz = tonumber(target.z) or 0
+
+    local vx = pendingTargetVector and pendingTargetVector.x or tx
+    local vy = pendingTargetVector and pendingTargetVector.y or ty
+    local vz = pendingTargetVector and pendingTargetVector.z or tz
+
+    local attempts = {
+        -- Entity-aware guesses.
+        function() return callIfExists(ni, "attack", target) end,
+        function() return callIfExists(ni, "fire", target, LASER_FULL_POWER) end,
+        function() return callIfExists(ni, "fireLaser", target, LASER_FULL_POWER) end,
+        function() return callIfExists(ni, "laser", target, LASER_FULL_POWER) end,
+
+        -- Vector-aware guesses aimed at actual sensed target.
+        function() return callIfExists(ni, "fire", tx, ty, tz, LASER_FULL_POWER) end,
+        function() return callIfExists(ni, "fireLaser", tx, ty, tz, LASER_FULL_POWER) end,
+        function() return callIfExists(ni, "laser", tx, ty, tz, LASER_FULL_POWER) end,
+        function() return callIfExists(ni, "shoot", tx, ty, tz, LASER_FULL_POWER) end,
+
+        -- Vector-aware guesses aimed at intended square vector.
+        function() return callIfExists(ni, "fire", vx, vy, vz, LASER_FULL_POWER) end,
+        function() return callIfExists(ni, "fireLaser", vx, vy, vz, LASER_FULL_POWER) end,
+        function() return callIfExists(ni, "laser", vx, vy, vz, LASER_FULL_POWER) end,
+        function() return callIfExists(ni, "shoot", vx, vy, vz, LASER_FULL_POWER) end,
+
+        -- Last-resort generic fire/attack, but only after a target is confirmed lined up.
+        function() return callIfExists(ni, "fire", LASER_FULL_POWER) end,
+        function() return callIfExists(ni, "fireLaser", LASER_FULL_POWER) end,
+        function() return callIfExists(ni, "laser", LASER_FULL_POWER) end,
+        function() return callIfExists(ni, "shoot", LASER_FULL_POWER) end,
+        function() return callIfExists(ni, "attack") end,
+    }
+
+    for _, fn in ipairs(attempts) do
+        local ok = fn()
+        if ok then return true end
+    end
+
+    return false, "target lined up, but no laser/attack method worked"
+end
+
+local function performAttackIfNeeded()
+    if not pendingCapture then return end
+
+    currentAction = "attack"
+    print("Attack move: waiting for intended target line. Expected piece:", tostring(pendingCapturedPiece))
+
+    sendToController({
+        type = "piece_attack_aiming",
+        targetSquare = currentSquare,
+        capturedPiece = pendingCapturedPiece,
+        targetVector = pendingTargetVector,
+    })
+
+    local started = os.clock()
+    local target, targetDist, debugInfo = nil, nil, nil
+
+    while os.clock() - started < ATTACK_WAIT_TIMEOUT do
+        target, targetDist, debugInfo = findCaptureTargetEntity()
+        if target then break end
+        sleep(0.10)
+    end
+
+    if not target then
+        print("Attack aborted/no shot: no intended target in line.")
+        sendToController({
+            type = "piece_attack_no_target",
+            capturedPiece = pendingCapturedPiece,
+            detail = tostring(debugInfo or "no lined-up target"),
+        })
+        return
+    end
+
+    print("Attack target lined up:", cleanName(target), "distToTargetSquare:", tostring(targetDist))
+
+    sendToController({
+        type = "piece_attack_started",
+        targetSquare = currentSquare,
+        capturedPiece = pendingCapturedPiece,
+        sawEntity = true,
+        entityDistance = targetDist,
+        detail = type(debugInfo) == "table" and textutils.serialize(debugInfo) or tostring(debugInfo),
+    })
+
+    for i = 1, ATTACK_PULSES do
+        local ok, err = tryAttackPulse()
+        if not ok then
+            print("Attack pulse failed:", tostring(err))
+        end
+        sleep(ATTACK_PULSE_DELAY)
+    end
+
+    sendToController({
+        type = "piece_attack_finished",
+        capturedPiece = pendingCapturedPiece,
+    })
+end
+
+-- =========================================================
+-- Boat sensing and coordinate mapping
+-- =========================================================
+
+local lastBoat = nil
+local lastBoatScan = -999
+
+local function findReferenceBoat()
+    local ok, entities = pcall(function()
+        return ni.sense(SENSE_RANGE)
+    end)
+
+    if not ok or type(entities) ~= "table" then
+        return nil, "sense failed"
+    end
+
+    local best = nil
+    local bestDist = 999999
+
+    for _, e in ipairs(entities) do
+        local display = lower(cleanName(e))
+        local internal = lower(e.name or "")
+
+        if display:find(BOAT_NAME_CONTAINS, 1, true) or internal:find(BOAT_NAME_CONTAINS, 1, true) then
+            local x = tonumber(e.x) or 0
+            local y = tonumber(e.y) or 0
+            local z = tonumber(e.z) or 0
+            local d = dist3(x, y, z)
+
+            if d < bestDist then
+                best = {x=x, y=y, z=z, name=cleanName(e), dist=d}
+                bestDist = d
+            end
+        end
+    end
+
+    if not best then return nil, "no boat found" end
+    return best
+end
+
+local function getBoat()
+    local now = os.clock()
+
+    if lastBoat and now - lastBoatScan < BOAT_RESCAN_SECONDS then
+        return lastBoat
+    end
+
+    local boat, err = findReferenceBoat()
+    lastBoatScan = now
+
+    if boat then
+        lastBoat = boat
+        return boat
+    end
+
+    return nil, err
+end
+
+local function targetRelativeFromBoat(boat)
+    -- Boat is A1 / 1,1.
+    -- Rotated coordinate map:
+    --   rank +1 => X -2
+    --   file +1 => Z -2
+    local worldXOffset = -((currentRank - 1) * SQUARE_SIZE)
+    local worldZOffset = -((currentFile - 1) * SQUARE_SIZE)
+
+    return {
+        x = boat.x + worldXOffset,
+        y = boat.y + PIECE_Y_ABOVE_BOAT + TARGET_Y_EXTRA_UP,
+        z = boat.z + worldZOffset,
+    }
+end
+
+-- =========================================================
+-- Kinetic movement
+-- =========================================================
+
+local function launchToward(vec)
+    local d = dist3(vec.x, vec.y, vec.z)
+
+    if d < HOLD_TOLERANCE then
+        return true, "already centered"
+    end
+
+    local yaw, pitch = vectorToYawPitch(vec.x, vec.y, vec.z)
+    local power = clamp(d * POWER_PER_BLOCK, MIN_LAUNCH_POWER, MAX_LAUNCH_POWER)
+
+    local attempts = {
+        function() return callIfExists(ni, "launch", yaw, pitch, power) end,
+        function() return callIfExists(ni, "launch", power, yaw, pitch) end,
+        function() return callIfExists(ni, "launch", {yaw = yaw, pitch = pitch, power = power}) end,
+        function() return callIfExists(ni, "kinetic", yaw, pitch, power) end,
+        function() return callIfExists(ni, "move", vec.x, vec.y, vec.z, power) end,
+    }
+
+    local lastErr = nil
+    for _, fn in ipairs(attempts) do
+        local ok, err = fn()
+        if ok then return true end
+        lastErr = err
+    end
+
+    return false, tostring(lastErr or "no kinetic launch method worked")
+end
+
+local function holdTarget()
+    local boat, err = getBoat()
+    if not boat then return false, err or "missing boat" end
+
+    local target = targetRelativeFromBoat(boat)
+    local horizontalD = math.sqrt(target.x * target.x + target.z * target.z)
+    local fullD = dist3(target.x, target.y, target.z)
+
+    if horizontalD > HOLD_TOLERANCE then
+        currentAction = pendingCapture and "attack_move" or "move"
+        local ok, moveErr = launchToward({x=target.x, y=0, z=target.z})
+        if not ok then return false, moveErr end
+    else
+        if currentAction ~= "hold" then
+            sendToController({
+                type = "piece_arrived",
+                targetSquare = currentSquare,
+                capture = pendingCapture,
+                capturedPiece = pendingCapturedPiece,
+            })
+        end
+        currentAction = "hold"
+    end
+
+    if horizontalD <= FACE_TOLERANCE then
+        facePositiveZ()
+    end
+
+    return true, ("square=%s action=%s delta x=%.2f y=%.2f z=%.2f h=%.2f full=%.2f"):format(
+        currentSquare, currentAction, target.x, target.y, target.z, horizontalD, fullD
+    )
+end
+
+-- =========================================================
+-- Assignment and rednet listener
+-- =========================================================
+
+local function setAssignedSquare(file, rank, square)
+    file = tonumber(file)
+    rank = tonumber(rank)
+
+    if not file or not rank or file < 1 or file > 8 or rank < 1 or rank > 8 then
+        return false, "bad square assignment"
+    end
+
+    currentFile = file
+    currentRank = rank
+    currentSquare = square or squareName(file, rank)
+
+    print("Assigned new square:", currentSquare, "file", currentFile, "rank", currentRank)
+
+    sendToController({
+        type = "piece_assignment",
+        state = "ASSIGNED",
+        targetFile = currentFile,
+        targetRank = currentRank,
+        targetSquare = currentSquare,
+        action = currentAction,
+        capture = pendingCapture,
+        capturedPiece = pendingCapturedPiece,
+    })
+
+    return true
+end
+
+local function rednetLoop()
+    while true do
+        if not rednetReady then rednetReady = tryOpenRednet() end
+
+        if rednetReady then
+            local sender, msg = rednet.receive(PROTOCOL, REDNET_TIMEOUT)
+
+            if type(msg) == "table" and (sender == FLOOR_COMPUTER_ID or msg.controllerId == FLOOR_COMPUTER_ID) then
+                if msg.type == "piece_move_command" then
+                    local matchesPiece = (msg.pieceId == PIECE_ID) or (tostring(msg.label or ""):lower() == PIECE_LABEL)
+
+                    if matchesPiece then
+                        pendingCapture = msg.capture or msg.action == "attack" or false
+                        pendingCapturedPiece = msg.capturedPiece
+                        pendingTargetVector = {
+                            x = tonumber(msg.targetRelX) or 0,
+                            y = tonumber(msg.targetRelY) or 0,
+                            z = tonumber(msg.targetRelZ) or 0,
+                        }
+                        currentAction = pendingCapture and "attack_pending" or "move_pending"
+
+                        sendToController({
+                            type = "piece_move_received",
+                            from = msg.from,
+                            to = msg.to,
+                            action = currentAction,
+                            capture = pendingCapture,
+                            capturedPiece = pendingCapturedPiece,
+                            targetVector = pendingTargetVector,
+                        })
+
+                        if pendingCapture then
+                            performAttackIfNeeded()
+                        end
+
+                        local ok, err = setAssignedSquare(msg.targetFile, msg.targetRank, msg.to)
+
+                        sendToController({
+                            type = ok and "piece_move_accepted" or "piece_move_rejected",
+                            ok = ok,
+                            detail = err,
+                            from = msg.from,
+                            to = msg.to,
+                            action = currentAction,
+                            capture = pendingCapture,
+                            capturedPiece = pendingCapturedPiece,
+                        })
+                    end
+
+                elseif msg.type == "piece_reset" then
+                    if not msg.pieceId or msg.pieceId == PIECE_ID or tostring(msg.label or ""):lower() == PIECE_LABEL then
+                        pendingCapture = false
+                        pendingCapturedPiece = nil
+                        pendingTargetVector = nil
+                        currentAction = "reset"
+                        setAssignedSquare(START_FILE, START_RANK, START_SQUARE)
+                    end
+                end
+            end
+        else
+            sleep(1)
+        end
+    end
+end
+
+local function holdLoop()
+    local lastStatus = 0
+    local lastAiSuppress = 0
+
+    while true do
+        local now = os.clock()
+
+        if KEEP_SUPPRESSING_AI or now - lastAiSuppress > 5 then
+            suppressAI()
+            lastAiSuppress = now
+        end
+
+        local ok, msg = holdTarget()
+
+        if now - lastStatus >= STATUS_SECONDS then
+            lastStatus = now
+            print((ok and "OK " or "WAIT ") .. tostring(msg))
+            sendToController({
+                type = "piece_status",
+                state = ok and ("HOLDING_" .. currentSquare) or "WAITING",
+                ok = ok,
+                detail = msg,
+                targetSquare = currentSquare,
+                targetFile = currentFile,
+                targetRank = currentRank,
+                action = currentAction,
+                capture = pendingCapture,
+                capturedPiece = pendingCapturedPiece,
+            })
+        end
+
+        sleep(LOOP_DELAY)
+    end
+end
+
+-- =========================================================
+-- Main
+-- =========================================================
+
+print("Wizard Chess reusable piece agent v9 LOS capture starting.")
+print("Label:", PIECE_LABEL, "Computer:", os.getComputerID())
+print("Piece:", PIECE_ID)
+print("Kind:", PIECE_KIND, "Side:", PIECE_SIDE)
+print("Start:", START_SQUARE, "file", START_FILE, "rank", START_RANK)
+print("Controller:", FLOOR_COMPUTER_ID)
+print("Coord map: rank +1 => X -2, file +1 => Z -2")
+print("Loop delay:", LOOP_DELAY)
+print("Rednet:", rednetReady and ("open on " .. MODEM_SIDE) or "not open")
+
+sendToController({
+    type = "piece_hello",
+    targetFile = currentFile,
+    targetRank = currentRank,
+    targetSquare = currentSquare,
+    message = "piece agent booted",
+})
+
+parallel.waitForAny(rednetLoop, holdLoop)
