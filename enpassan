@@ -1,0 +1,857 @@
+-- wizard_chess_floor_v1.lua
+-- 8-monitor floor controller for 16x16 physical Wizard Chess board.
+-- Each chess square = 2x2 monitor blocks.
+--
+-- Monitor layout, from White/bottom side:
+--   monitor_993 bottom left       monitor_994 bottom right
+-- v7: logic uses normal chess ranks, display/touch rows 1<->2 and 7<->8, and monitors 995/996/997/998 have local rows swapped.
+--   monitor_995 mid-bottom left   monitor_996 mid-bottom right
+--   monitor_997 mid-top left      monitor_998 mid-top right     (flipped 180)
+--   monitor_999 top left          monitor_1000 top right        (flipped 180)
+--
+-- Rednet protocol: wizard_chess
+-- Supported packets:
+--   {type="select_piece", pieceId="W_PAWN_E"}
+--   {type="select_square", square="E2"}
+--   {type="move_request", pieceId="W_PAWN_E", to="E4"}
+--   {type="reset_board"}
+--
+-- Terminal test commands:
+--   select E2
+--   select W_PAWN_E
+--   move E4
+--   clear
+--   reset
+--   scan
+--   status
+
+local REDNET_SIDE = "back"
+local PROTOCOL = "wizard_chess"
+local TEXT_SCALE = 0.5
+local SHOW_MARKERS = true
+
+-- Tester mode:
+-- Click/touch a square with a piece and it will highlight where that piece WOULD move
+-- if blockers were ignored. It does not actually move pieces on floor touch.
+local TEST_IGNORE_BLOCKERS = true
+local FLOOR_TOUCH_SELECT_ONLY = true
+
+local CHESTS = {
+    "minecraft:chest_432",
+    "minecraft:chest_433",
+    "minecraft:chest_434",
+    "minecraft:chest_435",
+}
+
+-- Each monitor is physically 8 wide x 4 tall.
+-- gx/gy are 1..16 physical board-block coordinates.
+local MONS = {
+    {name="monitor_993",  gx=1, gy=1,  bw=8, bh=4, flip=false, shiftX=4},
+    {name="monitor_994",  gx=9, gy=1,  bw=8, bh=4, flip=false, shiftX=0},
+    {name="monitor_995",  gx=1, gy=5,  bw=8, bh=4, flip=false, shiftX=4, rowSwap=true},
+    {name="monitor_996",  gx=9, gy=5,  bw=8, bh=4, flip=false, shiftX=0, rowSwap=true},
+    {name="monitor_997",  gx=1, gy=9,  bw=8, bh=4, flip=true,  shiftX=0, rowSwap=true},
+    {name="monitor_998",  gx=9, gy=9,  bw=8, bh=4, flip=true,  shiftX=4, rowSwap=true},
+    {name="monitor_999",  gx=1, gy=13, bw=8, bh=4, flip=true,  shiftX=0},
+    {name="monitor_1000", gx=9, gy=13, bw=8, bh=4, flip=true,  shiftX=4},
+}
+
+local C_LIGHT   = colors.white
+local C_DARK    = colors.lightBlue
+local C_SELECT  = colors.yellow
+local C_MOVE    = colors.lime
+local C_CAPTURE = colors.red
+local C_CHECK   = colors.purple
+local C_ERROR   = colors.orange
+
+local FILES = {"A","B","C","D","E","F","G","H"}
+
+-- =========================================================
+-- Peripheral setup
+-- =========================================================
+
+local floor = {}
+
+local function setupMonitor(m)
+    m.mon = peripheral.wrap(m.name)
+    if not m.mon then
+        print("Missing monitor: " .. m.name)
+        return false
+    end
+
+    m.mon.setTextScale(TEXT_SCALE)
+    m.cw, m.ch = m.mon.getSize()
+    m.cellW = math.max(1, math.floor(m.cw / m.bw))
+    m.cellH = math.max(1, math.floor(m.ch / m.bh))
+
+    if m.mon.setPaletteColor then
+        pcall(function()
+            m.mon.setPaletteColor(colors.white,     0.90, 0.88, 0.78)
+            m.mon.setPaletteColor(colors.lightBlue, 0.35, 0.48, 0.72)
+            m.mon.setPaletteColor(colors.yellow,    0.95, 0.73, 0.20)
+            m.mon.setPaletteColor(colors.lime,      0.30, 0.80, 0.30)
+            m.mon.setPaletteColor(colors.red,       0.86, 0.18, 0.14)
+            m.mon.setPaletteColor(colors.purple,    0.55, 0.20, 0.72)
+            m.mon.setPaletteColor(colors.orange,    0.95, 0.45, 0.12)
+            m.mon.setPaletteColor(colors.black,     0.02, 0.02, 0.02)
+        end)
+    end
+
+    return true
+end
+
+for _, m in ipairs(MONS) do
+    if setupMonitor(m) then floor[#floor+1] = m end
+end
+
+if #floor == 0 then error("No floor monitors found") end
+
+local function openRednet()
+    if not rednet then return false end
+
+    if peripheral.getType(REDNET_SIDE) == "modem" then
+        if not rednet.isOpen(REDNET_SIDE) then rednet.open(REDNET_SIDE) end
+        return rednet.isOpen(REDNET_SIDE)
+    end
+
+    for _, n in ipairs(peripheral.getNames()) do
+        if peripheral.getType(n) == "modem" then
+            if not rednet.isOpen(n) then rednet.open(n) end
+            if rednet.isOpen(n) then REDNET_SIDE = n return true end
+        end
+    end
+
+    return false
+end
+
+local rednetReady = openRednet()
+
+-- =========================================================
+-- Piece registry / board
+-- =========================================================
+
+local pieces = {
+    W_ROOK_A={side="w",kind="R",name="White Rook",start="A1"}, W_KNIGHT_B={side="w",kind="N",name="White Knight",start="B1"},
+    W_BISHOP_C={side="w",kind="B",name="White Bishop",start="C1"}, W_QUEEN={side="w",kind="Q",name="White Queen",start="D1"},
+    W_KING={side="w",kind="K",name="White King",start="E1"}, W_BISHOP_F={side="w",kind="B",name="White Bishop",start="F1"},
+    W_KNIGHT_G={side="w",kind="N",name="White Knight",start="G1"}, W_ROOK_H={side="w",kind="R",name="White Rook",start="H1"},
+    W_PAWN_A={side="w",kind="P",name="White Pawn",start="A2"}, W_PAWN_B={side="w",kind="P",name="White Pawn",start="B2"},
+    W_PAWN_C={side="w",kind="P",name="White Pawn",start="C2"}, W_PAWN_D={side="w",kind="P",name="White Pawn",start="D2"},
+    W_PAWN_E={side="w",kind="P",name="White Pawn",start="E2"}, W_PAWN_F={side="w",kind="P",name="White Pawn",start="F2"},
+    W_PAWN_G={side="w",kind="P",name="White Pawn",start="G2"}, W_PAWN_H={side="w",kind="P",name="White Pawn",start="H2"},
+
+    B_ROOK_A={side="b",kind="R",name="Black Rook",start="A8"}, B_KNIGHT_B={side="b",kind="N",name="Black Knight",start="B8"},
+    B_BISHOP_C={side="b",kind="B",name="Black Bishop",start="C8"}, B_QUEEN={side="b",kind="Q",name="Black Queen",start="D8"},
+    B_KING={side="b",kind="K",name="Black King",start="E8"}, B_BISHOP_F={side="b",kind="B",name="Black Bishop",start="F8"},
+    B_KNIGHT_G={side="b",kind="N",name="Black Knight",start="G8"}, B_ROOK_H={side="b",kind="R",name="Black Rook",start="H8"},
+    B_PAWN_A={side="b",kind="P",name="Black Pawn",start="A7"}, B_PAWN_B={side="b",kind="P",name="Black Pawn",start="B7"},
+    B_PAWN_C={side="b",kind="P",name="Black Pawn",start="C7"}, B_PAWN_D={side="b",kind="P",name="Black Pawn",start="D7"},
+    B_PAWN_E={side="b",kind="P",name="Black Pawn",start="E7"}, B_PAWN_F={side="b",kind="P",name="Black Pawn",start="F7"},
+    B_PAWN_G={side="b",kind="P",name="Black Pawn",start="G7"}, B_PAWN_H={side="b",kind="P",name="Black Pawn",start="H7"},
+}
+
+local board, loc = {}, {}
+local turn = "w"
+local selected, selectedSq = nil, nil
+local legal = {}
+local lastMessage = "Board ready."
+local lastMove = "None"
+local enPassant = nil
+local castle = {wK=true,wQ=true,bK=true,bQ=true}
+
+local function sqName(file, rank) return FILES[file] .. tostring(rank) end
+
+local function fileRank(s)
+    s = tostring(s or ""):upper()
+    local fch, r = s:sub(1,1), tonumber(s:sub(2,2))
+    local f
+    for i, ch in ipairs(FILES) do if ch == fch then f = i break end end
+    if not f or not r or r < 1 or r > 8 then return nil end
+    return f, r
+end
+
+local function physicalRankForLogical(rank)
+    -- The real floor has the first two and last two rows physically swapped.
+    -- Logic stays normal chess:
+    --   White pieces = rank 1, White pawns = rank 2
+    --   Black pieces = rank 8, Black pawns = rank 7
+    -- Display/touch mapping swaps only those physical rows:
+    --   logical rank 1 draws on physical row 2
+    --   logical rank 2 draws on physical row 1
+    --   logical rank 7 draws on physical row 8
+    --   logical rank 8 draws on physical row 7
+    if rank == 1 then return 2 end
+    if rank == 2 then return 1 end
+    if rank == 7 then return 8 end
+    if rank == 8 then return 7 end
+    return rank
+end
+
+local function logicalRankForPhysical(physRank)
+    -- inverse of physicalRankForLogical
+    if physRank == 1 then return 2 end
+    if physRank == 2 then return 1 end
+    if physRank == 7 then return 8 end
+    if physRank == 8 then return 7 end
+    return physRank
+end
+
+local function inBounds(f,r) return f and r and f>=1 and f<=8 and r>=1 and r<=8 end
+local function getAt(f,r) if not inBounds(f,r) then return nil end return board[sqName(f,r)] end
+local function sideOf(id) return id and pieces[id] and pieces[id].side end
+local function kindOf(id) return id and pieces[id] and pieces[id].kind end
+local function display(id) if not id then return "none" end return pieces[id] and (pieces[id].name .. " (" .. id .. ")") or id end
+local function opp(s) return s == "w" and "b" or "w" end
+
+local function setAt(f,r,id)
+    if not inBounds(f,r) then return end
+    local sq = sqName(f,r)
+    board[sq] = id
+    if id then loc[id] = sq end
+end
+
+local function resetBoard()
+    board, loc = {}, {}
+    for id, p in pairs(pieces) do
+        p.kind = p.kind -- keep field stable if edited
+        local f, r = fileRank(p.start)
+        setAt(f,r,id)
+    end
+    turn = "w"
+    selected, selectedSq = nil, nil
+    legal = {}
+    lastMessage = "Board reset. White to move."
+    lastMove = "None"
+    enPassant = nil
+    castle = {wK=true,wQ=true,bK=true,bQ=true}
+end
+
+-- =========================================================
+-- Chess move logic
+-- =========================================================
+
+local function addMove(t,f,r,capture,extra)
+    if not inBounds(f,r) then return end
+    extra = extra or {}
+    extra.file, extra.rank, extra.square = f, r, sqName(f,r)
+    extra.capture = capture or false
+    t[#t+1] = extra
+end
+
+local function findMove(t,sq)
+    sq = tostring(sq or ""):upper()
+    for _,m in ipairs(t or {}) do if m.square == sq then return m end end
+    return nil
+end
+
+local function addRay(t,f,r,df,dr,side)
+    f,r = f+df,r+dr
+    while inBounds(f,r) do
+        local p = getAt(f,r)
+        if not p then addMove(t,f,r,false)
+        else
+            if sideOf(p) ~= side then addMove(t,f,r,true) end
+            return
+        end
+        f,r = f+df,r+dr
+    end
+end
+
+local function kingSquare(side)
+    local id = side == "w" and "W_KING" or "B_KING"
+    return fileRank(loc[id])
+end
+
+local function attacked(f,r,by)
+    local pawnDir = by == "w" and 1 or -1
+    for _,df in ipairs({-1,1}) do
+        local p = getAt(f-df, r-pawnDir)
+        if p and sideOf(p)==by and kindOf(p)=="P" then return true end
+    end
+
+    for _,j in ipairs({{1,2},{2,1},{2,-1},{1,-2},{-1,-2},{-2,-1},{-2,1},{-1,2}}) do
+        local p = getAt(f+j[1], r+j[2])
+        if p and sideOf(p)==by and kindOf(p)=="N" then return true end
+    end
+
+    for df=-1,1 do for dr=-1,1 do
+        if not (df==0 and dr==0) then
+            local p = getAt(f+df,r+dr)
+            if p and sideOf(p)==by and kindOf(p)=="K" then return true end
+        end
+    end end
+
+    for _,d in ipairs({{1,0},{-1,0},{0,1},{0,-1}}) do
+        local x,y = f+d[1],r+d[2]
+        while inBounds(x,y) do
+            local p=getAt(x,y)
+            if p then
+                if sideOf(p)==by and (kindOf(p)=="R" or kindOf(p)=="Q") then return true end
+                break
+            end
+            x,y=x+d[1],y+d[2]
+        end
+    end
+
+    for _,d in ipairs({{1,1},{1,-1},{-1,1},{-1,-1}}) do
+        local x,y = f+d[1],r+d[2]
+        while inBounds(x,y) do
+            local p=getAt(x,y)
+            if p then
+                if sideOf(p)==by and (kindOf(p)=="B" or kindOf(p)=="Q") then return true end
+                break
+            end
+            x,y=x+d[1],y+d[2]
+        end
+    end
+
+    return false
+end
+
+local function inCheck(side)
+    local f,r = kingSquare(side)
+    if not f then return true end
+    return attacked(f,r,opp(side))
+end
+
+local function castleMoves(t, side)
+    if inCheck(side) then return end
+    local enemy = opp(side)
+    if side == "w" then
+        if castle.wK and getAt(5,1)=="W_KING" and getAt(8,1)=="W_ROOK_H" and not getAt(6,1) and not getAt(7,1)
+            and not attacked(6,1,enemy) and not attacked(7,1,enemy) then addMove(t,7,1,false,{castle="K"}) end
+        if castle.wQ and getAt(5,1)=="W_KING" and getAt(1,1)=="W_ROOK_A" and not getAt(4,1) and not getAt(3,1) and not getAt(2,1)
+            and not attacked(4,1,enemy) and not attacked(3,1,enemy) then addMove(t,3,1,false,{castle="Q"}) end
+    else
+        if castle.bK and getAt(5,8)=="B_KING" and getAt(8,8)=="B_ROOK_H" and not getAt(6,8) and not getAt(7,8)
+            and not attacked(6,8,enemy) and not attacked(7,8,enemy) then addMove(t,7,8,false,{castle="K"}) end
+        if castle.bQ and getAt(5,8)=="B_KING" and getAt(1,8)=="B_ROOK_A" and not getAt(4,8) and not getAt(3,8) and not getAt(2,8)
+            and not attacked(4,8,enemy) and not attacked(3,8,enemy) then addMove(t,3,8,false,{castle="Q"}) end
+    end
+end
+
+local function pseudo(id)
+    local sq = loc[id]
+    if not sq then return {} end
+    local f,r = fileRank(sq)
+    local side, kind = sideOf(id), kindOf(id)
+    local t = {}
+
+    if kind == "P" then
+        local dir = side=="w" and 1 or -1
+        local start = side=="w" and 2 or 7
+        local promote = side=="w" and 8 or 1
+        if inBounds(f,r+dir) and not getAt(f,r+dir) then
+            addMove(t,f,r+dir,false,{promotion=(r+dir==promote)})
+            if r==start and not getAt(f,r+2*dir) then addMove(t,f,r+2*dir,false,{doublePawn=true}) end
+        end
+        for _,df in ipairs({-1,1}) do
+            local tf,tr=f+df,r+dir
+            local target=getAt(tf,tr)
+            if target and sideOf(target)~=side then addMove(t,tf,tr,true,{promotion=(tr==promote)}) end
+            if enPassant and enPassant.file==tf and enPassant.rank==tr then
+                addMove(t,tf,tr,true,{enPassant=true,captureFile=enPassant.captureFile,captureRank=enPassant.captureRank,capturedPiece=enPassant.capturedPiece})
+            end
+        end
+
+    elseif kind == "N" then
+        for _,j in ipairs({{1,2},{2,1},{2,-1},{1,-2},{-1,-2},{-2,-1},{-2,1},{-1,2}}) do
+            local p=getAt(f+j[1],r+j[2])
+            if inBounds(f+j[1],r+j[2]) and (not p or sideOf(p)~=side) then addMove(t,f+j[1],r+j[2],p~=nil) end
+        end
+
+    elseif kind == "B" then
+        addRay(t,f,r,1,1,side); addRay(t,f,r,1,-1,side); addRay(t,f,r,-1,1,side); addRay(t,f,r,-1,-1,side)
+
+    elseif kind == "R" then
+        addRay(t,f,r,1,0,side); addRay(t,f,r,-1,0,side); addRay(t,f,r,0,1,side); addRay(t,f,r,0,-1,side)
+
+    elseif kind == "Q" then
+        addRay(t,f,r,1,0,side); addRay(t,f,r,-1,0,side); addRay(t,f,r,0,1,side); addRay(t,f,r,0,-1,side)
+        addRay(t,f,r,1,1,side); addRay(t,f,r,1,-1,side); addRay(t,f,r,-1,1,side); addRay(t,f,r,-1,-1,side)
+
+    elseif kind == "K" then
+        for df=-1,1 do for dr=-1,1 do
+            if not (df==0 and dr==0) then
+                local p=getAt(f+df,r+dr)
+                if inBounds(f+df,r+dr) and (not p or sideOf(p)~=side) then addMove(t,f+df,r+dr,p~=nil) end
+            end
+        end end
+        castleMoves(t,side)
+    end
+
+    return t
+end
+
+local function wouldCheck(id,m)
+    local from = loc[id]
+    if not from then return true end
+    local ff,fr=fileRank(from)
+    local tf,tr=m.file,m.rank
+    local target=getAt(tf,tr)
+    local side=sideOf(id)
+
+    local epCap
+    if m.enPassant then
+        epCap=getAt(m.captureFile,m.captureRank)
+        setAt(m.captureFile,m.captureRank,nil)
+        if epCap then loc[epCap]=nil end
+    end
+
+    setAt(tf,tr,id); setAt(ff,fr,nil); loc[id]=m.square
+    if target then loc[target]=nil end
+
+    local rookId,rf,rt
+    if m.castle=="K" then rf,rt=8,6 elseif m.castle=="Q" then rf,rt=1,4 end
+    if rf then
+        rookId=getAt(rf,fr)
+        if rookId then setAt(rt,fr,rookId); setAt(rf,fr,nil) end
+    end
+
+    local bad=inCheck(side)
+
+    if rf and rookId then setAt(rf,fr,rookId); setAt(rt,fr,nil) end
+    setAt(ff,fr,id); setAt(tf,tr,target); loc[id]=from
+    if target then loc[target]=m.square end
+    if epCap then setAt(m.captureFile,m.captureRank,epCap) end
+
+    return bad
+end
+
+local function legalFor(id)
+    local t={}
+    for _,m in ipairs(pseudo(id)) do if not wouldCheck(id,m) then t[#t+1]=m end end
+    return t
+end
+
+local function hasMove(side)
+    for id,p in pairs(pieces) do
+        if p.side==side and loc[id] and #legalFor(id)>0 then return true end
+    end
+    return false
+end
+
+-- =========================================================
+-- Drawing
+-- =========================================================
+
+local function fill(mon,x,y,w,h,c)
+    local mw, mh = mon.getSize()
+    if x > mw or y > mh or x + w - 1 < 1 or y + h - 1 < 1 then return end
+
+    local drawX = math.max(1, x)
+    local drawY1 = math.max(1, y)
+    local drawY2 = math.min(mh, y + h - 1)
+    local drawW = math.min(w - (drawX - x), mw - drawX + 1)
+    if drawW <= 0 then return end
+
+    mon.setBackgroundColor(c)
+    local s=string.rep(" ",drawW)
+    for yy=drawY1,drawY2 do
+        mon.setCursorPos(drawX,yy)
+        mon.write(s)
+    end
+end
+
+local function writeCenter(mon,x,y,w,h,text,fg,bg)
+    text=tostring(text or "")
+    local mw, mh = mon.getSize()
+    local tx = x+math.floor((w-#text)/2)
+    local ty = y+math.floor(h/2)
+    if ty < 1 or ty > mh or tx > mw then return end
+    if tx < 1 then
+        text = text:sub(2 - tx)
+        tx = 1
+    end
+    if #text <= 0 then return end
+    mon.setBackgroundColor(bg); mon.setTextColor(fg)
+    mon.setCursorPos(tx, ty)
+    mon.write(text:sub(1, math.min(w, mw - tx + 1)))
+end
+
+local function monitorFor(gx,gy)
+    for _,m in ipairs(floor) do
+        if gx>=m.gx and gx<m.gx+m.bw and gy>=m.gy and gy<m.gy+m.bh then return m end
+    end
+end
+
+local function drawBlock(gx,gy,c,text,fg)
+    local m=monitorFor(gx,gy)
+    if not m then return end
+    local lx,ly=gx-m.gx+1,gy-m.gy+1
+
+    -- Some physical monitor sections are installed with their rows reversed.
+    -- rowSwap flips only the local Y rows; flip still handles full 180 rotation.
+    if m.rowSwap then ly=m.bh-ly+1 end
+    if m.flip then lx=m.bw-lx+1; ly=m.bh-ly+1 end
+
+    local x=(lx-1)*m.cellW+1+(m.shiftX or 0)
+    local y=(ly-1)*m.cellH+1
+    fill(m.mon,x,y,m.cellW,m.cellH,c)
+    if text and #text>0 then writeCenter(m.mon,x,y,m.cellW,m.cellH,text,fg or colors.black,c) end
+end
+
+local function sqColor(f,r)
+    local sq=sqName(f,r)
+    if sq==selectedSq then return C_SELECT end
+    local m=findMove(legal,sq)
+    if m then return m.capture and C_CAPTURE or C_MOVE end
+    local kf,kr=kingSquare(turn)
+    if kf==f and kr==r and inCheck(turn) then return C_CHECK end
+    return ((f+r)%2==0) and C_LIGHT or C_DARK
+end
+
+local function redraw()
+    for _,m in ipairs(floor) do m.mon.setBackgroundColor(colors.black); m.mon.clear() end
+    for r=1,8 do
+        for f=1,8 do
+            local c=sqColor(f,r)
+            local physicalRank = physicalRankForLogical(r)
+            local gx,gy=(f-1)*2+1,(physicalRank-1)*2+1
+            drawBlock(gx,gy,c)
+            drawBlock(gx+1,gy,c)
+            drawBlock(gx,gy+1,c)
+            local id=getAt(f,r)
+            if SHOW_MARKERS and id then drawBlock(gx+1,gy+1,c,kindOf(id),sideOf(id)=="w" and colors.yellow or colors.black)
+            else drawBlock(gx+1,gy+1,c) end
+        end
+    end
+end
+
+-- =========================================================
+-- Recovery chest scan
+-- =========================================================
+
+local function identify(detail)
+    if not detail then return nil end
+    for _,v in ipairs({detail.displayName, detail.name, detail.nbt}) do
+        if type(v)=="string" then
+            for id in pairs(pieces) do if v:find(id,1,true) then return id end end
+        end
+    end
+end
+
+local function scanChests()
+    print("=== Fallen NI scan ===")
+    local any=false
+    for _,name in ipairs(CHESTS) do
+        local chest=peripheral.wrap(name)
+        if not chest or not chest.list then print("Missing chest: "..name)
+        else
+            for slot,item in pairs(chest.list()) do
+                any=true
+                local detail=chest.getItemDetail and chest.getItemDetail(slot) or item
+                local id=identify(detail or item)
+                print(("%s slot %s: %sx %s"):format(name,tostring(slot),tostring(item.count or 1),tostring(item.name)))
+                if detail and detail.displayName then print("  display: "..tostring(detail.displayName)) end
+                if id then print("  matched: "..id) end
+                if detail and detail.nbt then print("  nbt: "..tostring(detail.nbt)) end
+            end
+        end
+    end
+    if not any then print("No items in recovery chests.") end
+end
+
+-- =========================================================
+-- Selection and moves
+-- =========================================================
+
+
+local function addRayNoBlock(t,f,r,df,dr,captureFlag)
+    f,r = f+df,r+dr
+    while inBounds(f,r) do
+        addMove(t,f,r,captureFlag or false)
+        f,r = f+df,r+dr
+    end
+end
+
+local function testerMovesNoBlockers(id)
+    local sq = loc[id]
+    if not sq then return {} end
+
+    local f,r = fileRank(sq)
+    local side, kind = sideOf(id), kindOf(id)
+    local t = {}
+
+    if kind == "P" then
+        local dir = side=="w" and 1 or -1
+        local start = side=="w" and 2 or 7
+
+        -- Forward movement, ignoring blockers.
+        if inBounds(f,r+dir) then addMove(t,f,r+dir,false,{tester=true}) end
+        if r==start and inBounds(f,r+2*dir) then addMove(t,f,r+2*dir,false,{tester=true,doublePawn=true}) end
+
+        -- Diagonal attack possibilities, shown as capture-color even if empty.
+        for _,df in ipairs({-1,1}) do
+            if inBounds(f+df,r+dir) then addMove(t,f+df,r+dir,true,{tester=true,pawnAttack=true}) end
+        end
+
+    elseif kind == "N" then
+        for _,j in ipairs({{1,2},{2,1},{2,-1},{1,-2},{-1,-2},{-2,-1},{-2,1},{-1,2}}) do
+            if inBounds(f+j[1],r+j[2]) then addMove(t,f+j[1],r+j[2],false,{tester=true}) end
+        end
+
+    elseif kind == "B" then
+        addRayNoBlock(t,f,r,1,1,false); addRayNoBlock(t,f,r,1,-1,false)
+        addRayNoBlock(t,f,r,-1,1,false); addRayNoBlock(t,f,r,-1,-1,false)
+
+    elseif kind == "R" then
+        addRayNoBlock(t,f,r,1,0,false); addRayNoBlock(t,f,r,-1,0,false)
+        addRayNoBlock(t,f,r,0,1,false); addRayNoBlock(t,f,r,0,-1,false)
+
+    elseif kind == "Q" then
+        addRayNoBlock(t,f,r,1,0,false); addRayNoBlock(t,f,r,-1,0,false)
+        addRayNoBlock(t,f,r,0,1,false); addRayNoBlock(t,f,r,0,-1,false)
+        addRayNoBlock(t,f,r,1,1,false); addRayNoBlock(t,f,r,1,-1,false)
+        addRayNoBlock(t,f,r,-1,1,false); addRayNoBlock(t,f,r,-1,-1,false)
+
+    elseif kind == "K" then
+        for df=-1,1 do for dr=-1,1 do
+            if not (df==0 and dr==0) and inBounds(f+df,r+dr) then
+                addMove(t,f+df,r+dr,false,{tester=true})
+            end
+        end end
+    end
+
+    return t
+end
+
+local function selectPiece(id)
+    if not pieces[id] then lastMessage="Unknown piece "..tostring(id) return false end
+    if not loc[id] then lastMessage=id.." is not active." return false end
+    if sideOf(id)~=turn then lastMessage="Wrong turn. "..(turn=="w" and "White" or "Black").." to move." return false end
+    selected=id
+    selectedSq=loc[id]
+    if TEST_IGNORE_BLOCKERS then
+        legal=testerMovesNoBlockers(id)
+        lastMessage="TEST selected "..display(id).." at "..selectedSq.." (blockers ignored)."
+    else
+        legal=legalFor(id)
+        lastMessage="Selected "..display(id).." at "..selectedSq.."."
+    end
+    return true
+end
+
+local function selectSquare(sq)
+    local f,r=fileRank(sq)
+    if not f then lastMessage="Bad square "..tostring(sq) return false end
+    local id=getAt(f,r)
+    if not id then selected=nil selectedSq=nil legal={} lastMessage="No piece on "..tostring(sq):upper() return false end
+    return selectPiece(id)
+end
+
+local function updateCastle(id,target)
+    if id=="W_KING" then castle.wK=false; castle.wQ=false end
+    if id=="B_KING" then castle.bK=false; castle.bQ=false end
+    if id=="W_ROOK_A" then castle.wQ=false end
+    if id=="W_ROOK_H" then castle.wK=false end
+    if id=="B_ROOK_A" then castle.bQ=false end
+    if id=="B_ROOK_H" then castle.bK=false end
+    if target=="W_ROOK_A" then castle.wQ=false end
+    if target=="W_ROOK_H" then castle.wK=false end
+    if target=="B_ROOK_A" then castle.bQ=false end
+    if target=="B_ROOK_H" then castle.bK=false end
+end
+
+local function commitMove(dest)
+    if not selected then lastMessage="No selected piece." return false end
+    dest=tostring(dest or ""):upper()
+    local m=findMove(legal,dest)
+    if not m then lastMessage="Invalid destination "..dest.." for "..display(selected) return false end
+
+    local from=loc[selected]
+    local ff,fr=fileRank(from)
+    local target=getAt(m.file,m.rank)
+    if m.enPassant then
+        target=m.capturedPiece or getAt(m.captureFile,m.captureRank)
+        setAt(m.captureFile,m.captureRank,nil)
+        if target then loc[target]=nil end
+    end
+
+    updateCastle(selected,target)
+    setAt(m.file,m.rank,selected); setAt(ff,fr,nil)
+    if target then loc[target]=nil end
+
+    if m.castle=="K" then
+        local rook=turn=="w" and "W_ROOK_H" or "B_ROOK_H"
+        setAt(6,fr,rook); setAt(8,fr,nil)
+    elseif m.castle=="Q" then
+        local rook=turn=="w" and "W_ROOK_A" or "B_ROOK_A"
+        setAt(4,fr,rook); setAt(1,fr,nil)
+    end
+
+    enPassant=nil
+    if m.doublePawn then
+        local dir=turn=="w" and 1 or -1
+        enPassant={file=ff,rank=fr+dir,captureFile=m.file,captureRank=m.rank,capturedPiece=selected}
+    end
+
+    if m.promotion then pieces[selected].kind="Q"; pieces[selected].name=(turn=="w" and "White" or "Black").." Queen" end
+
+    lastMove=display(selected).." "..from.." -> "..dest
+    if target then lastMove=lastMove.." captures "..display(target) end
+
+    local moved=turn
+    selected=nil; selectedSq=nil; legal={}
+    turn=opp(turn)
+
+    if inCheck(turn) then
+        if not hasMove(turn) then lastMessage="Checkmate. "..(moved=="w" and "White" or "Black").." wins."
+        else lastMessage=(turn=="w" and "White" or "Black").." is in check." end
+    elseif not hasMove(turn) then lastMessage="Stalemate. Draw."
+    else lastMessage=(turn=="w" and "White" or "Black").." to move." end
+
+    if rednetReady then rednet.broadcast({type="floor_move_committed", lastMove=lastMove, turn=turn, message=lastMessage}, PROTOCOL) end
+    return true
+end
+
+local function status()
+    print("=== Wizard Chess Floor ===")
+    print("Turn: "..(turn=="w" and "White" or "Black"))
+    print("Selected: "..(selected and (display(selected).." at "..selectedSq) or "none"))
+    print("Legal moves: "..#legal)
+    print("Last move: "..lastMove)
+    print("Message: "..lastMessage)
+    print("Rednet: "..(rednetReady and ("open on "..REDNET_SIDE) or "OFF"))
+    print("Tester: "..(TEST_IGNORE_BLOCKERS and "blockers ignored, touch selects only" or "normal legal moves"))
+end
+
+local function handlePacket(sender,msg)
+    if type(msg)~="table" then return end
+    if msg.type=="select_piece" or msg.type=="piece_hit" then
+        selectPiece(msg.pieceId)
+        if rednetReady then rednet.send(sender,{type="selection_reply", ok=selected==msg.pieceId, message=lastMessage, moves=legal},PROTOCOL) end
+    elseif msg.type=="select_square" then
+        selectSquare(msg.square)
+    elseif msg.type=="move_request" then
+        if msg.pieceId and selected~=msg.pieceId then selectPiece(msg.pieceId) end
+        local ok=commitMove(msg.to or msg.square)
+        if rednetReady then rednet.send(sender,{type=ok and "move_ok" or "move_error", message=lastMessage, lastMove=lastMove},PROTOCOL) end
+    elseif msg.type=="reset_board" then
+        resetBoard()
+    elseif msg.type=="clear_selection" then
+        selected=nil selectedSq=nil legal={} lastMessage="Selection cleared."
+    end
+    redraw()
+end
+
+
+local function monitorByName(name)
+    for _,m in ipairs(floor) do
+        if m.name == name then return m end
+    end
+    return nil
+end
+
+local function squareFromMonitorTouch(monName, tx, ty)
+    local m = monitorByName(monName)
+    if not m then return nil end
+
+    -- Undo drawing shift. These shifted monitors have black padding columns on the left.
+    local localX = tx - (m.shiftX or 0)
+    if localX < 1 then return nil end
+
+    local lx = math.floor((localX - 1) / m.cellW) + 1
+    local ly = math.floor((ty - 1) / m.cellH) + 1
+
+    if lx < 1 or lx > m.bw or ly < 1 or ly > m.bh then return nil end
+
+    -- Undo physical 180 degree flip for top-half monitors, then undo row-only swap.
+    if m.flip then
+        lx = m.bw - lx + 1
+        ly = m.bh - ly + 1
+    end
+    if m.rowSwap then
+        ly = m.bh - ly + 1
+    end
+
+    local gx = m.gx + lx - 1
+    local gy = m.gy + ly - 1
+
+    if gx < 1 or gx > 16 or gy < 1 or gy > 16 then return nil end
+
+    local file = math.floor((gx - 1) / 2) + 1
+    local physicalRank = math.floor((gy - 1) / 2) + 1
+    local rank = logicalRankForPhysical(physicalRank)
+
+    if not inBounds(file, rank) then return nil end
+    return sqName(file, rank), file, rank
+end
+
+local function handleFloorTouch(monName, tx, ty)
+    local sq = squareFromMonitorTouch(monName, tx, ty)
+    if not sq then
+        lastMessage = "Touch outside board on " .. tostring(monName) .. "."
+        return
+    end
+
+    local f, r = fileRank(sq)
+    local id = getAt(f, r)
+
+    if id then
+        selectPiece(id)
+    else
+        if selected and not FLOOR_TOUCH_SELECT_ONLY then
+            commitMove(sq)
+        else
+            selected=nil
+            selectedSq=nil
+            legal={}
+            lastMessage="No piece on "..sq.."."
+        end
+    end
+end
+
+local function rednetLoop()
+    while true do
+        if not rednetReady then rednetReady=openRednet() sleep(1)
+        else
+            local sender,msg=rednet.receive(PROTOCOL,0.25)
+            if sender then handlePacket(sender,msg) end
+        end
+    end
+end
+
+local function commandLoop()
+    while true do
+        write("> ")
+        local line=read()
+        local cmd,arg=(line or ""):match("^(%S+)%s*(.*)$")
+        cmd=(cmd or ""):lower()
+        if cmd=="select" or cmd=="sel" then
+            arg=tostring(arg or ""):upper()
+            if pieces[arg] then selectPiece(arg) else selectSquare(arg) end
+            redraw(); status()
+        elseif cmd=="move" or cmd=="mv" then
+            commitMove(arg); redraw(); status()
+        elseif cmd=="clear" then
+            selected=nil selectedSq=nil legal={} lastMessage="Selection cleared."; redraw(); status()
+        elseif cmd=="reset" then
+            resetBoard(); redraw(); status()
+        elseif cmd=="scan" then
+            scanChests()
+        elseif cmd=="status" then
+            status()
+        elseif cmd=="help" then
+            print("select E2 | select W_PAWN_E | move E4 | clear | reset | scan | status")
+            print("Floor touch tester: tap a piece square to highlight no-blocker moves.")
+        else
+            print("Unknown command. Type help.")
+        end
+    end
+end
+
+resetBoard()
+redraw()
+status()
+print("Type help for commands.")
+local function touchLoop()
+    while true do
+        local event, monName, x, y = os.pullEvent("monitor_touch")
+        handleFloorTouch(monName, x, y)
+        redraw()
+        status()
+    end
+end
+
+parallel.waitForAny(commandLoop, rednetLoop, touchLoop)
